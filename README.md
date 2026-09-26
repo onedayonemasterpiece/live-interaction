@@ -14,7 +14,7 @@ its tested audio/lifecycle paths, not a general agent framework.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use immutable releases tied to a full source commit; see [integration](docs/integration.md).
+Use versioned releases (initial release `0.1.0`); see [integration](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
 speech/mutations. Repository visibility is private; no npm public publishing.

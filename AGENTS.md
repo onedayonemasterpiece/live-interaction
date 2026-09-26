@@ -9,5 +9,5 @@ adapters. Preserve immediate local Stop, bounded ordered capture, complete outpu
 confirmed voice Stop, and mutation idempotency. Never mask a provider error with
 another model/key. Run Node/Python contracts plus affected consumer browser tests.
 Real Google acceptance receipts are required for transport/lifecycle releases;
-record failures and provenance, not just passing fixtures. Pin consumers to a
-full commit and update the integration skill when the public contract changes.
+record failures and provenance, not just passing fixtures. Use versioned releases for
+consumers and update the integration skill when the public contract changes.

@@ -8,5 +8,6 @@ if(execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim())throw E
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 const packed=JSON.parse(execFileSync('npm',['pack','--json','--pack-destination',resolve(destination)],{encoding:'utf8'}))[0];
 const archive=join(resolve(destination),packed.filename),sha256=createHash('sha256').update(readFileSync(archive)).digest('hex');
-const receipt={repository:'https://github.com/onedayonemasterpiece/live-interaction',commit,archive,sha256};
+const version=JSON.parse(readFileSync('package.json','utf8')).version;
+const receipt={version,repository:'https://github.com/onedayonemasterpiece/live-interaction',commit,archive,sha256};
 writeFileSync(join(resolve(destination),'release.json'),JSON.stringify(receipt,null,2)+'\n');console.log(JSON.stringify(receipt));

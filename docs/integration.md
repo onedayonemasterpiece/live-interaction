@@ -4,25 +4,25 @@
 
 The first consumer uses a release tarball in its private `vendor/` directory.
 Build it with `npm pack` from a clean, committed framework checkout. Record its
-full source commit and SHA-256 in the consumer's `liveFramework` package metadata,
-use a `file:vendor/live-interaction-<commit>.tgz` dependency, and commit the npm
-lockfile (SHA-512 integrity). CI verifies pin metadata, archive digest, lockfile
+release version and archive SHA-256 in the consumer's `liveFramework` package metadata,
+use a `file:vendor/live-interaction-<version>.tgz` dependency, and commit the npm
+lockfile (SHA-512 integrity). CI verifies version metadata, archive digest, lockfile
 and installed/generated assets. This is an immutable distribution artifact, not
-an editable source fork. Update it only by repacking a reviewed framework commit.
+an editable source fork. Update it from the next versioned framework release; keep the source commit only in release receipts.
 This also works in container builds without granting a cross-repository key to CI.
 Do not distribute a private package inside a public product without authorization.
 
 Consumers with private Git read access may instead use this form:
 
 Node: `@onedayonemasterpiece/live-interaction` dependency set to
-`git+https://github.com/onedayonemasterpiece/live-interaction.git#<full commit SHA>`.
+`git+https://github.com/onedayonemasterpiece/live-interaction.git#semver:^0.1.0`.
 Commit the lockfile. Build browser assets with
 `installBrowserAssets(destination)` from the package `/assets` export; include
 these generated modules in the application's content hash/cache manifest. Never
 edit or commit generated copies. Import `createLiveClient` from the generated
 `client.js`; server imports `createLiveSessionHost` from the `/node` export.
 
-Python: install `live-interaction @ git+https://github.com/onedayonemasterpiece/live-interaction.git@<same SHA>`.
+Python: install `live-interaction @ git+https://github.com/onedayonemasterpiece/live-interaction.git@v0.1.0`.
 Use `live_interaction.provider.run(load_key=server_credential_resolver)` for the
 worker entrypoint. Default resolver reads only `LIVE_API_KEY`. Node packages
 include the same Python module, so a Node consumer need not perform a separate
@@ -129,11 +129,11 @@ considering a provider closure finished. Model mic energy alone is not barge-in.
 
 ## Release gate and ownership
 
-Core changes go here and run Node/Python tests. A consumer pins the reviewed
-commit and verifies generated assets match the installed package. Existing
+Core changes go here and run Node/Python tests. A consumer selects a versioned
+release and verifies generated assets match the installed package. Existing
 Wonderful Lections CI also rejects known duplicate transport implementations.
 Agent instructions/skill route new integrations here, but no skill can prevent
-all future deliberate divergence; code review and dependency checks enforce it.
+all future deliberate divergence; code review and versioned dependency checks enforce it.
 
 A new adapter/release requires real browser voice acceptance: 10 turns, authorized
 product actions, navigation/context changes, immediate Stop/no later audio POST,

@@ -8,17 +8,17 @@ description: Integrate or change interactive Live voice/video sessions in Wonder
 Canonical implementation: `onedayonemasterpiece/live-interaction` (private),
 local checkout `/home/dev/projects/live-interaction`. Read its
 [adapter contract](https://github.com/onedayonemasterpiece/live-interaction/blob/main/docs/integration.md)
-from the local checkout or pinned dependency before implementation. Do not fetch
+from the local checkout or versioned dependency before implementation. Do not fetch
 public pages as a substitute for authenticated access to this private source.
 
 Use the shared browser client and Python provider; Node hosts also use the shared
 session host. Add product tools/context/UI/authorization as adapters. Improve a
 missing transport capability in the shared repository, then update the consumer's
-immutable release dependency and lockfile. Do not fork/copy an independent audio queue,
+versioned release dependency and lockfile. Do not fork/copy an independent audio queue,
 provider websocket, playback or Stop implementation into a product.
 
 Build browser modules from the installed package; generated copies are ignored
-and covered by the consumer's asset hash/cache manifest. Enforce full source-SHA pinning, release archive digest (or immutable Git ref),
+and covered by the consumer's asset hash/cache manifest. Enforce semantic release versioning, release archive digest,
 lockfile provenance and generated-asset equality in the consumer's CI/build.
 Wonderful Lections has `scripts/verify-live-framework.mjs` as the first example.
 This guard plus review enforces known integration paths; a skill alone does not
@@ -41,8 +41,8 @@ Do not promise external provider latency or resumption success.
 Run shared Node/Python contracts and affected consumer regressions. For transport
 changes run real browser speech acceptance (10 turns plus product actions,
 context changes, Stop/restart, full playback and spoken confirmation), and long
-session/recovery checks where relevant. Keep receipts with exact source/dependency
-SHAs, timings and provider failures. Unit tests and setup success are not Live
+session/recovery checks where relevant. Keep receipts with exact source receipts and dependency
+versions, timings and provider failures. Unit tests and setup success are not Live
 acceptance. Use managed artifact storage where provided by the environment.
 
 Internet search via a separate lightweight model remains an unverified technical
