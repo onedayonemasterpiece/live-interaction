@@ -77,6 +77,8 @@ class _Session:
     ready: asyncio.Future | None = None
     awaiting_audio: bool = False
     tool_response_at: int | None = None
+    last_client_at_ms: int = 0
+    watchdog_task: asyncio.Task | None = None
 
 
 def _now_ms() -> int:
@@ -94,16 +96,22 @@ class LiveSessionHost:
         adapter_factory: Callable[..., Any],
         key_resolver: Callable[[str, Any], str | None] | None = None,
         provider_run: Callable[..., Awaitable[None]] = provider.run,
+        managed_runner: Callable[..., Awaitable[None]] | None = None,
         models: tuple[str, ...] = LIVE_SESSION_MODELS,
         ready_timeout_ms: int = 30_000,
         max_sessions: int = 2,
+        client_liveness_timeout_ms: int = 60_000,
     ):
         self.models = tuple(models)
         self.ready_timeout_ms = ready_timeout_ms
         self.max_sessions = max_sessions
         self.provider_run = provider_run
+        self.managed_runner = managed_runner
         self.key_resolver = key_resolver or (lambda _resource_id, _actor: provider.default_key())
+        self.client_liveness_timeout_ms = max(1_000, int(client_liveness_timeout_ms))
         self.sessions: dict[str, _Session] = {}
+        self._start_lock = asyncio.Lock()
+        self._starting_sessions = 0
         self.adapter = adapter_factory(
             emit=self._emit,
             write=self._write,
@@ -152,6 +160,25 @@ class LiveSessionHost:
             raise LiveError("FORBIDDEN", "Live-сессия принадлежит другому пользователю")
         return session
 
+    @staticmethod
+    def _touch(session: _Session) -> None:
+        session.last_client_at_ms = _now_ms()
+
+    async def _watch_client(self, session: _Session) -> None:
+        interval = max(250, min(5_000, self.client_liveness_timeout_ms // 3))
+        try:
+            while not session.closed:
+                await asyncio.sleep(interval / 1000)
+                if session.closed:
+                    return
+                if _now_ms() - session.last_client_at_ms < self.client_liveness_timeout_ms:
+                    continue
+                self._emit(session, {"type": "client_liveness_timeout"})
+                await self._discard(session, graceful=False)
+                return
+        except asyncio.CancelledError:
+            raise
+
     async def start(
         self,
         *,
@@ -166,14 +193,20 @@ class LiveSessionHost:
             raise LiveError("INVALID_ARGUMENT", "resource_id is required")
         if model not in self.models:
             raise LiveError("INVALID_INPUT", "Unknown Live model")
-        if len(self.sessions) >= self.max_sessions:
-            raise LiveError("LIVE_BUSY", "Live session limit reached")
-
-        initialized = await _maybe_await(
-            self.adapter.initialize(resource_id=resource_id, actor=actor, model=model, **args)
-        )
-        if not isinstance(initialized, dict):
-            raise LiveError("LIVE_ADAPTER_ERROR", "Live adapter initialize() returned invalid state")
+        async with self._start_lock:
+            active = sum(not item.closed for item in self.sessions.values())
+            if active + self._starting_sessions >= self.max_sessions:
+                raise LiveError("LIVE_BUSY", "Live session limit reached")
+            self._starting_sessions += 1
+        try:
+            initialized = await _maybe_await(
+                self.adapter.initialize(resource_id=resource_id, actor=actor, model=model, **args)
+            )
+            if not isinstance(initialized, dict):
+                raise LiveError("LIVE_ADAPTER_ERROR", "Live adapter initialize() returned invalid state")
+        finally:
+            async with self._start_lock:
+                self._starting_sessions -= 1
 
         session_id = "live_" + uuid.uuid4().hex
         reader = _QueueReader()
@@ -186,12 +219,15 @@ class LiveSessionHost:
             reader=reader,
             state=dict(initialized.get("state") or {}),
             ready=loop.create_future(),
+            last_client_at_ms=_now_ms(),
         )
         self.sessions[session_id] = session
-        key = self.key_resolver(resource_id, actor)
-        if not key:
-            self.sessions.pop(session_id, None)
-            raise LiveError("LIVE_UNAVAILABLE", "application_google_binding_missing")
+        key = None
+        if self.managed_runner is None:
+            key = self.key_resolver(resource_id, actor)
+            if not key:
+                self.sessions.pop(session_id, None)
+                raise LiveError("LIVE_UNAVAILABLE", "application_google_binding_missing")
 
         def on_event(event: dict[str, Any]) -> None:
             kind = event.get("type")
@@ -233,7 +269,10 @@ class LiveSessionHost:
 
         async def runner() -> None:
             try:
-                await self.provider_run(load_key=lambda: key, reader=reader, on_event=on_event)
+                if self.managed_runner is not None:
+                    await self.managed_runner(session=session, reader=reader, on_event=on_event)
+                else:
+                    await self.provider_run(load_key=lambda: key, reader=reader, on_event=on_event)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -273,6 +312,9 @@ class LiveSessionHost:
 
         if hasattr(self.adapter, "on_started"):
             await _maybe_await(self.adapter.on_started(session))
+        session.watchdog_task = asyncio.create_task(
+            self._watch_client(session), name=f"live-client-watchdog-{session_id}"
+        )
         response = initialized.get("response") or {}
         return {"session_id": session_id, "model": model, **response}
 
@@ -347,6 +389,7 @@ class LiveSessionHost:
         received_at: int | None = None,
     ) -> dict[str, Any]:
         session = self._get(session_id, resource_id, actor)
+        self._touch(session)
         if hasattr(self.adapter, "input"):
             await _maybe_await(self.adapter.input(session, message))
         received_at = received_at or _now_ms()
@@ -379,6 +422,7 @@ class LiveSessionHost:
         actor: Any = None,
     ) -> dict[str, Any]:
         session = self._get(session_id, resource_id, actor)
+        self._touch(session)
         all_events = list(session.events)
         items = [event for event in all_events if int(event["seq"]) > after][:64]
         cursor = int(items[-1]["seq"]) if items else after
@@ -406,6 +450,10 @@ class LiveSessionHost:
 
     async def _discard(self, session: _Session, graceful: bool = False) -> None:
         session.closed = True
+        current = asyncio.current_task()
+        if session.watchdog_task and session.watchdog_task is not current and not session.watchdog_task.done():
+            session.watchdog_task.cancel()
+            await asyncio.gather(session.watchdog_task, return_exceptions=True)
         if session.task and not session.task.done():
             if graceful:
                 try:
