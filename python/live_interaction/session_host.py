@@ -195,10 +195,13 @@ class LiveSessionHost:
 
         def on_event(event: dict[str, Any]) -> None:
             kind = event.get("type")
+            if hasattr(self.adapter, "on_event"):
+                observed = self.adapter.on_event(session, event)
+                if inspect.isawaitable(observed):
+                    asyncio.create_task(observed)
             if kind == "ready":
                 self._emit(session, event)
-                if session.ready and not session.ready.done():
-                    session.ready.set_result(event)
+                if session.ready and not session.ready.done():                    session.ready.set_result(event)
                 return
             if kind == "error":
                 self._emit(session, event)
@@ -397,8 +400,7 @@ class LiveSessionHost:
                 self._write(session, {"type": "stop"})
             except LiveError:
                 pass
-        if hasattr(self.adapter, "on_stopped"):
-            await _maybe_await(self.adapter.on_stopped(session))
+        if hasattr(self.adapter, "on_stopped"):            await _maybe_await(self.adapter.on_stopped(session))
         await self._discard(session, graceful=True)
         return {"ok": True, "session_id": session.id}
 

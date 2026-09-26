@@ -38,7 +38,7 @@ For in-process Python products, `live_interaction.session_host.LiveSessionHost` 
 matching generic host. Construct it with an `adapter_factory` and a server-owned
 `key_resolver(resource_id, actor)`. The adapter implements `initialize(...)` and
 `execute_tool(session, call)`; optional `input`, `on_started`, `on_resumed`, and
-`on_stopped` hooks mirror the Node host semantics. The host binds every session to
+`on_stopped` hooks mirror the Node host semantics. Optional `on_event(session, event)` observes\nprovider events before host projection, so a product can keep bounded conversation context\nwithout moving domain state into the provider. The host binds every session to
 resource+actor, bounds provider input to 768 KiB, caps audio chunks at 16k base64
 characters, paginates a 320-event ring, serializes tools, deduplicates successful
 provider call IDs, honors cancellation before execution, and never replays a mutation.

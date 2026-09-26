@@ -7,6 +7,10 @@ from live_interaction.session_host import LiveError, LiveSessionHost
 class Adapter:
     def __init__(self):
         self.called = []
+        self.observed = []
+
+    def on_event(self, session, event):
+        self.observed.append((session.resource_id, event.get("type"), event.get("text")))
 
     def initialize(self, *, resource_id, actor, model, **_args):
         return {
@@ -111,6 +115,11 @@ class SessionHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.called, ["one"])
         results = [e for e in session.events if e["type"] == "tool_result"]
         self.assertEqual([r["id"] for r in results], ["one", "one"])
+
+    async def test_provider_events_are_visible_to_product_adapter(self):
+        self.provider.events({"type": "input_transcript", "text": "Привет"})
+        await asyncio.sleep(0)
+        self.assertIn(("story1", "input_transcript", "Привет"), self.adapter.observed)
 
     async def test_stop_is_bounded_and_removes_session(self):
         session_id = self.started["session_id"]
