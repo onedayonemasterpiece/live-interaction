@@ -28,3 +28,49 @@ test('an Extended tool wait survives intermediate turnComplete and clears on IDL
  await new Promise(r=>setTimeout(r,180));release({events:[{seq:4,type:'tool_result',id:'mutation'},{seq:5,type:'interaction_status',status:'IDLE'}],cursor:5});await tick();
  assert.equal(waits.at(-1),null);client.stop();
 });
+
+
+test('microphone handoff reuses the existing stream and sends buffered PCM before live capture',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  let getUserMediaCalls=0,stopCalls=0,handoffCalls=0;
+  const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+  const handedStream={getTracks:()=>[track]};
+  class FakeNode{connect(){return this;}disconnect(){}}
+  class FakeProcessor extends FakeNode{onaudioprocess=null;}
+  class FakeContext{
+    sampleRate=48000;state='running';destination={};
+    createMediaStreamSource(stream){assert.equal(stream,handedStream);return new FakeNode();}
+    createScriptProcessor(){return new FakeProcessor();}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;throw new Error('must not open a second microphone');}}},configurable:true});
+  globalThis.AudioContext=FakeContext;
+  const inputs=[];
+  const client=createLiveClient({request:async(url,options={})=>{
+    if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));return {ok:true};}
+    if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
+    if(url==='/live/one/stop')return {ok:true};
+    throw new Error('unexpected '+url);
+  }});
+  try{
+    const chunk=new Float32Array(4096).fill(.2);
+    const started=await client.start({
+      url:'/live',
+      takeMicrophoneHandoff:async()=>{handoffCalls++;return {stream:handedStream,sampleRate:48000,chunks:[chunk,chunk,chunk,chunk]};}
+    });
+    assert.equal(started.session_id,'one');
+    assert.equal(handoffCalls,1);
+    assert.equal(getUserMediaCalls,0);
+    for(let i=0;i<10&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,20));
+    assert.ok(inputs.some(item=>typeof item.audio_base64==='string'&&item.audio_base64.length>100));
+    assert.equal(track.readyState,'live');
+    client.stop();
+    assert.equal(stopCalls,1);
+    assert.equal(track.readyState,'ended');
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});

@@ -77,16 +77,21 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const context=micContext;processor=inputSource=stream=micContext=null;
     if(context)void context.close().catch(()=>{});
   }
-  async function startMic(epoch){
-    if(!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return;}
+  async function startMic(epoch,handoff=null){
+    if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return;}
     try{
-      const captured=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+      const captured=handoff?.stream??await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
       if(epoch!==generation){for(const track of captured.getTracks())track.stop();return;}
       stream=captured;const Context=Audio();if(!Context)throw new Error('AudioContext unavailable');
       micContext=new Context();inputSource=micContext.createMediaStreamSource(stream);processor=micContext.createScriptProcessor(4096,1,1);
       sender=createLiveAudioSender({send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),onTiming:(event,metrics)=>{
         onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
       },onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}});
+      for(const chunk of handoff?.chunks??[]){
+        const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk),pcm=pcm16(samples,handoff.sampleRate);
+        let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
+        sender.push(pcm,Math.sqrt(energy/Math.max(1,samples.length)));
+      }
       processor.onaudioprocess=event=>{
         if(epoch!==generation||!sessionId)return;
         const samples=event.inputBuffer.getChannelData(0);let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
@@ -140,7 +145,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
-  async function start({url,body={},authorize=async()=>{}}){
+  async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null}){
     if(sessionId||starting)return;
     stopPlayback('new_session');const epoch=++generation;abort=new AbortController();starting=true;root=url;onState('starting');
     try{
@@ -150,7 +155,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       sessionId=started.session_id;model=started.model;cursor=0;onTiming('model_started',{model:started.model});onState('started',started);
       const Context=Audio();if(Context){playContext??=new Context();await playContext.resume().catch(()=>{});}
       if(epoch!==generation)return;
-      starting=false;void poll();await startMic(epoch);return started;
+      starting=false;void poll();const handoff=typeof takeMicrophoneHandoff==='function'?await takeMicrophoneHandoff():null;if(epoch!==generation){handoff?.stream?.getTracks?.().forEach(track=>track.stop());return;}await startMic(epoch,handoff);return started;
     }catch(error){if(epoch!==generation)return;stop();onState('start_error');onNotice('start_error',error);}
   }
   return {start,stop,input,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;}};
