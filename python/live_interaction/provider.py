@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import inspect
 import os
 import re
 import sys
@@ -19,6 +20,33 @@ def emit(payload):
 
 def default_key():
     return os.environ.get('LIVE_API_KEY')
+
+
+def _guard_check(resource_guard):
+    if resource_guard is not None:
+        resource_guard.check()
+
+
+async def _guarded_send(ws, payload, resource_guard=None):
+    _guard_check(resource_guard)
+    if resource_guard is not None:
+        pending = resource_guard.before_send(payload)
+        if inspect.isawaitable(pending):
+            await pending
+        _guard_check(resource_guard)
+    await ws.send(json.dumps(payload))
+    _guard_check(resource_guard)
+
+
+async def _guarded_recv(ws, resource_guard=None):
+    _guard_check(resource_guard)
+    raw = await ws.recv()
+    _guard_check(resource_guard)
+    return raw
+
+
+def _is_resource_failure(exc):
+    return bool(getattr(exc, 'resource_failure', False))
 
 
 async def read_line(reader):
@@ -76,7 +104,7 @@ def handle_server_message(obj, emit=emit):
         emit({'type': 'turn_complete'})
 
 
-async def run(*, load_key=default_key, reader=None, on_event=emit):
+async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None):
     from websockets import connect
     emit = on_event
     loop = asyncio.get_running_loop()
@@ -90,11 +118,12 @@ async def run(*, load_key=default_key, reader=None, on_event=emit):
     model = start.get('model', 'gemini-3.8-live')
     if model not in MODELS:
         raise ValueError('invalid_model')
-    key = load_key()
+    _guard_check(resource_guard)
+    key = resource_guard.key() if resource_guard is not None else load_key()
     if not key:
         emit({'type': 'error', 'code': 'LIVE_UNAVAILABLE', 'message': 'application_google_binding_missing'})
         return
-    state = {'ws': None, 'stopped': False, 'handle': None, 'context': start.get('context') or {}, 'reconnects': 0}
+    state = {'ws': None, 'stopped': False, 'handle': None, 'context': start.get('context') or {}, 'reconnects': 0, 'resource_error': None}
     search = bool(start.get("configuration", {}).get("search_enabled", False))
     if not search:
         emit({"type":"capability_unavailable","capability":"google_search","code":"PROVIDER_QUOTA","message":"Веб-поиск пока недоступен."})
@@ -134,7 +163,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit):
                 if kind in ('audio', 'audio_stream_end'):
                     max_stdin_delay_ms = max(max_stdin_delay_ms, max(0, started_ms - message.get('queued_at', started_ms)))
                     audio_chunks += int(kind == 'audio')
-                await ws.send(json.dumps(payload))
+                await _guarded_send(ws, payload, resource_guard)
                 if kind in ('audio', 'audio_stream_end'):
                     max_ws_send_ms = max(max_ws_send_ms, round(time.time() * 1000) - started_ms)
                 if kind == 'text':
@@ -143,28 +172,41 @@ async def run(*, load_key=default_key, reader=None, on_event=emit):
                     emit({'type': 'input_timing', 'audio_chunks': audio_chunks, 'max_stdin_delay_ms': max_stdin_delay_ms, 'max_ws_send_ms': max_ws_send_ms, 'audio_stream_end_sent_at': round(time.time() * 1000)})
                     audio_chunks = 0
                     max_stdin_delay_ms = max_ws_send_ms = 0
-            except Exception:
-                # Receiver owns bounded reconnect; sender remains alive to accept Stop.
+            except Exception as exc:
                 state['ws'] = None
+                if _is_resource_failure(exc):
+                    state['resource_error'] = exc
+                    state['stopped'] = True
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    raise
+                # Receiver owns bounded reconnect; sender remains alive to accept Stop.
 
     sender_task = asyncio.create_task(sender())
     try:
         while not state['stopped']:
             try:
+                _guard_check(resource_guard)
                 async with connect(ENDPOINT + '?key=' + quote(key, safe=''), open_timeout=15, close_timeout=2, max_size=8 * 1024 * 1024) as ws:
-                    await ws.send(json.dumps(setup_config(model, state['context'], start.get('history'), configuration=start.get('configuration'), search=search, handle=state['handle'])))
+                    setup = setup_config(model, state['context'], start.get('history'), configuration=start.get('configuration'), search=search, handle=state['handle'])
+                    await _guarded_send(ws, setup, resource_guard)
                     async with asyncio.timeout(20):
                         while True:
-                            obj = json.loads(await ws.recv())
+                            obj = json.loads(await _guarded_recv(ws, resource_guard))
                             if 'setupComplete' in obj:
                                 break
+                            _guard_check(resource_guard)
                             handle_server_message(obj, emit=emit)
                     if state['stopped']:
                         return
                     state['ws'] = ws
                     emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})
-                    async for raw in ws:
+                    while not state['stopped']:
+                        raw = await _guarded_recv(ws, resource_guard)
                         obj = json.loads(raw)
+                        _guard_check(resource_guard)
                         update = obj.get('sessionResumptionUpdate')
                         if update is not None:
                             state['handle'] = update.get('newHandle') if update.get('resumable') else None
@@ -178,6 +220,10 @@ async def run(*, load_key=default_key, reader=None, on_event=emit):
                 raise ConnectionError('provider_connection_closed')
             except Exception as exc:
                 state['ws'] = None
+                if state.get('resource_error') is not None:
+                    raise state['resource_error']
+                if _is_resource_failure(exc):
+                    raise
                 message = str(exc).replace(key, '[REDACTED]').replace(quote(key, safe=''), '[REDACTED]')
                 if search and not state['reconnects'] and 'quota' in message.lower():
                     search = False
@@ -191,6 +237,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit):
                 emit({'type': 'reconnecting', 'attempt': state['reconnects']})
                 await asyncio.sleep(min(2, state['reconnects'] * .5))
     except Exception as exc:
+        if _is_resource_failure(exc):
+            raise
         message = str(exc).replace(key, '[REDACTED]').replace(quote(key, safe=''), '[REDACTED]')
         emit({'type': 'error', 'code': type(exc).__name__, 'message': re.sub(r'AIza[A-Za-z0-9_-]{20,}', '[REDACTED]', message)[:500]})
     finally:
