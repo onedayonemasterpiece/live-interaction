@@ -144,3 +144,19 @@ failures visible and distinguish fixtures from real acceptance.
 Wonderful Lections Show should have a separate **read-only cohost tool adapter**,
 not reuse Review's mutation permissions by default. Street-story / idea-hub need
 their own context, authorization and UI; none is implemented by this extraction.
+
+## Updating a consumer by version
+
+For the initial npm archive distribution, use the source repository helper:
+
+```sh
+node scripts/update-consumer.mjs /path/to/product 0.1.0 /path/to/managed/artifacts
+# Or resolve the current stable release once:
+node scripts/update-consumer.mjs /path/to/product latest /path/to/managed/artifacts
+```
+
+It downloads the versioned public release, checks package identity, updates the
+versioned archive/manifest and lockfile. Then run npm ci/build and acceptance.
+`latest` is resolved during this explicit update; it never changes the code of
+an already running Live session. Keep previous package archives only if needed
+for your source history/release policy. The helper neither commits nor deploys.

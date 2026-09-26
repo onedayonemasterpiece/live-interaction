@@ -10,6 +10,11 @@ local checkout `/home/dev/projects/live-interaction`. Read its
 [adapter contract](https://github.com/onedayonemasterpiece/live-interaction/blob/main/docs/integration.md)
 from the local checkout or versioned dependency before implementation. The repository and its versioned GitHub release archives are public.
 
+Use semantic release versions. For npm consumers, the framework source helper
+`scripts/update-consumer.mjs <product> <version|latest> <managed-artifacts>` updates
+the release archive and lockfile; run build/acceptance before deploying. Never
+auto-update a running session.
+
 Use the shared browser client and Python provider; Node hosts also use the shared
 session host. Add product tools/context/UI/authorization as adapters. Improve a
 missing transport capability in the shared repository, then update the consumer's
