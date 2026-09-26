@@ -65,7 +65,7 @@ connection_error, start_error; second argument may be an Error.
 `onTiming` contains bounded numeric diagnostics, not speech/secret payloads.
 `onWait(null | {elapsed_ms,stage,can_restart})` stays hidden below 15 seconds;
 show mm:ss, a gentle pulse honoring reduced motion, and an immediate Stop.
-Stage is transport until worker-send/ASR evidence, then provider. At 120 seconds,
+Stage is transport until worker-send/ASR evidence, then provider; outstanding tool calls use action so a slow application is not blamed on Google. Extended intermediate turnComplete does not complete an outstanding wait. At 120 seconds,
 offer explicit Stop+Start without replaying the old command. Never auto-restart
 or automatically retry a mutation. Already accepted writes may still finish;
 refresh authoritative product state after reconnect.

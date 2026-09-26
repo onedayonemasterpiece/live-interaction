@@ -17,11 +17,12 @@ function pcm16(samples,fromRate){
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
 export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation}}={}){
-  let sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
+  let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
   let stream=null,micContext=null,processor=null,inputSource=null,sender=null;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false;
+  const pendingTools=new Set();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
   function beginWait(){
@@ -114,8 +115,12 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
           // Compare events within the server clock only; browser clock may differ.
           if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage='provider';
         }else if(event.type==='interrupted'){clearWait();onTiming('provider_interrupted');stopPlayback('provider_interrupted');}
+        else if(event.type==='tool_call'){for(const call of event.calls??[])pendingTools.add(call.id);waitStage='action';}
+        else if(event.type==='tool_result'){pendingTools.delete(event.id);if(!pendingTools.size)waitStage='provider';}
+        else if(event.type==='tool_cancelled'){for(const id of event.ids??[])pendingTools.delete(id);if(!pendingTools.size)waitStage='provider';}
+        else if(event.type==='interaction_status'&&event.status==='IDLE'){awaitingReply=false;clearWait();}
         else if(event.type==='turn_complete'){
-          awaitingReply=false;clearWait();if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
+          if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
         }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
         else if(event.type==='resumed'){void startMic(epoch);}
         if(epoch!==generation)return;
@@ -132,7 +137,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function stop({keepalive=false,reason='user_stop',preservePlayback=false}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();closeMic();clearTimeout(pollTimer);pollTimer=null;
-    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;cursor=0;starting=false;
+    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
   async function start({url,body={},authorize=async()=>{}}){
@@ -142,7 +147,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       await authorize();if(epoch!==generation)return;
       const started=await request(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
       if(epoch!==generation){remoteStop(`${url}/${encodeURIComponent(started.session_id)}/stop`);return;}
-      sessionId=started.session_id;cursor=0;onTiming('model_started',{model:started.model});onState('started',started);
+      sessionId=started.session_id;model=started.model;cursor=0;onTiming('model_started',{model:started.model});onState('started',started);
       const Context=Audio();if(Context){playContext??=new Context();await playContext.resume().catch(()=>{});}
       if(epoch!==generation)return;
       starting=false;void poll();await startMic(epoch);return started;
