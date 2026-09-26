@@ -1,0 +1,11 @@
+{
+  "name": "@onedayonemasterpiece/live-interaction",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared browser audio lifecycle and Gemini Live transport with application adapters",
+  "exports": {"./browser": "./browser/client.js", "./node": "./node/sessions.mjs", "./assets": "./node/assets.mjs", "./package.json": "./package.json"},
+  "files": ["browser", "node", "python", "skills", "docs", "README.md"],
+  "scripts": {"test": "node --test tests/*.test.mjs", "test:python": "PYTHONPATH=python python3 -m unittest discover -s tests -p '*_test.py'"},
+  "engines": {"node": ">=22"}
+}
