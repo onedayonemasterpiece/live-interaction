@@ -74,3 +74,41 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
     if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
   }
 });
+
+test('text-only start does not request microphone and microphone can be enabled later in the same session',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  let getUserMediaCalls=0,stopCalls=0;
+  const track={stop(){stopCalls++;}};
+  const liveStream={getTracks:()=>[track]};
+  class FakeNode{connect(){return this;}disconnect(){}}
+  class FakeProcessor extends FakeNode{onaudioprocess=null;}
+  class FakeContext{
+    sampleRate=48000;state='running';destination={};
+    createMediaStreamSource(stream){assert.equal(stream,liveStream);return new FakeNode();}
+    createScriptProcessor(){return new FakeProcessor();}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return liveStream;}}},configurable:true});
+  globalThis.AudioContext=FakeContext;
+  const client=createLiveClient({request:async(url)=>{
+    if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+    if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
+    if(url==='/live/one/stop')return {ok:true};
+    return {ok:true};
+  }});
+  try{
+    await client.start({url:'/live',microphone:false});
+    assert.equal(client.sessionId,'one');
+    assert.equal(client.microphoneEnabled,false);
+    assert.equal(getUserMediaCalls,0);
+    assert.equal(await client.enableMicrophone(),true);
+    assert.equal(client.microphoneEnabled,true);
+    assert.equal(getUserMediaCalls,1);
+    client.stop();
+    assert.equal(stopCalls,1);
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
