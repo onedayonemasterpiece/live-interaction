@@ -1,6 +1,6 @@
 # Shared Live runtime
 
-This private repository is the canonical implementation of browser Live audio
+This repository is the canonical implementation of browser Live audio
 and Gemini session transport for our products. Read `docs/integration.md` before
 changing a public interface or integrating a consumer.
 

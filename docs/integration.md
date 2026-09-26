@@ -12,7 +12,7 @@ an editable source fork. Update it from the next versioned framework release; ke
 This also works in container builds without granting a cross-repository key to CI.
 Do not distribute a private package inside a public product without authorization.
 
-Consumers with private Git read access may instead use this form:
+The framework repository is public. Consumers preferring Git version resolution may use this form:
 
 Node: `@onedayonemasterpiece/live-interaction` dependency set to
 `git+https://github.com/onedayonemasterpiece/live-interaction.git#semver:^0.1.0`.

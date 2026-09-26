@@ -1,6 +1,6 @@
 # Live Interaction
 
-Private shared Live runtime for Wonderful Lections and future product adapters.
+Shared Live runtime for Wonderful Lections and future product adapters.
 The first consumer is Wonderful Lections Review. This is a small extraction of
 its tested audio/lifecycle paths, not a general agent framework.
 
@@ -17,7 +17,7 @@ its tested audio/lifecycle paths, not a general agent framework.
 Use versioned releases (initial release `0.1.0`); see [integration](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
-speech/mutations. Repository visibility is private; no npm public publishing.
+speech/mutations. Repository visibility is public by owner request. Versioned archives are published as GitHub Releases; npm registry publishing is not configured.
 
 ## Measured boundary
 

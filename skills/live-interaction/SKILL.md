@@ -1,15 +1,14 @@
 ---
 name: live-interaction
-description: Integrate or change interactive Live voice/video sessions in Wonderful Lections, street-story, idea-hub or another product using the shared private live-interaction framework. Use for microphone transport, model playback, Live lifecycle, recovery or new Live product adapters; ordinary recorded voice-review is a separate flow.
+description: Integrate or change interactive Live voice/video sessions in Wonderful Lections, street-story, idea-hub or another product using the shared live-interaction framework. Use for microphone transport, model playback, Live lifecycle, recovery or new Live product adapters; ordinary recorded voice-review is a separate flow.
 ---
 
 # Shared Live interaction
 
-Canonical implementation: `onedayonemasterpiece/live-interaction` (private),
+Canonical implementation: `onedayonemasterpiece/live-interaction` (public),
 local checkout `/home/dev/projects/live-interaction`. Read its
 [adapter contract](https://github.com/onedayonemasterpiece/live-interaction/blob/main/docs/integration.md)
-from the local checkout or versioned dependency before implementation. Do not fetch
-public pages as a substitute for authenticated access to this private source.
+from the local checkout or versioned dependency before implementation. The repository and its versioned GitHub release archives are public.
 
 Use the shared browser client and Python provider; Node hosts also use the shared
 session host. Add product tools/context/UI/authorization as adapters. Improve a
