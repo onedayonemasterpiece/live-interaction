@@ -106,14 +106,14 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         if(epoch!==generation)return;
         if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
         if(event.type==='input_transcript'){
-          waitStage='provider';
+          waitStage=pendingTools.size?'action':'provider';
           if(Date.now()-transcriptAt>2000)inputTranscript='';
           transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
         }else if(event.type==='audio'){
           awaitingReply=false;clearWait();if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);
         }else if(event.type==='input_timing'){
           // Compare events within the server clock only; browser clock may differ.
-          if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage='provider';
+          if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage=pendingTools.size?'action':'provider';
         }else if(event.type==='interrupted'){clearWait();onTiming('provider_interrupted');stopPlayback('provider_interrupted');}
         else if(event.type==='tool_call'){for(const call of event.calls??[])pendingTools.add(call.id);waitStage='action';}
         else if(event.type==='tool_result'){pendingTools.delete(event.id);if(!pendingTools.size)waitStage='provider';}
