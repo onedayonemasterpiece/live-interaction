@@ -129,6 +129,106 @@ class SessionHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(self.host.size(), 0)
 
+class ManagedProvider:
+    def __init__(self):
+        self.calls = 0
+        self.cancelled = False
+        self.started = asyncio.Event()
+
+    async def run(self, *, session, reader, on_event):
+        self.calls += 1
+        start = await reader.readline()
+        self.started.set()
+        on_event({"type": "ready", "model": session.model})
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    return
+                if b'"type":"stop"' in line:
+                    return
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class ManagedHostContract(unittest.IsolatedAsyncioTestCase):
+    async def test_managed_runner_does_not_resolve_legacy_key(self):
+        adapter = Adapter()
+        provider = ManagedProvider()
+        legacy_calls = []
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            key_resolver=lambda *_args: legacy_calls.append(True) or "legacy-key",
+            managed_runner=provider.run,
+            ready_timeout_ms=500,
+        )
+        try:
+            started = await host.start(
+                resource_id="search1",
+                actor={"subject": "a", "tenant_id": "t"},
+            )
+            self.assertTrue(started["session_id"].startswith("live_"))
+            self.assertEqual(provider.calls, 1)
+            self.assertEqual(legacy_calls, [])
+        finally:
+            await host.stop_all()
+
+    async def test_client_liveness_discards_session_and_cancels_provider(self):
+        from unittest.mock import patch
+        adapter = Adapter()
+        provider = ManagedProvider()
+        now = [1000]
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            managed_runner=provider.run,
+            ready_timeout_ms=500,
+            client_liveness_timeout_ms=1000,
+        )
+        with patch("live_interaction.session_host._now_ms", side_effect=lambda: now[0]):
+            started = await host.start(
+                resource_id="search1",
+                actor={"subject": "a", "tenant_id": "t"},
+            )
+            now[0] = 2500
+            await asyncio.sleep(0.45)
+            self.assertNotIn(started["session_id"], host.sessions)
+            self.assertTrue(provider.cancelled)
+
+
+class SlowAdapter(Adapter):
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def initialize(self, **kwargs):
+        self.entered.set()
+        await self.release.wait()
+        return super().initialize(**kwargs)
+
+
+class ConcurrentStartContract(unittest.IsolatedAsyncioTestCase):
+    async def test_start_slot_is_reserved_before_async_initialization(self):
+        adapter = SlowAdapter()
+        provider = ManagedProvider()
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            managed_runner=provider.run,
+            max_sessions=1,
+            ready_timeout_ms=500,
+        )
+        actor = {"subject": "a", "tenant_id": "t"}
+        first = asyncio.create_task(host.start(resource_id="one", actor=actor))
+        await adapter.entered.wait()
+        with self.assertRaises(LiveError) as busy:
+            await host.start(resource_id="two", actor=actor)
+        self.assertEqual(busy.exception.code, "LIVE_BUSY")
+        adapter.release.set()
+        started = await first
+        self.assertTrue(started["session_id"].startswith("live_"))
+        await host.stop_all()
+
 
 if __name__ == "__main__":
     unittest.main()

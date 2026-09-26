@@ -170,3 +170,19 @@ versioned archive/manifest and lockfile. Then run npm ci/build and acceptance.
 `latest` is resolved during this explicit update; it never changes the code of
 an already running Live session. Keep previous package archives only if needed
 for your source history/release policy. The helper neither commits nor deploys.
+
+## Shared resource guard in 0.1.3
+
+A consumer that reserves Live capacity through a shared controller passes its
+lease to the provider as resource_guard. The transport checks the lease before
+opening or resuming a provider connection and before/after provider receives.
+It calls before_send(payload) before setup and every outbound provider message,
+then rechecks the lease before bytes are written.
+
+The key is resolved once from resource_guard.key() and remains pinned through
+session resumption. An exception marked resource_failure is terminal for the
+provider session: it is propagated to the resource controller and cannot cause
+reconnect, Search capability downgrade, or key rotation.
+
+The parameter is optional only for compatibility with consumers that have not
+yet migrated. New or changed managed consumers must supply the shared guard.
