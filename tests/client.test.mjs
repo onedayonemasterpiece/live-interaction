@@ -19,3 +19,12 @@ test('delay is hidden for 15 seconds, distinguishes delivery from provider, and 
  t.mock.timers.tick(105000);assert.equal(waits.at(-1).stage,'provider');assert.equal(waits.at(-1).elapsed_ms,120000);assert.equal(waits.at(-1).can_restart,true);
  client.stop();assert.equal(waits.at(-1),null);assert.equal(client.sessionId,null);
 });
+test('an Extended tool wait survives intermediate turnComplete and clears on IDLE',async t=>{
+ t.mock.timers.enable({apis:['setInterval','Date'],now:1000});let release;const waits=[];
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live-extended-thinking'}):url.includes('/events')?new Promise(r=>release=r):Promise.resolve({}),onWait:s=>waits.push(s)});
+ await client.start({url:'/live'});await client.input({text:'do the action'});
+ release({events:[{seq:1,type:'tool_call',calls:[{id:'mutation'}]},{seq:2,type:'turn_complete'}],cursor:2});await tick();
+ t.mock.timers.tick(16000);assert.equal(waits.at(-1).stage,'action');
+ await new Promise(r=>setTimeout(r,180));release({events:[{seq:3,type:'tool_result',id:'mutation'},{seq:4,type:'interaction_status',status:'IDLE'}],cursor:4});await tick();
+ assert.equal(waits.at(-1),null);client.stop();
+});
