@@ -14,11 +14,11 @@ public pages as a substitute for authenticated access to this private source.
 Use the shared browser client and Python provider; Node hosts also use the shared
 session host. Add product tools/context/UI/authorization as adapters. Improve a
 missing transport capability in the shared repository, then update the consumer's
-immutable Git dependency and lockfile. Do not fork/copy an independent audio queue,
+immutable release dependency and lockfile. Do not fork/copy an independent audio queue,
 provider websocket, playback or Stop implementation into a product.
 
 Build browser modules from the installed package; generated copies are ignored
-and covered by the consumer's asset hash/cache manifest. Enforce full-SHA pinning,
+and covered by the consumer's asset hash/cache manifest. Enforce full source-SHA pinning, release archive digest (or immutable Git ref),
 lockfile provenance and generated-asset equality in the consumer's CI/build.
 Wonderful Lections has `scripts/verify-live-framework.mjs` as the first example.
 This guard plus review enforces known integration paths; a skill alone does not

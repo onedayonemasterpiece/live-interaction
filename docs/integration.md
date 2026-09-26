@@ -2,6 +2,18 @@
 
 ## Pin and import
 
+The first consumer uses a release tarball in its private `vendor/` directory.
+Build it with `npm pack` from a clean, committed framework checkout. Record its
+full source commit and SHA-256 in the consumer's `liveFramework` package metadata,
+use a `file:vendor/live-interaction-<commit>.tgz` dependency, and commit the npm
+lockfile (SHA-512 integrity). CI verifies pin metadata, archive digest, lockfile
+and installed/generated assets. This is an immutable distribution artifact, not
+an editable source fork. Update it only by repacking a reviewed framework commit.
+This also works in container builds without granting a cross-repository key to CI.
+Do not distribute a private package inside a public product without authorization.
+
+Consumers with private Git read access may instead use this form:
+
 Node: `@onedayonemasterpiece/live-interaction` dependency set to
 `git+https://github.com/onedayonemasterpiece/live-interaction.git#<full commit SHA>`.
 Commit the lockfile. Build browser assets with
