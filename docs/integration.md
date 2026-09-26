@@ -22,7 +22,7 @@ these generated modules in the application's content hash/cache manifest. Never
 edit or commit generated copies. Import `createLiveClient` from the generated
 `client.js`; server imports `createLiveSessionHost` from the `/node` export.
 
-Python: install `live-interaction @ git+https://github.com/onedayonemasterpiece/live-interaction.git@v0.1.0`.
+Python: install `live-interaction @ git+https://github.com/onedayonemasterpiece/live-interaction.git@v0.1.2`.
 Use `live_interaction.provider.run(load_key=server_credential_resolver)` for the
 worker entrypoint. Default resolver reads only `LIVE_API_KEY`. Node packages
 include the same Python module, so a Node consumer need not perform a separate
@@ -33,6 +33,16 @@ also available for a Python host. Feed bounded NDJSON commands to the reader;
 callbacks receive events. Product endpoints and tool authorization belong in
 the host. Python applications should reuse this transport; they do not need the
 Wonderful Lections presentation service or Node to connect to Google.
+
+For in-process Python products, `live_interaction.session_host.LiveSessionHost` is the
+matching generic host. Construct it with an `adapter_factory` and a server-owned
+`key_resolver(resource_id, actor)`. The adapter implements `initialize(...)` and
+`execute_tool(session, call)`; optional `input`, `on_started`, `on_resumed`, and
+`on_stopped` hooks mirror the Node host semantics. Optional `on_event(session, event)` observes\nprovider events before host projection, so a product can keep bounded conversation context\nwithout moving domain state into the provider. The host binds every session to
+resource+actor, bounds provider input to 768 KiB, caps audio chunks at 16k base64
+characters, paginates a 320-event ring, serializes tools, deduplicates successful
+provider call IDs, honors cancellation before execution, and never replays a mutation.
+Applications still authenticate every HTTP route before calling the host.
 
 ## Browser API
 

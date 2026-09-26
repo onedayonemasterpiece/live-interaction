@@ -11,10 +11,12 @@ its tested audio/lifecycle paths, not a general agent framework.
   pagination, serialized/cancelled/deduplicated tool execution, bounded cleanup.
 - `python/live_interaction/provider.py`: one real Gemini WebSocket, setup,
   compression/resumption, same-model bounded recovery, provider event translation.
+- `python/live_interaction/session_host.py`: in-process Python session host with
+  resource/actor binding, bounded NDJSON input, event cursors and ordered/deduplicated tools.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (initial release `0.1.0`); see [integration](docs/integration.md).
+Use versioned releases (current release `0.1.2`); see [integration](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
 speech/mutations. Repository visibility is public by owner request. Versioned archives are published as GitHub Releases; npm registry publishing is not configured.
