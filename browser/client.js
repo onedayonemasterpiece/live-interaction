@@ -18,7 +18,7 @@ function pcm16(samples,fromRate){
 // go through this client, including Stop while setup or a poll is still pending.
 export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation}}={}){
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
-  let stream=null,micContext=null,processor=null,inputSource=null,sender=null;
+  let stream=null,micContext=null,processor=null,inputSource=null,sender=null,microphoneEnabled=false;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false;
@@ -77,24 +77,30 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const context=micContext;processor=inputSource=stream=micContext=null;
     if(context)void context.close().catch(()=>{});
   }
-  async function startMic(epoch){
-    if(!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return;}
+  async function startMic(epoch,handoff=null){
+    if(!microphoneEnabled)return false;
+    if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
-      const captured=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-      if(epoch!==generation){for(const track of captured.getTracks())track.stop();return;}
+      const captured=handoff?.stream??await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+      if(epoch!==generation||!microphoneEnabled){for(const track of captured.getTracks())track.stop();return false;}
       stream=captured;const Context=Audio();if(!Context)throw new Error('AudioContext unavailable');
       micContext=new Context();inputSource=micContext.createMediaStreamSource(stream);processor=micContext.createScriptProcessor(4096,1,1);
       sender=createLiveAudioSender({send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),onTiming:(event,metrics)=>{
         onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
       },onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}});
+      for(const chunk of handoff?.chunks??[]){
+        const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk),pcm=pcm16(samples,handoff.sampleRate);
+        let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
+        sender.push(pcm,Math.sqrt(energy/Math.max(1,samples.length)));
+      }
       processor.onaudioprocess=event=>{
         if(epoch!==generation||!sessionId)return;
         const samples=event.inputBuffer.getChannelData(0);let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
         // Only provider interruption or an explicit Stop cancels model playback.
         sender.push(pcm16(samples,micContext.sampleRate),Math.sqrt(energy/samples.length));
       };
-      inputSource.connect(processor);processor.connect(micContext.destination);onState('listening');
-    }catch(error){if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
+      inputSource.connect(processor);processor.connect(micContext.destination);onState('listening');return true;
+    }catch(error){if(epoch!==generation)return false;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);return false;}
   }
   async function poll(){
     if(!sessionId)return;const epoch=generation;
@@ -122,7 +128,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         else if(event.type==='turn_complete'){
           if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
         }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
-        else if(event.type==='resumed'){void startMic(epoch);}
+        else if(event.type==='resumed'&&microphoneEnabled){void startMic(epoch);}
         if(epoch!==generation)return;
         onEvent(event,epoch);cursor=event.seq??cursor;
       }
@@ -137,12 +143,12 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function stop({keepalive=false,reason='user_stop',preservePlayback=false}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();closeMic();clearTimeout(pollTimer);pollTimer=null;
-    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;
+    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
-  async function start({url,body={},authorize=async()=>{}}){
+  async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true}){
     if(sessionId||starting)return;
-    stopPlayback('new_session');const epoch=++generation;abort=new AbortController();starting=true;root=url;onState('starting');
+    stopPlayback('new_session');const epoch=++generation;abort=new AbortController();starting=true;root=url;microphoneEnabled=Boolean(microphone);onState('starting');
     try{
       await authorize();if(epoch!==generation)return;
       const started=await request(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
@@ -150,8 +156,18 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       sessionId=started.session_id;model=started.model;cursor=0;onTiming('model_started',{model:started.model});onState('started',started);
       const Context=Audio();if(Context){playContext??=new Context();await playContext.resume().catch(()=>{});}
       if(epoch!==generation)return;
-      starting=false;void poll();await startMic(epoch);return started;
+      starting=false;void poll();const handoff=microphoneEnabled&&typeof takeMicrophoneHandoff==='function'?await takeMicrophoneHandoff():null;if(epoch!==generation){handoff?.stream?.getTracks?.().forEach(track=>track.stop());return;}if(microphoneEnabled)await startMic(epoch,handoff);return started;
     }catch(error){if(epoch!==generation)return;stop();onState('start_error');onNotice('start_error',error);}
   }
-  return {start,stop,input,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;}};
+  async function enableMicrophone({takeMicrophoneHandoff=null}={}){
+    if(!sessionId)return false;
+    microphoneEnabled=true;
+    if(stream)return true;
+    const epoch=generation;
+    const handoff=typeof takeMicrophoneHandoff==='function'?await takeMicrophoneHandoff():null;
+    if(epoch!==generation){handoff?.stream?.getTracks?.().forEach(track=>track.stop());return false;}
+    return startMic(epoch,handoff);
+  }
+  function disableMicrophone(){microphoneEnabled=false;closeMic();}
+  return {start,stop,input,enableMicrophone,disableMicrophone,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;},get microphoneEnabled(){return microphoneEnabled;}};
 }
