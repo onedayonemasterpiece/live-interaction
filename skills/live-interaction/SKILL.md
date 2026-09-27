@@ -35,7 +35,9 @@ Do not ask the user to paste credentials or put them in browser config/receipts.
 
 Preserve one ordered bounded sender, silence preroll/tail, immediate local Stop,
 no stale speech replay, full received output playback, separate spoken Stop
-confirmation, owner/resource checks and serialized authorized tools. A Show/cohost
+confirmation, owner/resource checks and serialized authorized tools. An intentional
+same-microphone startup handoff may use the framework's bounded catch-up seed; do not
+weaken the normal steady-state queue/age limits to accommodate it. A Show/cohost
 adapter should start read-only; do not inherit Review mutation permissions.
 
 Surface waits after 15s with elapsed mm:ss, truthful transport/provider stage,

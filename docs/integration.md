@@ -50,8 +50,10 @@ Applications still authenticate every HTTP route before calling the host.
 voiceControl?})` returns `start`, `stop`, `input` and read-only `sessionId`,
 `starting`, `generation`, `playingCount`.
 
-`start({url,body,authorize})`: same-origin authenticated collection URL, application
-start arguments (model/context IDs/history, never a key), async authorization.
+`start({url,body,authorize,takeMicrophoneHandoff?,microphone?})`: same-origin authenticated collection URL, application
+start arguments (model/context IDs/history, never a key), async authorization. A
+microphone handoff reuses the existing MediaStream and may seed buffered PCM captured
+while the server/provider session was starting; it must not open a second microphone.
 Default HTTP protocol: POST collection -> `{session_id,model,...app metadata}`;
 POST `/:id/input` -> `{ok:true}`; GET `/:id/events?after=N` ->
 `{events,cursor,has_more,gap,closed}`; POST `/:id/stop` -> `{ok:true}`.
@@ -131,7 +133,11 @@ normal domain reconciliation.
 
 Current measured defaults: 256ms batch; <=11000 PCM bytes / <=16000 base64
 characters; 1.5s buffered PCM, 2.5s age/request bound; one in-flight sender;
-250ms preroll; conservative RMS gate; 2s quiet tail. Silence is suppressed after
+250ms preroll; conservative RMS gate; 2s quiet tail. An intentional startup
+microphone handoff may seed at most 20s of PCM and temporarily uses a separate
+bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog is
+back within the ordinary watermark, queued ages are rebased once and the strict
+1.5s / 2.5s steady-state guards resume. Silence is suppressed after
 the tail. PCM is required by this provider transport; AAC/OGG would need a measured
 server decoder and new acceptance, not just a MIME rename. Poll 160ms, drain
 has_more immediately, report gaps, and play every received audio buffer before
