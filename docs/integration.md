@@ -186,3 +186,16 @@ reconnect, Search capability downgrade, or key rotation.
 
 The parameter is optional only for compatibility with consumers that have not
 yet migrated. New or changed managed consumers must supply the shared guard.
+
+## Future provider research
+
+The 0.1.x provider transport is Gemini-specific. Potential alternatives are kept
+in [the Live provider research backlog](provider-research-backlog.md), including
+Qwen Audio/Omni Realtime, StepAudio, GLM-Realtime, SeedRealtime, OpenAI
+Realtime/GPT-Live, Grok Voice, Nova Sonic, Hume EVI and self-hosted research
+options such as MiniCPM-o and PersonaPlex.
+
+This list is intentionally **not** a fallback chain. A new provider needs a thin
+adapter plus provider-specific real acceptance. Do not switch providers inside a
+running/recovering session merely because Gemini is slow, unavailable or out of
+quota.
