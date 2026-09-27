@@ -151,7 +151,7 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
-    async def test_reconfigure_uses_same_resumption_handle_without_reconnect_budget(self):
+    async def test_reconfigure_completes_router_call_before_using_fresh_resumption_handle(self):
         reader=_QueueReader()
         reader.feed({
             'type':'start',
@@ -164,7 +164,7 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
         })
         first=_FakeSocket([
             {'setupComplete':{}},
-            {'sessionResumptionUpdate':{'resumable':True,'newHandle':'opaque-handle'}},
+            {'sessionResumptionUpdate':{'resumable':True,'newHandle':'old-handle'}},
         ])
         second=_FakeSocket([{'setupComplete':{}}])
         sockets=[first,second]
@@ -175,18 +175,13 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError('unexpected third provider connection')
             return sockets.pop(0)
         events=[]
-        task=asyncio.create_task(run(
-            load_key=lambda:'fixture-key',
-            reader=reader,
-            on_event=events.append,
-        ))
+        task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
         with patch('websockets.connect',side_effect=fake_connect):
             for _ in range(100):
                 if any(e.get('type')=='resumption_state' and e.get('resumable') for e in events):
                     break
                 await asyncio.sleep(0.001)
             self.assertTrue(any(e.get('type')=='ready' for e in events))
-            self.assertTrue(any(e.get('type')=='resumption_state' and e.get('resumable') for e in events))
             reader.feed({
                 'type':'reconfigure',
                 'transition_id':'tr-1',
@@ -196,19 +191,37 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                     'functions':[{'name':'activate_capability'},{'name':'dataset.find'}],
                 },
                 'context':{'slide':'one','scope':'dataset'},
+                'continuation':'find national projects dataset',
+                'router_response':{
+                    'name':'activate_capability',
+                    'id':'cap-1',
+                    'response':{'result':{'capability':'dataset','accepted':True},'scheduling':'SILENT'},
+                },
             })
             for _ in range(100):
+                if any('toolResponse' in item for item in first.sent):
+                    break
+                await asyncio.sleep(0.001)
+            self.assertTrue(any('toolResponse' in item for item in first.sent))
+            self.assertEqual(len(connect_calls),1)
+            first.incoming.put_nowait({'sessionResumptionUpdate':{'resumable':True,'newHandle':'fresh-handle'}})
+            for _ in range(200):
                 if any(e.get('type')=='capability_ready' and e.get('transition_id')=='tr-1' for e in events):
                     break
                 await asyncio.sleep(0.001)
             self.assertEqual(len(connect_calls),2)
             self.assertEqual(first.sent[0]['setup']['sessionResumption'],{})
-            self.assertEqual(second.sent[0]['setup']['sessionResumption'],{'handle':'opaque-handle'})
+            self.assertEqual(second.sent[0]['setup']['sessionResumption'],{'handle':'fresh-handle'})
             names=[x['name'] for x in second.sent[0]['setup']['tools'][0]['functionDeclarations']]
             self.assertEqual(names,['activate_capability','dataset.find'])
+            continuation=[item for item in second.sent if 'clientContent' in item]
+            self.assertEqual(len(continuation),1)
+            self.assertIn('find national projects dataset',continuation[0]['clientContent']['turns'][0]['parts'][0]['text'])
             self.assertFalse(any(e.get('type')=='reconnecting' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_transition_acknowledged' for e in events))
             self.assertTrue(any(e.get('type')=='capability_transition_started' for e in events))
             self.assertTrue(any(e.get('type')=='capability_ready' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_continuation_sent' for e in events))
             reader.feed({'type':'stop'})
             await asyncio.wait_for(task,1)
 

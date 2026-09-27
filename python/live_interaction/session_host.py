@@ -129,7 +129,15 @@ def _validate_capability_spec(spec: Any) -> dict[str, Any]:
     context = spec.get("context")
     if context is not None and not isinstance(context, dict):
         raise LiveError("LIVE_CAPABILITY_INVALID", "Capability context is invalid")
-    return {**spec, "capability": capability, **meta}
+    continuation = spec.get("continuation")
+    if continuation is not None and (not isinstance(continuation, str) or len(continuation) > 1200):
+        raise LiveError("LIVE_CAPABILITY_INVALID", "Capability continuation is invalid")
+    return {
+        **spec,
+        "capability": capability,
+        "continuation": continuation.strip() if isinstance(continuation, str) else None,
+        **meta,
+    }
 
 
 class LiveSessionHost:
@@ -142,7 +150,7 @@ class LiveSessionHost:
         managed_runner: Callable[..., Awaitable[None]] | None = None,
         models: tuple[str, ...] = LIVE_SESSION_MODELS,
         ready_timeout_ms: int = 30_000,
-        reconfigure_timeout_ms: int = 10_000,
+        reconfigure_timeout_ms: int = 30_000,
         max_sessions: int = 2,
         client_liveness_timeout_ms: int = 60_000,
     ):
@@ -451,6 +459,13 @@ class LiveSessionHost:
                 "schema_bytes": resolved["schema_bytes"],
             },
         )
+        call_id = str(call.get("id") or "")
+        call_name = str(call.get("name") or "unknown")
+        fallback_intent = str((call.get("args") or {}).get("intent") or "").strip()
+        continuation = resolved.get("continuation") or fallback_intent
+        if len(continuation) > 1200:
+            raise LiveError("LIVE_CAPABILITY_INVALID", "Capability continuation is invalid")
+        acknowledgement = {"capability": resolved["capability"], "accepted": True}
         try:
             self._write(
                 session,
@@ -460,78 +475,46 @@ class LiveSessionHost:
                     "capability": resolved["capability"],
                     "configuration": resolved["configuration"],
                     "context": resolved.get("context") or {},
+                    "continuation": continuation,
+                    "router_response": {
+                        "name": call_name,
+                        "id": call_id,
+                        "response": {"result": acknowledgement, "scheduling": "SILENT"},
+                    },
                 },
             )
-            await asyncio.wait_for(
-                asyncio.shield(future), timeout=self.reconfigure_timeout_ms / 1000
-            )
+            await asyncio.wait_for(asyncio.shield(future), timeout=self.reconfigure_timeout_ms / 1000)
             session.capability = resolved["capability"]
             session.configuration_digest = resolved["configuration_digest"]
             result = {
                 "capability": session.capability,
                 "ready": True,
-                **(
-                    resolved.get("response")
-                    if isinstance(resolved.get("response"), dict)
-                    else {}
-                ),
+                **(resolved.get("response") if isinstance(resolved.get("response"), dict) else {}),
             }
-            call_id = str(call.get("id") or "")
             self._remember_tool_result(session, call_id, result)
-            self._emit(
-                session,
-                {
-                    "type": "tool_result",
-                    "name": str(call.get("name") or "unknown"),
-                    "id": call_id,
-                    "status": "ok",
-                    "capability": session.capability,
-                },
-            )
-            self._send_tool_responses(
-                session,
-                [
-                    {
-                        "name": str(call.get("name") or "unknown"),
-                        "id": call_id,
-                        "response": {"result": result},
-                    }
-                ],
-            )
+            self._emit(session, {
+                "type": "tool_result",
+                "name": call_name,
+                "id": call_id,
+                "status": "ok",
+                "capability": session.capability,
+            })
         except Exception as exc:
             code = getattr(exc, "code", "LIVE_CAPABILITY_ERROR")
-            self._emit(
-                session,
-                {
-                    "type": "capability_transition_failed",
-                    "transition_id": transition_id,
-                    "from_capability": session.capability,
-                    "to_capability": resolved["capability"],
-                    "code": code,
-                },
-            )
-            self._emit(
-                session,
-                {
-                    "type": "tool_result",
-                    "name": str(call.get("name") or "unknown"),
-                    "id": str(call.get("id") or ""),
-                    "status": "error",
-                    "code": code,
-                },
-            )
-            self._send_tool_responses(
-                session,
-                [
-                    {
-                        "name": str(call.get("name") or "unknown"),
-                        "id": str(call.get("id") or ""),
-                        "response": {
-                            "error": {"code": code, "message": str(exc)[:500]}
-                        },
-                    }
-                ],
-            )
+            self._emit(session, {
+                "type": "capability_transition_failed",
+                "transition_id": transition_id,
+                "from_capability": session.capability,
+                "to_capability": resolved["capability"],
+                "code": code,
+            })
+            self._emit(session, {
+                "type": "tool_result",
+                "name": call_name,
+                "id": call_id,
+                "status": "error",
+                "code": code,
+            })
         finally:
             if session.pending_transition_id == transition_id:
                 session.pending_transition_id = None
@@ -542,6 +525,15 @@ class LiveSessionHost:
             calls = calls if isinstance(calls, list) else []
             if not calls or session.closed:
                 return
+            if len(calls) == 1:
+                call_id = str(calls[0].get("id") or "")
+                if call_id and call_id in session.tool_results:
+                    self._send_tool_responses(session, [{
+                        "name": str(calls[0].get("name") or "unknown"),
+                        "id": call_id,
+                        "response": {"result": session.tool_results[call_id]},
+                    }])
+                    return
             resolver = getattr(self.adapter, "resolve_capability", None)
             if callable(resolver):
                 resolved = [
@@ -750,6 +742,12 @@ class LiveSessionHost:
 
     async def _discard(self, session: _Session, graceful: bool = False) -> None:
         session.closed = True
+        if session.pending_transition and not session.pending_transition.done():
+            session.pending_transition.set_exception(
+                LiveError("LIVE_SESSION_CLOSED", "Live session stopped during capability transition")
+            )
+        session.pending_transition = None
+        session.pending_transition_id = None
         current = asyncio.current_task()
         if session.watchdog_task and session.watchdog_task is not current and not session.watchdog_task.done():
             session.watchdog_task.cancel()
