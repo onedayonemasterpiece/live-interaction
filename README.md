@@ -16,10 +16,10 @@ its tested audio/lifecycle paths, not a general agent framework.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.1.9`); see [integration](docs/integration.md).
+Use versioned releases (current release `0.1.10`); see [integration](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
-speech/mutations. Release 0.1.9 distinguishes provider-native Google Search from an application-provided search function so disabling or losing native search does not suppress a product search tool. Release 0.1.8 can capture and buffer the first user speech locally while a manually started Live session is still being created, closing the push-to-toggle startup gap without opening a second microphone. Release 0.1.7 keeps the strict steady-state audio queue/age guards while giving audio HTTP delivery a 10s absolute ceiling so a bounded startup handoff is not falsely aborted by the older 2.5s generic request timeout. Release 0.1.6 separates an intentional bounded microphone-handoff catch-up from the normal 1.5s network queue guard; after catch-up, the original steady-state queue and age limits apply unchanged. Release 0.1.5 keeps the 0.1.4 runtime while aligning Node and Python package metadata. Release 0.1.3 adds an optional provider resource guard. A
+speech/mutations. Release 0.1.10 makes provider-native Google Search and an application fallback search function mutually exclusive in each provider setup: native search is exposed first, and the application search function appears only after native search is disabled/unavailable. Release 0.1.9 distinguishes provider-native Google Search from an application-provided search function so disabling or losing native search does not suppress a product search tool. Release 0.1.8 can capture and buffer the first user speech locally while a manually started Live session is still being created, closing the push-to-toggle startup gap without opening a second microphone. Release 0.1.7 keeps the strict steady-state audio queue/age guards while giving audio HTTP delivery a 10s absolute ceiling so a bounded startup handoff is not falsely aborted by the older 2.5s generic request timeout. Release 0.1.6 separates an intentional bounded microphone-handoff catch-up from the normal 1.5s network queue guard; after catch-up, the original steady-state queue and age limits apply unchanged. Release 0.1.5 keeps the 0.1.4 runtime while aligning Node and Python package metadata. Release 0.1.3 adds an optional provider resource guard. A
 guarded consumer checks its lease before connect/setup/send/receive, charges
 outbound provider payloads before transmission, and keeps the same guarded key
 through provider resumption. Resource-controller failures are terminal and are
@@ -41,5 +41,4 @@ Consumers must surface delay, provider closure and missing capabilities honestly
 Post-extraction acceptance evidence and exact versions belong in consumer release
 reports. Unit/fixture tests are not substitutes for real provider acceptance.
 
-Internet search is deferred. A function calling a separate lightweight search
-model is an unverified hypothesis, not an implemented capability or dependency.
+Internet search can be provider-native or application-provided. When an application declares a fallback search function, the provider exposes exactly one search mechanism at a time: native Google Search first, then the application function if native search becomes unavailable.
