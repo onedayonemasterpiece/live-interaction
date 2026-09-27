@@ -41,6 +41,29 @@ class ProviderContract(unittest.TestCase):
         self.assertNotIn('read_story', str(b))
         self.assertNotIn('thinkingConfig', a['generationConfig'])
 
+    def test_native_search_hides_application_search_until_fallback(self):
+        setup = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={
+                'system_instruction': 'street-story',
+                'functions': [
+                    {'name': 'read_topic'},
+                    {'name': 'search_web'},
+                    {'name': 'edit_text'},
+                ],
+                'application_search_function': 'search_web',
+            },
+            search=True,
+        )['setup']
+        self.assertEqual(
+            [item['name'] for item in setup['tools'][0]['functionDeclarations']],
+            ['read_topic', 'edit_text'],
+        )
+        self.assertEqual(setup['tools'][1], {'googleSearch': {}})
+        self.assertNotIn('search_web', str(setup['tools']))
+        self.assertIn('Provider-native Google Search доступен', setup['systemInstruction']['parts'][0]['text'])
+
     def test_application_search_function_remains_available_without_native_search(self):
         setup = setup_config(
             'gemini-3.8-live',
