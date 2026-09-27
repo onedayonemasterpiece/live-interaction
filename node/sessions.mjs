@@ -54,7 +54,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     session.toolResults.set(id,result);
     while(session.toolResults.size>100)session.toolResults.delete(session.toolResults.keys().next().value);
   };
-  const functionResponse=(call,result)=>({name:call.name??'unknown',id:call.id,response:{result},...(result?.[TOOL_PARTS]?{parts:result[TOOL_PARTS]}:{})});
+  const functionResponse=(call,result)=>({name:call.name??'unknown',id:call.id,response:result?.[TOOL_PARTS]?result:{result},...(result?.[TOOL_PARTS]?{parts:result[TOOL_PARTS]}:{})});
   const sendToolResponses=(session,responses)=>{
     if(responses.length&&!session.closed){
       session.toolResponseAt=write(session,{type:'tool_response',responses});

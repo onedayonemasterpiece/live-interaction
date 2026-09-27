@@ -34,8 +34,8 @@ test('image returned by a tool stays in its multimodal FunctionResponse on first
  assert.equal(calls,1);
  assert.equal(responses.length,2);
  for(const response of responses){
-  assert.deepEqual(response.response.result.image,{$ref:'preview.jpg'});
-  assert.equal(response.response.result.preview_delivered,true);
+  assert.deepEqual(response.response.image,{$ref:'preview.jpg'});
+  assert.equal(response.response.preview_delivered,true);
   assert.equal(response.parts[0].inlineData.data,image);
   assert.equal(JSON.stringify(response.response).includes(image),false,'raw image is not placed inside text result');
  }
