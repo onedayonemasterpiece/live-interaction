@@ -36,11 +36,37 @@ test('bounded handoff catch-up drains a startup backlog then restores the steady
  for(let i=0;i<100&&sender.stats().catchup;i++)await tick();
  assert.equal(error,undefined);
  assert.equal(sender.stats().catchup,false);
- assert.ok(sender.stats().queued_pcm_bytes<=48000);
+ assert.ok(sender.stats().queued_pcm_bytes<=24000);
  holdSteady=true;
  for(let i=0;i<30&&!error;i++)sender.push(new Int16Array(1486).fill(1000),.05);
  assert.match(error?.message??'',/Сеть/);
  releaseSteady?.();await tick();
+});
+test('handoff catch-up retains headroom while a queued HTTP batch is in flight',async()=>{
+ let error;const releases=[];
+ const sender=createLiveAudioSender({
+  send:()=>new Promise(resolve=>releases.push(resolve)),
+  onError:e=>error=e
+ });
+ const frame=()=>({pcm:new Int16Array(1486).fill(1000),rms:.05});
+ assert.equal(sender.seed(Array.from({length:64},frame)),true);
+ for(let i=0;i<40&&sender.stats().queued_pcm_bytes>43000;i++){
+  assert.ok(releases.length);
+  releases.shift()();await tick();
+ }
+ assert.ok(sender.stats().queued_pcm_bytes<=48000);
+ assert.ok(sender.stats().queued_pcm_bytes>24000);
+ assert.equal(sender.stats().catchup,true);
+ for(let i=0;i<5;i++)sender.push(frame().pcm,.05);
+ assert.equal(error,undefined);
+ for(let i=0;i<40&&sender.stats().catchup;i++){
+  assert.ok(releases.length);
+  releases.shift()();await tick();
+ }
+ assert.equal(sender.stats().catchup,false);
+ assert.ok(sender.stats().queued_pcm_bytes<=24000);
+ sender.stop();
+ for(const release of releases)release();
 });
 
 test('slow transport is bounded; stop discards pending audio and never waits for network',async()=>{

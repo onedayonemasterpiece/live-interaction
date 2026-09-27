@@ -1,8 +1,8 @@
 // One ordered sender; at most 1.5 seconds of steady-state PCM waiting, never a promise per frame.
 // PCM16/16kHz is the Gemini Live wire format. Keep each batch below 16000 base64 bytes.
 // A microphone handoff may intentionally contain up to 20 seconds captured while Live starts.
-// That seed gets a separate bounded catch-up window; once drained back to the normal queue
-// watermark, the strict steady-state queue/age guards resume automatically.
+// That seed gets a separate bounded catch-up window; once drained below half the
+// normal queue watermark, the strict steady-state queue/age guards resume.
 export function createLiveAudioSender({
   send,
   onTiming=()=>{},
@@ -38,7 +38,8 @@ export function createLiveAudioSender({
     for(const item of preRoll)if(item.pcm)item.at=at;
   };
   const maybeFinishCatchup=()=>{
-    if(!catchup||!catchupSealed||bytes>steadyByteLimit)return false;
+    // Leave room for PCM captured while the next HTTP batch is in flight.
+    if(!catchup||!catchupSealed||bytes>steadyByteLimit/2)return false;
     catchup=false;catchupSealed=false;rebaseQueuedAge();
     report('catchup_end',{seed_pcm_bytes:catchupSeedBytes});
     return true;
