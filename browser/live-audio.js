@@ -11,10 +11,12 @@ export function createLiveAudioSender({
   batchMs=256,
   maxQueueMs=1500,
   maxAgeMs=2500,
-  maxBootstrapMs=20000
+  maxBootstrapMs=20000,
+  persist=null
 }={}){
   let queue=[],preRoll=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
   let catchup=false,catchupSealed=false,catchupSeedBytes=0;
+  let durableBytes=0,durableItems=0,durableChain=Promise.resolve(),durableError=null,lastStagedWasEnd=false;
   const bytesPerSecond=32000;
   const steadyByteLimit=bytesPerSecond*maxQueueMs/1000;
   const catchupByteLimit=bytesPerSecond*(maxBootstrapMs+maxQueueMs)/1000;
@@ -29,7 +31,9 @@ export function createLiveAudioSender({
     queued_base64_bytes:Math.ceil(bytes/3)*4,
     oldest_age_ms:queue.some(x=>x.pcm)?Math.round(now()-queue.find(x=>x.pcm).at):0,
     catchup,
-    catchup_seed_pcm_bytes:catchupSeedBytes
+    catchup_seed_pcm_bytes:catchupSeedBytes,
+    durable_pending_items:durableItems,
+    durable_pending_pcm_bytes:durableBytes
   });
   const report=(event,extra={})=>onTiming(event,{...stats(),...extra});
   const rebaseQueuedAge=()=>{
@@ -82,6 +86,42 @@ export function createLiveAudioSender({
   }
 
   function enqueue(item){queue.push(item);bytes+=item.pcm?.byteLength??0;}
+  function durableRelease(size){durableBytes=Math.max(0,durableBytes-size);durableItems=Math.max(0,durableItems-1);}
+  function stage(item){
+    lastStagedWasEnd=Boolean(item.end);
+    if(typeof persist!=='function'){enqueue(item);return true;}
+    const size=item.pcm?.byteLength??0,copy=item.pcm?{...item,pcm:new Int16Array(item.pcm)}:{...item};
+    durableBytes+=size;durableItems++;
+    const byteLimit=catchup?catchupByteLimit:steadyByteLimit;
+    const itemLimit=catchup?maxCatchupItems:80;
+    if(bytes+durableBytes>byteLimit||queue.length+durableItems>itemLimit){
+      durableRelease(size);
+      fail(new Error('Локальное сохранение речи не успевает за микрофоном.'));
+      return false;
+    }
+    durableChain=durableChain.then(async()=>{
+      if(durableError){durableRelease(size);return;}
+      try{
+        await persist(copy.end
+          ?{audio_stream_end:true,captured_at_ms:copy.at}
+          :{pcm:copy.pcm,sample_rate:16000,captured_at_ms:copy.at});
+      }catch(error){
+        durableError=error;durableRelease(size);if(!closed)fail(error);return;
+      }
+      durableRelease(size);
+      report('durable_commit',{pcm_bytes:size,stream_end:Boolean(copy.end)});
+      if(!closed){enqueue(copy);schedule();}
+    });
+    return true;
+  }
+  async function drainDurable(){await durableChain;if(durableError)throw durableError;}
+  async function finish(){
+    if(!lastStagedWasEnd){
+      active=false;quietMs=0;preRoll=[];
+      stage({end:true,at:now()});
+    }
+    await drainDurable();
+  }
   function schedule(){
     if(closed)return;
     maybeFinishCatchup();
@@ -106,15 +146,15 @@ export function createLiveAudioSender({
     if(rms>=0.008){
       if(!active){
         active=true;
-        for(const previous of preRoll)enqueue(previous);
+        for(const previous of preRoll)stage(previous);
         preRoll=[];
         report('speech_start',{capture_at_ms:at});
       }
-      quietMs=0;enqueue(item);
+      quietMs=0;stage(item);
     }else if(active){
-      enqueue(item);quietMs+=duration;
+      stage(item);quietMs+=duration;
       if(quietMs>=2000){
-        active=false;enqueue({end:true,at});report('speech_end',{capture_at_ms:at});
+        active=false;stage({end:true,at});report('speech_end',{capture_at_ms:at});
       }
     }else{
       suppressed++;preRoll.push(item);
@@ -148,5 +188,5 @@ export function createLiveAudioSender({
     return !closed;
   }
 
-  return {push,seed,stop,stats};
+  return {push,seed,finish,drainDurable,stop,stats};
 }

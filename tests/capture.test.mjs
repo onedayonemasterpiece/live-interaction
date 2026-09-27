@@ -1,0 +1,106 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createMicrophoneCapture,createDurableMicrophoneCapture} from '../browser/capture.js';
+
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('shared microphone capture owns getUserMedia, resampling and ordered frame delivery',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  const processors=[];let getUserMediaCalls=0,stops=0;
+  const track={stop(){stops++;}};
+  const stream={getTracks:()=>[track]};
+  class Node{connect(){return this;}disconnect(){}}
+  class Processor extends Node{onaudioprocess=null;}
+  class Context{
+    sampleRate=48000;destination={};state='running';
+    createMediaStreamSource(value){assert.equal(value,stream);return new Node();}
+    createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return stream;}}},configurable:true});
+  globalThis.AudioContext=Context;
+  const frames=[];
+  const capture=createMicrophoneCapture({onFrame:(pcm,rms,meta)=>frames.push({pcm,rms,meta})});
+  try{
+    assert.equal(await capture.start(),true);
+    const samples=new Float32Array(4096).fill(.25);
+    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>samples}});
+    await capture.drain();
+    assert.equal(getUserMediaCalls,1);
+    assert.equal(frames.length,1);
+    assert.ok(frames[0].pcm instanceof Int16Array);
+    assert.equal(frames[0].meta.sample_rate,16000);
+    assert.ok(frames[0].rms>.2);
+    capture.stop();assert.equal(stops,1);
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
+
+test('offline durable capture uses shared VAD/sender and seals after microphone drain',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  const processors=[];let stops=0;
+  const track={stop(){stops++;}},stream={getTracks:()=>[track]};
+  class Node{connect(){return this;}disconnect(){}}
+  class Processor extends Node{onaudioprocess=null;}
+  class Context{
+    sampleRate=16000;destination={};state='running';
+    createMediaStreamSource(){return new Node();}
+    createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>stream}},configurable:true});
+  globalThis.AudioContext=Context;
+  const durable=[];
+  const capture=createDurableMicrophoneCapture({persist:async message=>durable.push(message),batchMs:0});
+  try{
+    await capture.start();
+    const speech=new Float32Array(1600).fill(.2);
+    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    await tick();
+    await capture.stop();
+    assert.equal(stops,1);
+    assert.ok(durable.some(item=>item.pcm instanceof Int16Array));
+    assert.equal(durable.at(-1).audio_stream_end,true);
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
+
+test('offline durable capture stops microphone immediately when persistence fails',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  const processors=[];let stops=0,seenError=null;
+  const track={stop(){stops++;}},stream={getTracks:()=>[track]};
+  class Node{connect(){return this;}disconnect(){}}
+  class Processor extends Node{onaudioprocess=null;}
+  class Context{
+    sampleRate=16000;destination={};state='running';
+    createMediaStreamSource(){return new Node();}
+    createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>stream}},configurable:true});
+  globalThis.AudioContext=Context;
+  const capture=createDurableMicrophoneCapture({
+    persist:async()=>{throw new Error('idb unavailable');},
+    onError:error=>{seenError=error;},
+    batchMs:0
+  });
+  try{
+    await capture.start();
+    const speech=new Float32Array(1600).fill(.2);
+    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    for(let i=0;i<20&&!seenError;i++)await tick();
+    assert.match(seenError.message,/idb unavailable/);
+    assert.equal(capture.running,false);
+    assert.equal(stops,1);
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
