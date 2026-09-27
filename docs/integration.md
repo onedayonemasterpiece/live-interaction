@@ -136,7 +136,7 @@ call in its provider batch. The host sends one bounded `reconfigure` worker
 command containing the server-owned configuration, a router acknowledgement and
 the bounded continuation intent. For Gemini the worker sends that acknowledgement
 on the old connection first, waits for a **fresh post-response** resumable handle,
-then resumes the same model/key/session with the new bundle. After
+then resumes the same model/key/session with the new bundle. If Gemini does not issue a fresh checkpoint within the bounded wait, the worker discards the old handle, opens a new connection with the same model/key, restores bounded dialogue history, and delivers the one accepted continuation. After
 `capability_ready` the host updates active capability/configuration state but
 must not send a duplicate FunctionResponse. Transition failure is emitted as
 structured transition/tool metadata; it is never silently converted into a

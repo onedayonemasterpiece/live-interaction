@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
+FRESH_HANDLE_WAIT_SECONDS = 8
 
 def emit(payload):
     payload['provider_at'] = round(time.time() * 1000)
@@ -161,6 +162,24 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         'transition': None,
         'search_disabled_by_quota': False,
     }
+    state['history'] = [
+        {'role': item['role'], 'text': item['text'][:700]}
+        for item in state['history'][-8:]
+        if isinstance(item, dict) and item.get('role') in ('user', 'model')
+        and isinstance(item.get('text'), str)
+    ]
+    def remember(role, value):
+        if not isinstance(value, str) or not value.strip():
+            return
+        entry = {'role': role, 'text': value.strip()[:700]}
+        if not state['history'] or state['history'][-1] != entry:
+            state['history'] = (state['history'] + [entry])[-8:]
+    def emit_observed(event):
+        if event.get('type') == 'input_transcript':
+            remember('user', event.get('text'))
+        elif event.get('type') == 'output_transcript':
+            remember('model', event.get('text'))
+        emit(event)
     declared_functions = state['configuration'].get("functions", [])
     application_search = _application_search_function(state['configuration'], declared_functions)
     search = bool(state['configuration'].get("search_enabled", False))
@@ -216,15 +235,16 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     await _guarded_send(ws, {'toolResponse': {'functionResponses': [router_response]}}, resource_guard)
                     wait['router_response_sent'] = True
                     emit({'type':'capability_transition_acknowledged','transition_id':transition_id,'capability':capability})
-                    await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=8)
+                    await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=FRESH_HANDLE_WAIT_SECONDS)
                 except TimeoutError:
-                    state['transition_wait'] = None
-                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
-                    continue
-                if not state['handle'] or state['handle_generation'] <= wait['baseline']:
-                    state['transition_wait'] = None
-                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
-                    continue
+                    # The provider can finish the router call yet never issue a
+                    # post-response checkpoint. The old handle is unsafe. Restore
+                    # bounded dialogue context on a new connection with the same
+                    # model/key, then inject the accepted intent exactly once.
+                    state['handle'] = None
+                    emit({'type':'capability_transition_recovered','transition_id':transition_id,
+                          'capability':capability,'reason':'fresh_handle_unavailable',
+                          'history_turns':len(state['history'])})
                 state['transition_wait'] = None
                 state['configuration'] = configuration
                 if isinstance(context, dict):
@@ -260,6 +280,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     max_stdin_delay_ms = max(max_stdin_delay_ms, max(0, started_ms - message.get('queued_at', started_ms)))
                     audio_chunks += int(kind == 'audio')
                 await _guarded_send(ws, payload, resource_guard)
+                if kind == 'text':
+                    remember('user', message.get('text'))
                 if kind in ('audio', 'audio_stream_end'):
                     max_ws_send_ms = max(max_ws_send_ms, round(time.time() * 1000) - started_ms)
                 if kind == 'text':
@@ -298,13 +320,14 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             if 'setupComplete' in obj:
                                 break
                             _guard_check(resource_guard)
-                            handle_server_message(obj, emit=emit)
+                            handle_server_message(obj, emit=emit_observed)
                     if state['stopped']:
                         return
                     state['ws'] = ws
                     transition = state.get('transition')
                     if transition:
-                        emit({'type':'resumed','model':model,'voice':'Aoede','search_available':search})
+                        emit({'type':'resumed','model':model,'voice':'Aoede','search_available':search,
+                              'resumption_mode':'checkpoint' if setup['setup']['sessionResumption'].get('handle') else 'history_restore'})
                         emit({'type':'capability_ready','transition_id':transition['transition_id'],'capability':transition['capability']})
                         continuation = transition.get('continuation') or ''
                         state['transition'] = None
@@ -337,7 +360,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                         if obj.get('goAway'):
                             emit({'type': 'go_away', 'time_left': obj['goAway'].get('timeLeft')})
                             break
-                        handle_server_message(obj, emit=emit)
+                        handle_server_message(obj, emit=emit_observed)
                 if state['stopped']:
                     break
                 if state.get('transition'):
