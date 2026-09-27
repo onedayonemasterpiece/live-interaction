@@ -70,7 +70,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     try{
       write(session,{type:'reconfigure',transition_id:transitionId,capability:resolved.capability,
         configuration:resolved.configuration,context:resolved.context??{},continuation,
-        router_response:{name:callName,id:callId,response:{result:acknowledgement,scheduling:'SILENT'}}});
+        router_response:{name:callName,id:callId,response:{result:acknowledgement},scheduling:'SILENT',willContinue:false}});
       let timer;
       try{
         await Promise.race([

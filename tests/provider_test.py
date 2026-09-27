@@ -151,6 +151,51 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_post_response_checkpoint_restores_bounded_history_and_intent(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','history':[
+            {'role':'user','text':'previous topic'}],
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        first=_FakeSocket([{'setupComplete':{}},
+            {'sessionResumptionUpdate':{'resumable':True,'newHandle':'pre-call-handle'}}])
+        second=_FakeSocket([{'setupComplete':{}}])
+        sockets=[first,second]
+        def fake_connect(*args,**kwargs):
+            return sockets.pop(0)
+        events=[]
+        with patch('websockets.connect',side_effect=fake_connect), patch(
+            'live_interaction.provider.FRESH_HANDLE_WAIT_SECONDS',0.025):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            for _ in range(100):
+                if any(e.get('type')=='resumption_state' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='resumption_state' for e in events))
+            reader.feed({'type':'text','text':'attach a dataset','queued_at':1})
+            for _ in range(100):
+                if any(e.get('type')=='input_timing' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-restore','capability':'dataset',
+                'configuration':{'system_instruction':'dataset','functions':[{'name':'dataset.find'}]},
+                'continuation':'attach the national projects dataset',
+                'router_response':{'name':'activate_capability','id':'cap-restore',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            for _ in range(200):
+                if any(e.get('type')=='capability_continuation_sent' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertEqual(len(sockets),0)
+            self.assertTrue(first.closed)
+            self.assertEqual(second.sent[0]['setup']['sessionResumption'],{})
+            system=second.sent[0]['setup']['systemInstruction']['parts'][0]['text']
+            self.assertIn('previous topic',system)
+            self.assertIn('attach a dataset',system)
+            self.assertEqual(len([m for m in second.sent if 'clientContent' in m]),1)
+            self.assertTrue(any(e.get('type')=='capability_transition_recovered' and
+                e.get('reason')=='fresh_handle_unavailable' for e in events))
+            self.assertTrue(any(e.get('type')=='resumed' and
+                e.get('resumption_mode')=='history_restore' for e in events))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
     async def test_reconfigure_completes_router_call_before_using_fresh_resumption_handle(self):
         reader=_QueueReader()
         reader.feed({
@@ -195,7 +240,9 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                 'router_response':{
                     'name':'activate_capability',
                     'id':'cap-1',
-                    'response':{'result':{'capability':'dataset','accepted':True},'scheduling':'SILENT'},
+                    'response':{'result':{'capability':'dataset','accepted':True}},
+                    'scheduling':'SILENT',
+                    'willContinue':False,
                 },
             })
             for _ in range(100):
@@ -203,6 +250,10 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.001)
             self.assertTrue(any('toolResponse' in item for item in first.sent))
+            response=next(item['toolResponse']['functionResponses'][0] for item in first.sent if 'toolResponse' in item)
+            self.assertEqual(response['scheduling'],'SILENT')
+            self.assertIs(response['willContinue'],False)
+            self.assertNotIn('scheduling',response['response'])
             self.assertEqual(len(connect_calls),1)
             first.incoming.put_nowait({'sessionResumptionUpdate':{'resumable':True,'newHandle':'fresh-handle'}})
             for _ in range(200):

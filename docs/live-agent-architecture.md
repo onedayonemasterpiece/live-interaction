@@ -192,10 +192,11 @@ provider call ID is answered from the bounded host result cache rather than
 starting a second transition.
 
 If no fresh post-response resumable handle becomes available within the
-bounded transition window, fail the transition explicitly. A product may open
-a new provider session only if it can restore bounded dialogue history and the
-pending intent without replaying a mutation. The UI conversation remains
-continuous; transport identity is an implementation detail.
+bounded transition window, open a new provider connection with the same model
+and key, bounded application dialogue history and the one accepted intent.
+Never reuse the pre-call handle or replay a mutation. Emit explicit recovery
+metadata. The UI conversation remains continuous; transport identity is an
+implementation detail.
 
 Never switch model or API key merely to load a capability.
 

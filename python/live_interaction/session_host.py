@@ -479,7 +479,9 @@ class LiveSessionHost:
                     "router_response": {
                         "name": call_name,
                         "id": call_id,
-                        "response": {"result": acknowledgement, "scheduling": "SILENT"},
+                        "response": {"result": acknowledgement},
+                        "scheduling": "SILENT",
+                        "willContinue": False,
                     },
                 },
             )
