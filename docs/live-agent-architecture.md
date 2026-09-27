@@ -162,29 +162,40 @@ available. Do not send definitions for unrelated namespaces.
 Gemini does not accept configuration changes on an open WebSocket. Capability
 switching therefore uses a **safe session-resumption boundary**:
 
-1. The model requests a capability.
-2. The application validates it and records a pending transition.
-3. Do not reconnect while a tool call or model generation is in flight.
-4. Wait for a resumable session handle / safe turn boundary.
-5. Pause the provider connection.
-6. Resume the same model with:
-   - the latest resumption handle;
+1. The model requests a capability through the small router and supplies a
+   bounded `intent` summary for continuation.
+2. The application validates the requested capability, permissions and bounded
+   configuration, then records a pending transition.
+3. Gemini must first complete the router function call on the **current**
+   connection. The worker sends a bounded acknowledgement with
+   `scheduling=SILENT`; this acknowledgement grants no new authority.
+4. Discard any pre-call resumption handle. Wait for a **new resumable handle
+   issued after that router response**. Google explicitly marks function-call
+   and generation states as non-resumable, so reusing a handle from before the
+   router response can lose the pending tool-call state.
+5. Only after that fresh handle exists, pause the provider connection. Input
+   captured during this bounded handoff is not replayed as stale speech.
+6. Resume the same model and key with:
+   - that fresh resumption handle;
    - the same core prompt;
    - the current mode overlay;
    - the new capability overlay;
    - only the router + selected bundle functions.
-7. Emit `capability_ready`.
+7. Emit `capability_ready`, then inject one bounded application-owned
+   continuation turn derived from the already accepted `intent`. This is
+   continuity context, not a new authorization or a replay of a mutation.
 8. Continue the pending user intent without requiring the user to repeat it.
 
-Google documents that configuration parameters except the model can change
-while pausing/resuming. We still require provider acceptance because preview
-behaviour can change.
+The host must not send a second FunctionResponse after `capability_ready`;
+the provider worker owns the two-phase router acknowledgement. A duplicate
+provider call ID is answered from the bounded host result cache rather than
+starting a second transition.
 
-If no resumable handle becomes available within a bounded transition window,
-the runtime may open a new provider session only if the product can restore
-bounded dialogue history and the pending intent without replaying a mutation.
-The UI conversation remains continuous; transport identity is an
-implementation detail.
+If no fresh post-response resumable handle becomes available within the
+bounded transition window, fail the transition explicitly. A product may open
+a new provider session only if it can restore bounded dialogue history and the
+pending intent without replaying a mutation. The UI conversation remains
+continuous; transport identity is an implementation detail.
 
 Never switch model or API key merely to load a capability.
 
@@ -398,82 +409,3 @@ For every provider/model/framework combination that matters in production:
 - provider session resumption;
 - context compression / long-session evidence;
 - resource accounting readback;
-- audit-log correlation for the entire run.
-
-Record exact framework, consumer SHA, provider model and timestamps.
-
-## 12. Consumer adoption contract
-
-A consumer must:
-
-1. pin a released `live-interaction` version;
-2. link this document from its Live architecture/runbook;
-3. declare its modes and capability bundles in product source;
-4. keep domain authorization/mutations in its adapter;
-5. use the shared resource-control library;
-6. implement the observability contract;
-7. run shared contract tests plus product-specific acceptance;
-8. avoid private forks of transport, capability routing or resource accounting.
-
-Consumer-specific prompt text belongs in the consumer repository. The reusable
-rules for layering, capability disclosure, lifecycle, logging and acceptance
-belong here.
-
-## 13. Initial Wonderful Lections decomposition
-
-This is an example, not framework-owned product policy.
-
-`core`
-- get_current_slide
-- get_slide_context
-- activate_capability
-- wait/yield only when the mode needs it
-
-`slide_edit`
-- get_current_slide
-- get_design_options
-- prepare_slide_change
-- apply_prepared_change
-- read_slide_after_change
-- activate_capability
-
-`dataset`
-- get_current_slide
-- open_dataset_chooser
-- preview_authoring_choice
-- apply_authoring_choice
-- read_dataset_rows
-- activate_capability
-
-`media`
-- get_current_slide
-- get_design_options
-- prepare_slide_change
-- apply_prepared_change
-- read_slide_after_change
-- open_media_chooser
-- preview_authoring_choice
-- apply_authoring_choice
-- activate_capability
-
-`deck` and `verification` should remain separate bundles.
-
-Show mode does not expose the capability router for mutation capabilities. Its
-tool surface remains intentionally tiny.
-
-## 14. Rollout sequence
-
-Do not big-bang this architecture into every consumer.
-
-1. Fix shared resource-accounting defects and add budget audit evidence.
-2. Add provider-neutral capability state/digests/audit primitives.
-3. Add Gemini safe reconfiguration via session resumption and prove it with a
-   real provider test.
-4. Migrate one Wonderful Lections capability (dataset) end to end.
-5. Add media, then slide edit.
-6. Run long-session/interrupt/reconnect acceptance.
-7. Release a new shared framework version.
-8. Update Street Story and other consumers by pinned release, adopting the
-   standard without copying Wonderful-specific tools.
-
-Each stage must be independently deployable and reversible.

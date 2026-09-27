@@ -225,6 +225,7 @@ class CapabilityAdapter(Adapter):
                 ],
             },
             "context": {"scope": "dataset"},
+            "continuation": str((call.get("args") or {}).get("intent") or ""),
             "response": {"selected": "dataset"},
         }
 
@@ -265,7 +266,7 @@ class CapabilityProvider:
 
 
 class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
-    async def test_capability_router_reconfigures_before_tool_response(self):
+    async def test_capability_router_delegates_acknowledgement_to_provider(self):
         adapter = CapabilityAdapter()
         provider = CapabilityProvider()
         host = LiveSessionHost(
@@ -277,44 +278,34 @@ class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
         actor = {"subject": "a", "tenant_id": "t"}
         started = await host.start(resource_id="story1", actor=actor)
         session = host.sessions[started["session_id"]]
-        provider.events(
-            {
-                "type": "tool_call",
-                "calls": [
-                    {
-                        "name": "activate_capability",
-                        "id": "cap1",
-                        "args": {"capability": "dataset"},
-                    }
-                ],
-            }
-        )
+        provider.events({
+            "type": "tool_call",
+            "calls": [{
+                "name": "activate_capability",
+                "id": "cap1",
+                "args": {"capability": "dataset", "intent": "find national projects dataset"},
+            }],
+        })
         for _ in range(40):
             decoded = [__import__("json").loads(item) for item in provider.messages]
-            if any(item.get("type") == "tool_response" for item in decoded):
+            if any(event.get("type") == "tool_result" and event.get("id") == "cap1" for event in session.events):
                 break
             await asyncio.sleep(0)
         decoded = [__import__("json").loads(item) for item in provider.messages]
         reconfigure = next(item for item in decoded if item.get("type") == "reconfigure")
-        response = next(item for item in decoded if item.get("type") == "tool_response")
         self.assertEqual(reconfigure["capability"], "dataset")
         self.assertEqual(len(reconfigure["configuration"]["functions"]), 3)
-        self.assertEqual(
-            response["responses"][0]["response"]["result"]["capability"], "dataset"
-        )
+        self.assertEqual(reconfigure["continuation"], "find national projects dataset")
+        self.assertEqual(reconfigure["router_response"]["id"], "cap1")
+        self.assertEqual(reconfigure["router_response"]["response"]["scheduling"], "SILENT")
+        self.assertFalse(any(item.get("type") == "tool_response" for item in decoded))
         self.assertEqual(session.capability, "dataset")
-        self.assertTrue(
-            any(
-                event.get("type") == "capability_transition_requested"
-                and event.get("to_capability") == "dataset"
-                for event in session.events
-            )
-        )
-        await host.stop(
-            resource_id="story1",
-            session_id=started["session_id"],
-            actor=actor,
-        )
+        self.assertTrue(any(
+            event.get("type") == "capability_transition_requested"
+            and event.get("to_capability") == "dataset"
+            for event in session.events
+        ))
+        await host.stop(resource_id="story1", session_id=started["session_id"], actor=actor)
 
     async def test_capability_bundle_limit_is_structured_tool_error(self):
         class TooBig(CapabilityAdapter):

@@ -117,7 +117,10 @@ Do not expose the internal actor-omitting stopAll path over HTTP.
   and runs the product's normal prepare/apply/readback semantics.
 - Optional `resolveCapability(session,call)` (Python: `resolve_capability`) is a
   side-effect-free router resolver. Return null for an ordinary tool or
-  `{capability,configuration,context?,response?}` for a capability transition.
+  `{capability,configuration,context?,continuation?,response?}` for a capability
+  transition. `continuation` is a bounded application-owned summary of the
+  already pending intent; when omitted, hosts may use the router call's bounded
+  `intent` argument. It is context, not permission.
   Capability IDs are bounded identifiers; a transition bundle contains at most
   nine functions and at most 256 KiB serialized configuration.
 - Optional `input`, `onStarted`, `onResumed`, `onStopped` for product context and
@@ -129,11 +132,15 @@ Do not expose the internal actor-omitting stopAll path over HTTP.
 The host caches successful tool results by provider call ID and serializes tools;
 application idempotency must still survive process/session restarts. If
 `resolveCapability` selects a transition, that router call must be the only tool
-call in its provider batch. The host sends a `reconfigure` worker command, waits
-for the provider to resume with the same model/key/session handle, updates the
-active capability/configuration digest, and only then sends the router tool
-response. A transition error is returned as a structured tool error; it is not
-silently converted into a fresh conversation.
+call in its provider batch. The host sends one bounded `reconfigure` worker
+command containing the server-owned configuration, a router acknowledgement and
+the bounded continuation intent. For Gemini the worker sends that acknowledgement
+on the old connection first, waits for a **fresh post-response** resumable handle,
+then resumes the same model/key/session with the new bundle. After
+`capability_ready` the host updates active capability/configuration state but
+must not send a duplicate FunctionResponse. Transition failure is emitted as
+structured transition/tool metadata; it is never silently converted into a
+successful fresh conversation.
 
 `createWorker({model,actor,resourceId})` returns a child with stdin/stdout/stderr
 and kill(). Spawn the shared Python provider or a **thin credential adapter**.
@@ -148,11 +155,15 @@ quota failure never triggers key hopping. No shared global default credential po
 Start: `{type:'start',model,context,configuration,history}`. Inputs: audio
 (base64 PCM16, 16kHz mono), audio_stream_end, text, snapshot (JPEG+context),
 tool_response, `reconfigure`, stop. `reconfigure` carries a server-owned
-transition ID, capability ID, full bounded configuration and optional context.
-Gemini reconfiguration waits for a resumable handle, closes only the current
-provider WebSocket intentionally, resumes the same model/session with the new
-configuration, then emits `capability_ready`. Writes include numeric
-`queued_at` for delay measurement.
+transition ID, capability ID, full bounded configuration, optional context,
+bounded `continuation`, and the exact router FunctionResponse acknowledgement.
+For Gemini the worker writes that acknowledgement on the current WebSocket,
+invalidates the old resumption token, waits for a fresh resumable handle issued
+after the acknowledgement, closes only that WebSocket intentionally, resumes
+the same model/session with the new configuration, emits `capability_ready`,
+and sends one bounded `LIVE_CONTINUATION` application turn. Inputs queued
+before the handoff completes are dropped rather than replayed. Writes include
+numeric `queued_at` for delay measurement.
 Snapshot uses video input only, never an implicit user text turn. Product images
 must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require

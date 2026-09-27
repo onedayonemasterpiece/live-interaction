@@ -18,7 +18,7 @@ test('independent product adapters preserve ordered tools, deduplication, owner 
  assert.equal(audio,140);assert.equal(page.closed,true);await host.stop(base);
 });
 
-test('capability router reconfigures provider before replying to the router tool',async()=>{
+test('capability router delegates safe acknowledgement and continuation to provider worker',async()=>{
  const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>c.emit('close',0);
  const writes=[];
  c.stdin.on('data',b=>{
@@ -37,6 +37,7 @@ test('capability router reconfigures provider before replying to the router tool
      capability:'dataset',
      configuration:{system_instruction:'dataset',functions:[{name:'activate_capability'},{name:'dataset.find'},{name:'dataset.read'}]},
      context:{scope:'dataset'},
+     continuation:call.args.intent,
      response:{selected:'dataset'}
    }:null,
    executeTool:async()=>({ok:true})
@@ -44,13 +45,16 @@ test('capability router reconfigures provider before replying to the router tool
  const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>adapter,reconfigureTimeoutMs:1000});
  const started=await host.start({resourceId:'r1',actor:{subject:'a',tenant_id:'t'}});
  const base={resourceId:'r1',sessionId:started.session_id,actor:{subject:'a',tenant_id:'t'}};
- c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'cap1',args:{capability:'dataset'}}]})+'\n');
- for(let i=0;i<20&&!writes.some(x=>x.type==='tool_response');i++)await tick();
- const reconfigure=writes.find(x=>x.type==='reconfigure'),response=writes.find(x=>x.type==='tool_response');
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'cap1',args:{capability:'dataset',intent:'find national projects dataset'}}]})+'\n');
+ for(let i=0;i<40&&!host.events(base).events.some(e=>e.type==='tool_result'&&e.id==='cap1');i++)await tick();
+ const reconfigure=writes.find(x=>x.type==='reconfigure');
  assert.equal(reconfigure.capability,'dataset');
  assert.equal(reconfigure.configuration.functions.length,3);
- assert.ok(response,'router response must be sent only after capability_ready');
- assert.equal(response.responses[0].response.result.capability,'dataset');
+ assert.equal(reconfigure.continuation,'find national projects dataset');
+ assert.equal(reconfigure.router_response.id,'cap1');
+ assert.equal(reconfigure.router_response.response.result.accepted,true);
+ assert.equal(reconfigure.router_response.response.scheduling,'SILENT');
+ assert.equal(writes.some(x=>x.type==='tool_response'),false,'provider worker owns router acknowledgement');
  const events=host.events(base).events;
  assert.ok(events.some(e=>e.type==='capability_transition_requested'&&e.to_capability==='dataset'));
  assert.ok(events.some(e=>e.type==='capability_ready'&&e.capability==='dataset'));

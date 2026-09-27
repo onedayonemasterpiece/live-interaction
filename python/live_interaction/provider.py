@@ -149,6 +149,10 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         'stopped': False,
         'handle': None,
         'handle_event': asyncio.Event(),
+        'handle_generation': 0,
+        'transition_handle_event': asyncio.Event(),
+        'transition_wait': None,
+        'drop_inputs_before': 0,
         'context': start.get('context') or {},
         'configuration': start.get('configuration', {}) or {},
         'history': start.get('history') or [],
@@ -181,45 +185,61 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 capability = str(message.get('capability') or '')[:80]
                 configuration = message.get('configuration')
                 context = message.get('context')
-                if not transition_id or not capability or not isinstance(configuration, dict):
-                    emit({'type':'capability_transition_error','transition_id':transition_id,
-                          'capability':capability,'code':'LIVE_RECONFIGURE_INVALID'})
+                router_response = message.get('router_response')
+                continuation = message.get('continuation') or ''
+                if (not transition_id or not capability or not isinstance(configuration, dict)
+                        or not isinstance(router_response, dict) or not isinstance(continuation, str)
+                        or len(continuation) > 1200):
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RECONFIGURE_INVALID'})
                     continue
                 try:
                     serialized = json.dumps(configuration, ensure_ascii=False, separators=(',', ':')).encode()
+                    response_bytes = json.dumps(router_response, ensure_ascii=False, separators=(',', ':')).encode()
                 except (TypeError, ValueError, UnicodeError):
-                    emit({'type':'capability_transition_error','transition_id':transition_id,
-                          'capability':capability,'code':'LIVE_RECONFIGURE_INVALID'})
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RECONFIGURE_INVALID'})
                     continue
                 functions = configuration.get('functions') or []
-                if len(serialized) > 262144 or not isinstance(functions, list) or len(functions) > 9:
-                    emit({'type':'capability_transition_error','transition_id':transition_id,
-                          'capability':capability,'code':'LIVE_RECONFIGURE_LIMIT'})
+                if (len(serialized) > 262144 or len(response_bytes) > 16384
+                        or not isinstance(functions, list) or len(functions) > 9):
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RECONFIGURE_LIMIT'})
                     continue
-                if not state['handle']:
-                    try:
-                        await asyncio.wait_for(state['handle_event'].wait(), timeout=5)
-                    except TimeoutError:
-                        emit({'type':'capability_transition_error','transition_id':transition_id,
-                              'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
-                        continue
-                if not state['handle']:
-                    emit({'type':'capability_transition_error','transition_id':transition_id,
-                          'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
+                ws = state['ws']
+                if not ws:
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
                     continue
+                wait = {'baseline':state['handle_generation'],'router_response_sent':False}
+                state['transition_wait'] = wait
+                state['transition_handle_event'].clear()
+                state['handle'] = None
+                state['handle_event'].clear()
+                try:
+                    await _guarded_send(ws, {'toolResponse': {'functionResponses': [router_response]}}, resource_guard)
+                    wait['router_response_sent'] = True
+                    emit({'type':'capability_transition_acknowledged','transition_id':transition_id,'capability':capability})
+                    await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=8)
+                except TimeoutError:
+                    state['transition_wait'] = None
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
+                    continue
+                if not state['handle'] or state['handle_generation'] <= wait['baseline']:
+                    state['transition_wait'] = None
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
+                    continue
+                state['transition_wait'] = None
                 state['configuration'] = configuration
                 if isinstance(context, dict):
                     state['context'] = context
-                state['transition'] = {'transition_id':transition_id,'capability':capability}
-                emit({'type':'capability_transition_started','transition_id':transition_id,
-                      'capability':capability})
-                ws = state['ws']
-                if ws:
-                    await ws.close()
+                state['transition'] = {'transition_id':transition_id,'capability':capability,'continuation':continuation.strip()}
+                state['drop_inputs_before'] = round(time.time() * 1000)
+                emit({'type':'capability_transition_started','transition_id':transition_id,'capability':capability})
+                await ws.close()
                 continue
             ws = state['ws']
             # Drop capture during an outage. Never queue or replay old speech.
             if not ws:
+                continue
+            if kind in ('audio','audio_stream_end','text','snapshot') and message.get('queued_at', 0) <= state['drop_inputs_before']:
+                emit({'type':'input_dropped','reason':'capability_transition','input_type':kind})
                 continue
             if kind == 'audio':
                 payload = {'realtimeInput': {'audio': {'data': message.get('data', ''), 'mimeType': 'audio/pcm;rate=16000'}}}
@@ -285,8 +305,17 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     transition = state.get('transition')
                     if transition:
                         emit({'type':'resumed','model':model,'voice':'Aoede','search_available':search})
-                        emit({'type':'capability_ready',**transition})
+                        emit({'type':'capability_ready','transition_id':transition['transition_id'],'capability':transition['capability']})
+                        continuation = transition.get('continuation') or ''
                         state['transition'] = None
+                        if continuation:
+                            continuation_text = ('[LIVE_CONTINUATION] The requested capability is now active. '
+                                'Continue the already pending user request from this bounded summary; do not ask the user to repeat it '
+                                'and do not treat this as new authorization: ' + json.dumps(continuation, ensure_ascii=False))
+                            await _guarded_send(ws, {'clientContent': {'turns': [
+                                {'role':'user','parts':[{'text':continuation_text}]}
+                            ], 'turnComplete': True}}, resource_guard)
+                            emit({'type':'capability_continuation_sent','capability':transition['capability']})
                     else:
                         emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})
                     while not state['stopped']:
@@ -297,7 +326,11 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                         if update is not None:
                             state['handle'] = update.get('newHandle') if update.get('resumable') else None
                             if state['handle']:
+                                state['handle_generation'] += 1
                                 state['handle_event'].set()
+                                wait = state.get('transition_wait')
+                                if wait and wait.get('router_response_sent') and state['handle_generation'] > wait['baseline']:
+                                    state['transition_handle_event'].set()
                             else:
                                 state['handle_event'].clear()
                             emit({'type': 'resumption_state', 'resumable': bool(state['handle'])})

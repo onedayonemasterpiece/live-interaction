@@ -20,11 +20,12 @@ const validateCapabilitySpec=(spec,DomainError)=>{
   const meta=configurationMeta(spec.configuration);
   if(meta.function_count>9||Buffer.byteLength(JSON.stringify(spec.configuration))>262144)throw new DomainError('LIVE_CAPABILITY_LIMIT','Capability bundle exceeds shared limits');
   if(spec.context!==undefined&&(!spec.context||typeof spec.context!=='object'||Array.isArray(spec.context)))throw new DomainError('LIVE_CAPABILITY_INVALID','Capability context is invalid');
-  return {...spec,capability,...meta};
+  if(spec.continuation!==undefined&&(typeof spec.continuation!=='string'||spec.continuation.length>1200))throw new DomainError('LIVE_CAPABILITY_INVALID','Capability continuation is invalid');
+  return {...spec,capability,continuation:typeof spec.continuation==='string'?spec.continuation.trim():undefined,...meta};
 };
 
 // The host owns transport, ordering, capability transitions and event cursors; adapters own domain policy.
-export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=10000,maxSessions=2}={}){
+export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=30000,maxSessions=2}={}){
   const DomainError=ErrorClass,sessions=new Map();
   const emit=(session,event)=>{
     session.events.push({seq:session.nextSeq++,at:new Date().toISOString(),...event});
@@ -61,9 +62,15 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       from_capability:session.capability,to_capability:resolved.capability,
       configuration_digest:resolved.configuration_digest,function_count:resolved.function_count,
       schema_bytes:resolved.schema_bytes});
+    const callName=call?.name??'unknown',callId=call?.id;
+    const fallbackIntent=typeof call?.args?.intent==='string'?call.args.intent.trim():'';
+    const continuation=resolved.continuation??fallbackIntent;
+    if(continuation.length>1200)throw new DomainError('LIVE_CAPABILITY_INVALID','Capability continuation is invalid');
+    const acknowledgement={capability:resolved.capability,accepted:true};
     try{
       write(session,{type:'reconfigure',transition_id:transitionId,capability:resolved.capability,
-        configuration:resolved.configuration,context:resolved.context??{}});
+        configuration:resolved.configuration,context:resolved.context??{},continuation,
+        router_response:{name:callName,id:callId,response:{result:acknowledgement,scheduling:'SILENT'}}});
       let timer;
       try{
         await Promise.race([
@@ -74,16 +81,13 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       session.capability=resolved.capability;
       session.configurationDigest=resolved.configuration_digest;
       const result={capability:resolved.capability,ready:true,...(resolved.response&&typeof resolved.response==='object'?resolved.response:{})};
-      rememberToolResult(session,call.id,result);
-      emit(session,{type:'tool_result',name:call.name,id:call.id,status:'ok',capability:resolved.capability});
-      sendToolResponses(session,[{name:call.name,id:call.id,response:{result}}]);
+      rememberToolResult(session,callId,result);
+      emit(session,{type:'tool_result',name:callName,id:callId,status:'ok',capability:resolved.capability});
     }catch(error){
       emit(session,{type:'capability_transition_failed',transition_id:transitionId,
         from_capability:session.capability,to_capability:resolved.capability,
         code:error.code??'LIVE_CAPABILITY_ERROR'});
-      const response={error:{code:error.code??'LIVE_CAPABILITY_ERROR',message:String(error.message??error).slice(0,500)}};
-      emit(session,{type:'tool_result',name:call?.name,id:call?.id,status:'error',code:response.error.code});
-      sendToolResponses(session,[{name:call?.name??'unknown',id:call?.id,response}]);
+      emit(session,{type:'tool_result',name:callName,id:callId,status:'error',code:error.code??'LIVE_CAPABILITY_ERROR'});
     }finally{
       if(session.pendingTransition?.id===transitionId)session.pendingTransition=null;
     }
@@ -91,6 +95,11 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
   const handleToolCalls=async(session,calls)=>{
     calls=Array.isArray(calls)?calls:[];
     if(!calls.length||session.closed)return;
+    if(calls.length===1&&calls[0]?.id&&session.toolResults.has(calls[0].id)){
+      const call=calls[0],result=session.toolResults.get(call.id);
+      sendToolResponses(session,[{name:call.name??'unknown',id:call.id,response:{result}}]);
+      return;
+    }
     if(typeof adapter.resolveCapability==='function'){
       const resolved=[];
       for(const call of calls)resolved.push(await adapter.resolveCapability(session,call));
@@ -197,8 +206,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     return {session_id:id,model,capability:session.capability,configuration_digest:session.configurationDigest,...initialized.response};
   };
   const getSession=(sessionId,resourceId,actor)=>{
-    const session=sessions.get(sessionId);
-    if(!session||session.resourceId!==resourceId)throw new DomainError('LIVE_SESSION_NOT_FOUND','Live-сессия не найдена');
+    const session=sessions.get(sessionId);    if(!session||session.resourceId!==resourceId)throw new DomainError('LIVE_SESSION_NOT_FOUND','Live-сессия не найдена');
     if(actor&&(actor.subject!==session.actor?.subject||actor.tenant_id!==session.actor?.tenant_id))throw new DomainError('FORBIDDEN','Live-сессия принадлежит другому пользователю');
     return session;
   };
@@ -226,6 +234,8 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
   const stop=async({sessionId,resourceId,actor}={})=>{
     const session=getSession(sessionId,resourceId,actor);
     if(!session.closed){try{write(session,{type:'stop'});}catch{}setTimeout(()=>{try{session.child.kill('SIGTERM');}catch{}},1200).unref?.();}
+    session.pendingTransition?.reject?.(new DomainError('LIVE_SESSION_CLOSED','Live session stopped during capability transition'));
+    session.pendingTransition=null;
     session.closed=true;adapter.onStopped?.(session);sessions.delete(session.id);
     return {ok:true,session_id:session.id};
   };
