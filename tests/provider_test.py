@@ -41,6 +41,43 @@ class ProviderContract(unittest.TestCase):
         self.assertNotIn('read_story', str(b))
         self.assertNotIn('thinkingConfig', a['generationConfig'])
 
+    def test_application_search_function_remains_available_without_native_search(self):
+        setup = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={
+                'system_instruction': 'street-story',
+                'functions': [
+                    {'name': 'read_topic'},
+                    {'name': 'search_web'},
+                ],
+                'application_search_function': 'search_web',
+            },
+            search=False,
+        )['setup']
+        system = setup['systemInstruction']['parts'][0]['text']
+        self.assertIn('search_web', system)
+        self.assertIn('Provider-native Google Search', system)
+        self.assertNotIn('Интернет-поиск сейчас недоступен', system)
+        self.assertEqual(
+            [item['name'] for item in setup['tools'][0]['functionDeclarations']],
+            ['read_topic', 'search_web'],
+        )
+
+    def test_unknown_application_search_function_does_not_claim_search(self):
+        setup = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={
+                'functions': [{'name': 'read_topic'}],
+                'application_search_function': 'search_web',
+            },
+            search=False,
+        )['setup']
+        system = setup['systemInstruction']['parts'][0]['text']
+        self.assertIn('Интернет-поиск сейчас недоступен', system)
+        self.assertNotIn('приложение предоставляет функцию search_web', system)
+
     def test_extended_nonblocking_and_resumption(self):
         s = setup_config('gemini-3.8-live-extended-thinking', {}, configuration={'functions':[{'name':'read'}]}, handle='test-handle')['setup']
         self.assertEqual(s['tools'][0]['functionDeclarations'][0]['behavior'], 'NON_BLOCKING')
