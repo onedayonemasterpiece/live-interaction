@@ -37,7 +37,9 @@ Preserve one ordered bounded sender, silence preroll/tail, immediate local Stop,
 no stale speech replay, full received output playback, separate spoken Stop
 confirmation, owner/resource checks and serialized authorized tools. An intentional
 same-microphone startup handoff may use the framework's bounded catch-up seed; do not
-weaken the normal steady-state queue/age limits to accommodate it. A Show/cohost
+weaken the normal steady-state queue/age limits to accommodate it. Audio HTTP delivery
+may have a longer absolute ceiling than the steady queue/age limits; the sender remains
+the primary steady-state liveness guard. A Show/cohost
 adapter should start read-only; do not inherit Review mutation permissions.
 
 Surface waits after 15s with elapsed mm:ss, truthful transport/provider stage,
