@@ -16,10 +16,10 @@ its tested audio/lifecycle paths, not a general agent framework.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.1.3`); see [integration](docs/integration.md).
+Use versioned releases (current release `0.1.5`); see [integration](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
-speech/mutations. Release 0.1.3 adds an optional provider resource guard. A
+speech/mutations. Release 0.1.5 keeps the 0.1.4 runtime while aligning Node and Python package metadata. Release 0.1.3 adds an optional provider resource guard. A
 guarded consumer checks its lease before connect/setup/send/receive, charges
 outbound provider payloads before transmission, and keeps the same guarded key
 through provider resumption. Resource-controller failures are terminal and are
