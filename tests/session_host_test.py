@@ -297,7 +297,9 @@ class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(reconfigure["configuration"]["functions"]), 3)
         self.assertEqual(reconfigure["continuation"], "find national projects dataset")
         self.assertEqual(reconfigure["router_response"]["id"], "cap1")
-        self.assertEqual(reconfigure["router_response"]["response"]["scheduling"], "SILENT")
+        self.assertEqual(reconfigure["router_response"]["scheduling"], "SILENT")
+        self.assertIs(reconfigure["router_response"]["willContinue"], False)
+        self.assertNotIn("scheduling", reconfigure["router_response"]["response"])
         self.assertFalse(any(item.get("type") == "tool_response" for item in decoded))
         self.assertEqual(session.capability, "dataset")
         self.assertTrue(any(

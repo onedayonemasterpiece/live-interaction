@@ -195,7 +195,9 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                 'router_response':{
                     'name':'activate_capability',
                     'id':'cap-1',
-                    'response':{'result':{'capability':'dataset','accepted':True},'scheduling':'SILENT'},
+                    'response':{'result':{'capability':'dataset','accepted':True}},
+                    'scheduling':'SILENT',
+                    'willContinue':False,
                 },
             })
             for _ in range(100):
@@ -203,6 +205,10 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.001)
             self.assertTrue(any('toolResponse' in item for item in first.sent))
+            response=next(item['toolResponse']['functionResponses'][0] for item in first.sent if 'toolResponse' in item)
+            self.assertEqual(response['scheduling'],'SILENT')
+            self.assertIs(response['willContinue'],False)
+            self.assertNotIn('scheduling',response['response'])
             self.assertEqual(len(connect_calls),1)
             first.incoming.put_nowait({'sessionResumptionUpdate':{'resumable':True,'newHandle':'fresh-handle'}})
             for _ in range(200):

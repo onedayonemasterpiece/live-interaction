@@ -53,7 +53,9 @@ test('capability router delegates safe acknowledgement and continuation to provi
  assert.equal(reconfigure.continuation,'find national projects dataset');
  assert.equal(reconfigure.router_response.id,'cap1');
  assert.equal(reconfigure.router_response.response.result.accepted,true);
- assert.equal(reconfigure.router_response.response.scheduling,'SILENT');
+ assert.equal(reconfigure.router_response.scheduling,'SILENT');
+ assert.equal(reconfigure.router_response.willContinue,false);
+ assert.equal(reconfigure.router_response.response.scheduling,undefined);
  assert.equal(writes.some(x=>x.type==='tool_response'),false,'provider worker owns router acknowledgement');
  const events=host.events(base).events;
  assert.ok(events.some(e=>e.type==='capability_transition_requested'&&e.to_capability==='dataset'));
