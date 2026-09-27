@@ -1,5 +1,11 @@
 # Integration contract
 
+This document covers transport/package integration. The mandatory product
+architecture for prompt layering, progressive capability disclosure, session
+continuity, modality-aware resource accounting, logging and acceptance lives in
+[Live agent architecture and operating standard](live-agent-architecture.md).
+A new or materially changed consumer MUST follow both documents.
+
 ## Pin and import
 
 The first consumer uses a release tarball in its private `vendor/` directory.
@@ -149,7 +155,12 @@ considering a provider closure finished. Model mic energy alone is not barge-in.
 
 ## Release gate and ownership
 
-Core changes go here and run Node/Python tests. A consumer selects a versioned
+Core changes go here and run Node/Python tests. Capability routing, configuration
+digests, provider reconfiguration and audit behaviour are shared framework concerns;
+do not reimplement them independently in a consumer once the corresponding released
+framework primitive exists.
+
+A consumer selects a versioned
 release and verifies generated assets match the installed package. Existing
 Wonderful Lections CI also rejects known duplicate transport implementations.
 Agent instructions/skill route new integrations here, but no skill can prevent
