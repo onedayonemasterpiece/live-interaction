@@ -256,3 +256,26 @@ This list is intentionally **not** a fallback chain. A new provider needs a thin
 adapter plus provider-specific real acceptance. Do not switch providers inside a
 running/recovering session merely because Gemini is slow, unavailable or out of
 quota.
+
+## Browser durable capture
+
+Release 0.2.6 exposes `createMicrophoneCapture` and
+`createDurableMicrophoneCapture` from the existing `./browser` entry point. This is
+the reusable capture layer for consumers that need an offline/restart-safe source;
+do not copy `getUserMedia`, PCM conversion, silence gating or pre-roll into a product.
+
+`createLiveClient({persistAudio})` passes the same optional durability callback into
+the shared audio sender. For accepted speech/pre-roll/tail, the callback receives
+either `{pcm:Int16Array,sample_rate:16000,captured_at_ms}` or an
+`{audio_stream_end:true,captured_at_ms}` marker. Provider transport is not allowed
+to see that accepted PCM until the callback resolves. A persistence failure stops the
+sender and surfaces the transport error; it is never converted into a provider retry.
+
+For completely offline capture, `createDurableMicrophoneCapture({persist})` runs the
+same microphone conversion and shared sender/VAD path with no provider POST. Its
+async `stop()` stops hardware, drains already captured frames, seals the source, waits
+for durable receipts, then closes the sender. The product owns the durable store,
+source IDs/manifests, retention and later upload/replay policy. When connectivity is
+available again, feed the durable source through the product's deliberate buffered
+Live turn (`activityStart → PCM → activityEnd`); ordinary reconnect still never
+replays old speech automatically.

@@ -186,3 +186,49 @@ test('text-only start does not request microphone and microphone can be enabled 
     if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
   }
 });
+
+test('createLiveClient persists accepted microphone PCM before HTTP transport',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  const processors=[];let releasePersist;const order=[];
+  const track={stop(){}},stream={getTracks:()=>[track]};
+  class Node{connect(){return this;}disconnect(){}}
+  class Processor extends Node{onaudioprocess=null;}
+  class Context{
+    sampleRate=16000;state='running';destination={};
+    createMediaStreamSource(){return new Node();}
+    createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>stream}},configurable:true});
+  globalThis.AudioContext=Context;
+  let releaseEvents;
+  const client=createLiveClient({
+    persistAudio:message=>{
+      order.push(message.pcm?'persist_pcm':'persist_end');
+      return new Promise(resolve=>{releasePersist=resolve;});
+    },
+    request:async(url,options={})=>{
+      if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+      if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+      if(url==='/live/one/input'){order.push('http_audio');return {ok:true};}
+      if(url==='/live/one/stop')return {ok:true};
+      throw new Error('unexpected '+url);
+    }
+  });
+  try{
+    await client.start({url:'/live'});
+    const speech=new Float32Array(1600).fill(.2);
+    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    for(let i=0;i<20&&!releasePersist;i++)await tick();
+    assert.deepEqual(order,['persist_pcm']);
+    releasePersist();
+    for(let i=0;i<30&&!order.includes('http_audio');i++)await new Promise(resolve=>setTimeout(resolve,20));
+    assert.deepEqual(order.slice(0,2),['persist_pcm','http_audio']);
+    client.stop();
+    releaseEvents?.({events:[],cursor:0,closed:true});
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});

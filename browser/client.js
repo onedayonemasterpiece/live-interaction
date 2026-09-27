@@ -1,5 +1,9 @@
 import {createLiveAudioSender} from './live-audio.js';
+import {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
 import {isLiveStopCommand,liveStopConfirmation} from './live-commands.js';
+
+export {createLiveAudioSender} from './live-audio.js';
+export {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
 
 export async function liveJson(url,options){
   const response=await fetch(url,{cache:'no-store',credentials:'same-origin',signal:AbortSignal.timeout(30000),...options});
@@ -8,17 +12,11 @@ export async function liveJson(url,options){
   return payload;
 }
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
-function pcm16(samples,fromRate){
-  const ratio=fromRate/16000,count=Math.max(1,Math.floor(samples.length/ratio)),out=new Int16Array(count);
-  for(let i=0;i<count;i++){const value=Math.max(-1,Math.min(1,samples[Math.min(samples.length-1,Math.floor(i*ratio))]));out[i]=value<0?value*32768:value*32767;}
-  return out;
-}
-
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
-export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation}}={}){
+export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null}={}){
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
-  let stream=null,micContext=null,processor=null,inputSource=null,sender=null,microphoneEnabled=false,startupCapture=null;
+  let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false;
@@ -75,7 +73,6 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const timeoutMs=audio?10000:2500;
     return request(`${root}/${encodeURIComponent(sessionId)}/input`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(message),signal:AbortSignal.any([abort.signal,AbortSignal.timeout(timeoutMs)])});
   }
-  const microphoneConstraints={audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false};
   function releaseStartupCapture({stopTracks=true,event='startup_capture_cancelled'}={}){
     const capture=startupCapture;startupCapture=null;
     if(!capture)return null;
@@ -113,37 +110,35 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
 
   function closeMic(){
     sender?.stop();sender=null;
-    if(processor)processor.onaudioprocess=null;
-    try{processor?.disconnect();inputSource?.disconnect();}catch{}
-    for(const track of stream?.getTracks?.()??[]){track.stop();onTiming('microphone_track_stopped');}
-    const context=micContext;processor=inputSource=stream=micContext=null;
-    if(context)void context.close().catch(()=>{});
+    microphone?.stop();microphone=null;
   }
   async function startMic(epoch,handoff=null){
     if(!microphoneEnabled)return false;
     if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
-      const captured=handoff?.stream??await navigator.mediaDevices.getUserMedia(microphoneConstraints);
-      if(epoch!==generation||!microphoneEnabled){for(const track of captured.getTracks())track.stop();return false;}
-      stream=captured;const Context=Audio();if(!Context)throw new Error('AudioContext unavailable');
-      micContext=new Context();inputSource=micContext.createMediaStreamSource(stream);processor=micContext.createScriptProcessor(4096,1,1);
-      sender=createLiveAudioSender({send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),onTiming:(event,metrics)=>{
-        onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
-      },onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}});
+      sender=createLiveAudioSender({
+        send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),
+        persist:persistAudio,
+        onTiming:(event,metrics)=>{
+          onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
+        },
+        onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}
+      });
       const handoffFrames=[];
       for(const chunk of handoff?.chunks??[]){
-        const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk),pcm=pcm16(samples,handoff.sampleRate);
-        let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
-        handoffFrames.push({pcm,rms:Math.sqrt(energy/Math.max(1,samples.length))});
+        const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk);
+        handoffFrames.push({pcm:pcm16(samples,handoff.sampleRate),rms:frameRms(samples)});
       }
       if(handoffFrames.length&&!sender.seed(handoffFrames))return false;
-      processor.onaudioprocess=event=>{
-        if(epoch!==generation||!sessionId)return;
-        const samples=event.inputBuffer.getChannelData(0);let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
-        // Only provider interruption or an explicit Stop cancels model playback.
-        sender.push(pcm16(samples,micContext.sampleRate),Math.sqrt(energy/samples.length));
-      };
-      inputSource.connect(processor);processor.connect(micContext.destination);onState('listening');return true;
+      microphone=createMicrophoneCapture({
+        onFrame:(pcm,rms)=>{if(epoch===generation&&sessionId)sender?.push(pcm,rms);},
+        onTiming,
+        onError:error=>{if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
+      });
+      const started=await microphone.start({stream:handoff?.stream??null,constraints:microphoneConstraints});
+      if(epoch!==generation||!microphoneEnabled){microphone.stop();microphone=null;return false;}
+      if(started){onState('listening');return true;}
+      return false;
     }catch(error){if(epoch!==generation)return false;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);return false;}
   }
   async function poll(){
@@ -217,7 +212,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   async function enableMicrophone({takeMicrophoneHandoff=null}={}){
     if(!sessionId)return false;
     microphoneEnabled=true;
-    if(stream)return true;
+    if(microphone?.running)return true;
     const epoch=generation;
     const handoff=typeof takeMicrophoneHandoff==='function'?await takeMicrophoneHandoff():null;
     if(epoch!==generation){handoff?.stream?.getTracks?.().forEach(track=>track.stop());return false;}

@@ -99,3 +99,49 @@ test('a delayed end-of-stream marker is flushed even after the audio age bound',
  assert.ok(release);assert.equal(sender.stats().queued_pcm_bytes,0);at+=3000;release();await tick();
  assert.equal(error,undefined);assert.equal(sent.at(-1).audio_stream_end,true);assert.equal(sender.stats().oldest_age_ms,0);sender.stop();
 });
+
+
+test('durable receipt is completed before provider transport sees accepted PCM',async()=>{
+  let releasePersist;const order=[],sent=[];
+  const sender=createLiveAudioSender({
+    batchMs:0,
+    persist:message=>{order.push(message.pcm?'persist_pcm':'persist_end');return new Promise(resolve=>{releasePersist=resolve;});},
+    send:async message=>{order.push(message.pcm?'send_pcm':'send_end');sent.push(message);}
+  });
+  sender.push(new Int16Array(1600).fill(1000),.05);
+  await tick();
+  assert.deepEqual(order,['persist_pcm']);
+  assert.equal(sent.length,0);
+  releasePersist();await tick();await tick();
+  assert.equal(order[1],'send_pcm');
+  await sender.drainDurable();
+  sender.stop();
+});
+
+test('durable failure prevents the corresponding PCM from reaching provider transport',async()=>{
+  const sent=[];let failed;
+  const sender=createLiveAudioSender({
+    batchMs:0,
+    persist:async()=>{throw new Error('disk failed');},
+    send:async message=>sent.push(message),
+    onError:error=>{failed=error;}
+  });
+  sender.push(new Int16Array(1600).fill(1000),.05);
+  await tick();await tick();
+  assert.match(failed.message,/disk failed/);
+  assert.equal(sent.length,0);
+  await assert.rejects(sender.drainDurable(),/disk failed/);
+});
+
+test('finish seals a durable source without replaying provider transport requirements',async()=>{
+  const durable=[];const sender=createLiveAudioSender({
+    batchMs:0,
+    persist:async message=>durable.push(message),
+    send:async()=>{}
+  });
+  sender.push(new Int16Array(1600).fill(1000),.05);
+  await sender.finish();
+  assert.ok(durable.some(item=>item.pcm instanceof Int16Array));
+  assert.equal(durable.at(-1).audio_stream_end,true);
+  sender.stop();
+});
