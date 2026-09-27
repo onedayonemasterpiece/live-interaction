@@ -1,6 +1,15 @@
 import {createHash,randomUUID} from 'node:crypto';
 export const LIVE_SESSION_MODELS=Object.freeze(['gemini-3.8-live','gemini-3.8-live-extended-thinking']);
 export class LiveError extends Error {constructor(code,message){super(message);this.code=code;}}
+const TOOL_PARTS=Symbol('live_tool_response_parts');
+export function withLiveToolParts(result,parts){
+  if(!result||typeof result!=='object'||Array.isArray(result)||!Array.isArray(parts)||parts.length<1||parts.length>2)throw new TypeError('Invalid Live tool response parts');
+  for(const part of parts){
+    const blob=part?.inlineData;
+    if(!['image/jpeg','image/png','image/webp'].includes(blob?.mimeType)||typeof blob?.data!=='string'||blob.data.length>700000||Buffer.from(blob.data,'base64').length>512*1024||typeof blob?.displayName!=='string'||!/^[a-zA-Z0-9_.-]{1,80}$/.test(blob.displayName))throw new TypeError('Invalid Live image response part');
+  }
+  return Object.defineProperty({...result},TOOL_PARTS,{value:parts});
+}
 const trimText=(value,max=1200)=>typeof value==='string'?value.slice(0,max):value;
 const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,stable(value[key])])):value;
 const configurationMeta=configuration=>{
@@ -45,6 +54,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     session.toolResults.set(id,result);
     while(session.toolResults.size>100)session.toolResults.delete(session.toolResults.keys().next().value);
   };
+  const functionResponse=(call,result)=>({name:call.name??'unknown',id:call.id,response:{result},...(result?.[TOOL_PARTS]?{parts:result[TOOL_PARTS]}:{})});
   const sendToolResponses=(session,responses)=>{
     if(responses.length&&!session.closed){
       session.toolResponseAt=write(session,{type:'tool_response',responses});
@@ -97,7 +107,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     if(!calls.length||session.closed)return;
     if(calls.length===1&&calls[0]?.id&&session.toolResults.has(calls[0].id)){
       const call=calls[0],result=session.toolResults.get(call.id);
-      sendToolResponses(session,[{name:call.name??'unknown',id:call.id,response:{result}}]);
+      sendToolResponses(session,[functionResponse(call,result)]);
       return;
     }
     if(typeof adapter.resolveCapability==='function'){
@@ -132,7 +142,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         const result=session.toolResults.has(call.id)?session.toolResults.get(call.id):await adapter.executeTool(session,call);
         rememberToolResult(session,call.id,result);
         emit(session,{type:'tool_result',name:call.name,id:call.id,status:'ok',duration_ms:Date.now()-toolAt,revision:result?.revision??result?.result_revision??null});
-        responses.push({name:call.name,id:call.id,response:{result}});
+        responses.push(functionResponse(call,result));
       }catch(error){
         emit(session,{type:'tool_result',name:call?.name,id:call?.id,status:'error',code:error.code??'LIVE_TOOL_ERROR',message:trimText(error.message,240),change_shapes:Array.isArray(call?.args?.changes)?call.args.changes.slice(0,16).map(c=>({kind:c?.kind,keys:Object.keys(c??{})})):undefined});
         responses.push({name:call?.name??'unknown',id:call?.id,response:{error:{code:error.code??'LIVE_TOOL_ERROR',message:String(error.message??error).slice(0,500)}}});

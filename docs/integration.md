@@ -137,6 +137,8 @@ Do not expose the internal actor-omitting stopAll path over HTTP.
 `configuration` is server-owned: `system_instruction`, `context_instruction`,
 `functions` (Gemini declarations), `voice` (default Aoede), `search_enabled`
 (default false). Never accept arbitrary declarations/instructions from a browser.
+An image-reading tool may return `withLiveToolParts(result, [{inlineData:{mimeType:'image/jpeg',displayName:'preview.jpg',data:base64}}])` from the Node host. The host sends the bounded image in the same provider FunctionResponse as `result` and preserves it on deduplicated calls; the product still owns image access and authorization.
+
 The host caches successful tool results by provider call ID and serializes tools;
 application idempotency must still survive process/session restarts. If
 `resolveCapability` selects a transition, that router call must be the only tool

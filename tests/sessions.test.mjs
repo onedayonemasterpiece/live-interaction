@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {createLiveSessionHost} from '../node/sessions.mjs';
+import {createLiveSessionHost,withLiveToolParts} from '../node/sessions.mjs';
 const tick=()=>new Promise(r=>setImmediate(r));
 function worker(){const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>c.emit('close',0);c.stdin.on('data',b=>{if(JSON.parse(b).type==='start')queueMicrotask(()=>c.stdout.write('{"type":"ready"}\n'));});return c;}
 test('independent product adapters preserve ordered tools, deduplication, owner isolation and cancel-before-start',async()=>{
@@ -16,6 +16,31 @@ test('independent product adapters preserve ordered tools, deduplication, owner 
  let page=host.events(base),audio=page.events.filter(e=>e.type==='audio').length;assert.equal(page.closed,false);
  while(page.has_more){page=host.events({...base,after:page.cursor});audio+=page.events.filter(e=>e.type==='audio').length;}
  assert.equal(audio,140);assert.equal(page.closed,true);await host.stop(base);
+});
+
+test('image returned by a tool stays in its multimodal FunctionResponse on first call and deduplication',async()=>{
+ const c=worker(),writes=[];c.stdin.on('data',b=>{for(const line of b.toString().split('\n').filter(Boolean))writes.push(JSON.parse(line));});
+ const image=Buffer.from('small-image-fixture').toString('base64');let calls=0;
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[{name:'inspect_image'}]}}),
+  executeTool:async()=>{calls++;return withLiveToolParts({image:{$ref:'preview.jpg'},preview_delivered:true},[{inlineData:{mimeType:'image/jpeg',displayName:'preview.jpg',data:image}}]);}
+ })});
+ const actor={subject:'a',tenant_id:'t'},started=await host.start({resourceId:'r1',actor});
+ const base={resourceId:'r1',sessionId:started.session_id,actor};
+ const call=()=>c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'inspect_image',id:'same-image'}]})+'\n');
+ call();for(let i=0;i<30&&writes.filter(x=>x.type==='tool_response').length<1;i++)await tick();
+ call();for(let i=0;i<30&&writes.filter(x=>x.type==='tool_response').length<2;i++)await tick();
+ const responses=writes.filter(x=>x.type==='tool_response').map(x=>x.responses[0]);
+ assert.equal(calls,1);
+ assert.equal(responses.length,2);
+ for(const response of responses){
+  assert.deepEqual(response.response.result.image,{$ref:'preview.jpg'});
+  assert.equal(response.response.result.preview_delivered,true);
+  assert.equal(response.parts[0].inlineData.data,image);
+  assert.equal(JSON.stringify(response.response).includes(image),false,'raw image is not placed inside text result');
+ }
+ assert.equal(JSON.stringify(host.events(base).events).includes(image),false,'browser events contain no image bytes');
+ await host.stop(base);
 });
 
 test('capability router delegates safe acknowledgement and continuation to provider worker',async()=>{
