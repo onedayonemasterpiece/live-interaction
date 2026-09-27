@@ -1,10 +1,30 @@
-import {randomUUID} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 export const LIVE_SESSION_MODELS=Object.freeze(['gemini-3.8-live','gemini-3.8-live-extended-thinking']);
 export class LiveError extends Error {constructor(code,message){super(message);this.code=code;}}
 const trimText=(value,max=1200)=>typeof value==='string'?value.slice(0,max):value;
+const stable=value=>Array.isArray(value)?value.map(stable):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,stable(value[key])])):value;
+const configurationMeta=configuration=>{
+  const functions=Array.isArray(configuration?.functions)?configuration.functions:[];
+  const encoded=JSON.stringify(stable(configuration??{}));
+  return {
+    configuration_digest:createHash('sha256').update(encoded).digest('hex'),
+    function_count:functions.length,
+    schema_bytes:Buffer.byteLength(JSON.stringify(functions))
+  };
+};
+const validateCapabilitySpec=(spec,DomainError)=>{
+  if(!spec||typeof spec!=='object')throw new DomainError('LIVE_CAPABILITY_INVALID','Capability resolver returned invalid state');
+  const capability=String(spec.capability??'');
+  if(!/^[a-z][a-z0-9_-]{0,63}$/.test(capability))throw new DomainError('LIVE_CAPABILITY_INVALID','Capability id is invalid');
+  if(!spec.configuration||typeof spec.configuration!=='object'||Array.isArray(spec.configuration))throw new DomainError('LIVE_CAPABILITY_INVALID','Capability configuration is required');
+  const meta=configurationMeta(spec.configuration);
+  if(meta.function_count>9||Buffer.byteLength(JSON.stringify(spec.configuration))>262144)throw new DomainError('LIVE_CAPABILITY_LIMIT','Capability bundle exceeds shared limits');
+  if(spec.context!==undefined&&(!spec.context||typeof spec.context!=='object'||Array.isArray(spec.context)))throw new DomainError('LIVE_CAPABILITY_INVALID','Capability context is invalid');
+  return {...spec,capability,...meta};
+};
 
-// The host owns transport, ordering and event cursors; adapters own domain policy.
-export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,maxSessions=2}={}){
+// The host owns transport, ordering, capability transitions and event cursors; adapters own domain policy.
+export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=10000,maxSessions=2}={}){
   const DomainError=ErrorClass,sessions=new Map();
   const emit=(session,event)=>{
     session.events.push({seq:session.nextSeq++,at:new Date().toISOString(),...event});
@@ -19,15 +39,89 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     session.child.stdin.write(`${JSON.stringify({...message,queued_at:queuedAt})}\n`);
     return queuedAt;
   };
+  const rememberToolResult=(session,id,result)=>{
+    if(!id)return;
+    session.toolResults.set(id,result);
+    while(session.toolResults.size>100)session.toolResults.delete(session.toolResults.keys().next().value);
+  };
+  const sendToolResponses=(session,responses)=>{
+    if(responses.length&&!session.closed){
+      session.toolResponseAt=write(session,{type:'tool_response',responses});
+      session.awaitingAudio=true;
+      emit(session,{type:'timing',stage:'tool_response_written'});
+    }
+  };
+  const transitionCapability=async(session,call,spec)=>{
+    const resolved=validateCapabilitySpec(spec,DomainError);
+    const transitionId='cap_'+randomUUID().replaceAll('-','');
+    let resolveReady,rejectReady;
+    const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject;});
+    session.pendingTransition={id:transitionId,capability:resolved.capability,resolve:resolveReady,reject:rejectReady};
+    emit(session,{type:'capability_transition_requested',transition_id:transitionId,
+      from_capability:session.capability,to_capability:resolved.capability,
+      configuration_digest:resolved.configuration_digest,function_count:resolved.function_count,
+      schema_bytes:resolved.schema_bytes});
+    try{
+      write(session,{type:'reconfigure',transition_id:transitionId,capability:resolved.capability,
+        configuration:resolved.configuration,context:resolved.context??{}});
+      let timer;
+      try{
+        await Promise.race([
+          ready,
+          new Promise((_,reject)=>{timer=setTimeout(()=>reject(new DomainError('LIVE_CAPABILITY_TIMEOUT','Capability transition timeout')),reconfigureTimeoutMs);})
+        ]);
+      }finally{clearTimeout(timer);}
+      session.capability=resolved.capability;
+      session.configurationDigest=resolved.configuration_digest;
+      const result={capability:resolved.capability,ready:true,...(resolved.response&&typeof resolved.response==='object'?resolved.response:{})};
+      rememberToolResult(session,call.id,result);
+      emit(session,{type:'tool_result',name:call.name,id:call.id,status:'ok',capability:resolved.capability});
+      sendToolResponses(session,[{name:call.name,id:call.id,response:{result}}]);
+    }catch(error){
+      emit(session,{type:'capability_transition_failed',transition_id:transitionId,
+        from_capability:session.capability,to_capability:resolved.capability,
+        code:error.code??'LIVE_CAPABILITY_ERROR'});
+      const response={error:{code:error.code??'LIVE_CAPABILITY_ERROR',message:String(error.message??error).slice(0,500)}};
+      emit(session,{type:'tool_result',name:call?.name,id:call?.id,status:'error',code:response.error.code});
+      sendToolResponses(session,[{name:call?.name??'unknown',id:call?.id,response}]);
+    }finally{
+      if(session.pendingTransition?.id===transitionId)session.pendingTransition=null;
+    }
+  };
   const handleToolCalls=async(session,calls)=>{
+    calls=Array.isArray(calls)?calls:[];
+    if(!calls.length||session.closed)return;
+    if(typeof adapter.resolveCapability==='function'){
+      const resolved=[];
+      for(const call of calls)resolved.push(await adapter.resolveCapability(session,call));
+      const transitions=resolved.map((spec,index)=>({spec,index})).filter(item=>item.spec);
+      if(transitions.length){
+        if(calls.length!==1||transitions.length!==1){
+          const responses=calls.map(call=>({name:call?.name??'unknown',id:call?.id,response:{error:{code:'LIVE_CAPABILITY_CONFLICT',message:'Capability transition must be the only tool call in its batch'}}}));
+          for(const call of calls)emit(session,{type:'tool_result',name:call?.name,id:call?.id,status:'error',code:'LIVE_CAPABILITY_CONFLICT'});
+          sendToolResponses(session,responses);
+          return;
+        }
+        try{
+          await transitionCapability(session,calls[0],transitions[0].spec);
+        }catch(error){
+          const response={error:{code:error.code??'LIVE_CAPABILITY_ERROR',message:String(error.message??error).slice(0,500)}};
+          emit(session,{type:'capability_transition_rejected',from_capability:session.capability,
+            to_capability:String(transitions[0].spec?.capability??'').slice(0,80),code:response.error.code});
+          emit(session,{type:'tool_result',name:calls[0]?.name,id:calls[0]?.id,status:'error',code:response.error.code});
+          sendToolResponses(session,[{name:calls[0]?.name??'unknown',id:calls[0]?.id,response}]);
+        }
+        return;
+      }
+    }
     const responses=[];
-    for(const call of Array.isArray(calls)?calls:[]){
+    for(const call of calls){
       if(session.closed)return;
       if(session.cancelled.has(call.id))continue;
       const toolAt=Date.now();
       try{
         const result=session.toolResults.has(call.id)?session.toolResults.get(call.id):await adapter.executeTool(session,call);
-        session.toolResults.set(call.id,result);while(session.toolResults.size>100)session.toolResults.delete(session.toolResults.keys().next().value);
+        rememberToolResult(session,call.id,result);
         emit(session,{type:'tool_result',name:call.name,id:call.id,status:'ok',duration_ms:Date.now()-toolAt,revision:result?.revision??result?.result_revision??null});
         responses.push({name:call.name,id:call.id,response:{result}});
       }catch(error){
@@ -35,7 +129,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         responses.push({name:call?.name??'unknown',id:call?.id,response:{error:{code:error.code??'LIVE_TOOL_ERROR',message:String(error.message??error).slice(0,500)}}});
       }
     }
-    if(responses.length&&!session.closed){session.toolResponseAt=write(session,{type:'tool_response',responses});session.awaitingAudio=true;emit(session,{type:'timing',stage:'tool_response_written'});}
+    sendToolResponses(session,responses);
   };
   const adapter=adapterFactory({emit,write,measure,timing});
   const start=async({resourceId,actor,model=models[0],history=[],...args}={})=>{
@@ -45,7 +139,9 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     const initialized=adapter.initialize({resourceId,actor,model,...args});
     const id=`live_${randomUUID().replaceAll('-','')}`;
     const child=createWorker({model,actor,resourceId});
-    const session={...initialized.state,id,resourceId,actor,model,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map()};
+    const initialMeta=configurationMeta(initialized.configuration??{});
+    const session={...initialized.state,id,resourceId,actor,model,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map(),
+      capability:initialized.capability??initialized.state?.capability??'core',configurationDigest:initialMeta.configuration_digest,pendingTransition:null};
     sessions.set(id,session);
     let readyResolve,readyReject;
     const ready=new Promise((resolve,reject)=>{readyResolve=resolve;readyReject=reject;});
@@ -53,6 +149,16 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       if(!line.trim())return;
       let event;
       try{event=JSON.parse(line);}catch{return;}
+      if(event.type==='capability_ready'){
+        emit(session,event);
+        if(session.pendingTransition?.id===event.transition_id)session.pendingTransition.resolve(event);
+        return;
+      }
+      if(event.type==='capability_transition_error'){
+        emit(session,event);
+        if(session.pendingTransition?.id===event.transition_id)session.pendingTransition.reject(new DomainError(event.code??'LIVE_CAPABILITY_ERROR','Capability transition failed'));
+        return;
+      }
       if(event.type==='ready'){emit(session,event);readyResolve(event);return;}
       if(event.type==='error'){emit(session,event);readyReject(new DomainError('LIVE_PROVIDER_ERROR',trimText(event.message??'Gemini Live error',500)));return;}
       if(event.type==='tool_cancelled'){for(const id of event.ids??[])session.cancelled.add(id);}
@@ -72,7 +178,12 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     });
     child.stderr.on('data',()=>{});
     child.on('error',()=>readyReject(new DomainError('LIVE_UNAVAILABLE','Не удалось запустить Live worker')));
-    child.on('close',code=>{readyReject(new DomainError('LIVE_PROVIDER_CLOSED','Live provider closed during setup'));session.closed=true;emit(session,{type:'closed',code});});
+    child.on('close',code=>{
+      readyReject(new DomainError('LIVE_PROVIDER_CLOSED','Live provider closed during setup'));
+      session.pendingTransition?.reject?.(new DomainError('LIVE_PROVIDER_CLOSED','Live provider closed during capability transition'));
+      session.pendingTransition=null;
+      session.closed=true;emit(session,{type:'closed',code});
+    });
     write(session,{type:'start',model,configuration:initialized.configuration,context:initialized.context,history:Array.isArray(history)?history.slice(-8).filter(m=>['user','model'].includes(m?.role)&&typeof m.text==='string').map(m=>({role:m.role,text:m.text.slice(-700)})):[]});
     let timer;
     try{
@@ -81,7 +192,9 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       sessions.delete(id);try{child.kill('SIGKILL');}catch{}throw error;
     }finally{clearTimeout(timer);}
     adapter.onStarted?.(session);
-    return {session_id:id,model,...initialized.response};
+    emit(session,{type:'configuration_ready',capability:session.capability,
+      configuration_digest:session.configurationDigest,function_count:initialMeta.function_count,schema_bytes:initialMeta.schema_bytes});
+    return {session_id:id,model,capability:session.capability,configuration_digest:session.configurationDigest,...initialized.response};
   };
   const getSession=(sessionId,resourceId,actor)=>{
     const session=sessions.get(sessionId);

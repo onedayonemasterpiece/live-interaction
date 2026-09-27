@@ -17,3 +17,60 @@ test('independent product adapters preserve ordered tools, deduplication, owner 
  while(page.has_more){page=host.events({...base,after:page.cursor});audio+=page.events.filter(e=>e.type==='audio').length;}
  assert.equal(audio,140);assert.equal(page.closed,true);await host.stop(base);
 });
+
+test('capability router reconfigures provider before replying to the router tool',async()=>{
+ const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>c.emit('close',0);
+ const writes=[];
+ c.stdin.on('data',b=>{
+   for(const line of b.toString().split('\n').filter(Boolean)){
+     const message=JSON.parse(line);writes.push(message);
+     if(message.type==='start')queueMicrotask(()=>c.stdout.write('{"type":"ready"}\n'));
+     if(message.type==='reconfigure')queueMicrotask(()=>{
+       c.stdout.write(JSON.stringify({type:'capability_transition_started',transition_id:message.transition_id,capability:message.capability})+'\n');
+       c.stdout.write(JSON.stringify({type:'capability_ready',transition_id:message.transition_id,capability:message.capability})+'\n');
+     });
+   }
+ });
+ const adapter={
+   initialize:()=>({state:{},capability:'core',context:{},configuration:{functions:[{name:'activate_capability'},{name:'read'}]}}),
+   resolveCapability:async(_,call)=>call.name==='activate_capability'?{
+     capability:'dataset',
+     configuration:{system_instruction:'dataset',functions:[{name:'activate_capability'},{name:'dataset.find'},{name:'dataset.read'}]},
+     context:{scope:'dataset'},
+     response:{selected:'dataset'}
+   }:null,
+   executeTool:async()=>({ok:true})
+ };
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>adapter,reconfigureTimeoutMs:1000});
+ const started=await host.start({resourceId:'r1',actor:{subject:'a',tenant_id:'t'}});
+ const base={resourceId:'r1',sessionId:started.session_id,actor:{subject:'a',tenant_id:'t'}};
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'cap1',args:{capability:'dataset'}}]})+'\n');
+ for(let i=0;i<20&&!writes.some(x=>x.type==='tool_response');i++)await tick();
+ const reconfigure=writes.find(x=>x.type==='reconfigure'),response=writes.find(x=>x.type==='tool_response');
+ assert.equal(reconfigure.capability,'dataset');
+ assert.equal(reconfigure.configuration.functions.length,3);
+ assert.ok(response,'router response must be sent only after capability_ready');
+ assert.equal(response.responses[0].response.result.capability,'dataset');
+ const events=host.events(base).events;
+ assert.ok(events.some(e=>e.type==='capability_transition_requested'&&e.to_capability==='dataset'));
+ assert.ok(events.some(e=>e.type==='capability_ready'&&e.capability==='dataset'));
+ assert.ok(events.some(e=>e.type==='tool_result'&&e.id==='cap1'&&e.status==='ok'));
+ await host.stop(base);
+});
+
+test('capability bundles reject more than nine functions without reconfiguring provider',async()=>{
+ const c=worker(),writes=[];c.stdin.on('data',b=>{for(const line of b.toString().split('\n').filter(Boolean))writes.push(JSON.parse(line));});
+ const adapter={
+   initialize:()=>({state:{},context:{},configuration:{functions:[{name:'activate_capability'}]}}),
+   resolveCapability:async()=>({capability:'too_big',configuration:{functions:Array.from({length:10},(_,i)=>({name:'f'+i}))}}),
+   executeTool:async()=>({ok:true})
+ };
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>adapter,reconfigureTimeoutMs:100});
+ const started=await host.start({resourceId:'r2',actor:{subject:'a',tenant_id:'t'}});
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'cap2',args:{}}]})+'\n');
+ for(let i=0;i<20&&!writes.some(x=>x.type==='tool_response');i++)await tick();
+ assert.equal(writes.some(x=>x.type==='reconfigure'),false);
+ const response=writes.find(x=>x.type==='tool_response');
+ assert.equal(response.responses[0].response.error.code,'LIVE_CAPABILITY_LIMIT');
+ await host.stop({resourceId:'r2',sessionId:started.session_id,actor:{subject:'a',tenant_id:'t'}});
+});

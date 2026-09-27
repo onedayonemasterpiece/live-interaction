@@ -196,6 +196,173 @@ class ManagedHostContract(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(provider.cancelled)
 
 
+
+class CapabilityAdapter(Adapter):
+    def initialize(self, *, resource_id, actor, model, **_args):
+        return {
+            "state": {},
+            "capability": "core",
+            "context": {"resourceId": resource_id},
+            "configuration": {
+                "functions": [
+                    {"name": "activate_capability"},
+                    {"name": "read"},
+                ]
+            },
+        }
+
+    async def resolve_capability(self, _session, call):
+        if call.get("name") != "activate_capability":
+            return None
+        return {
+            "capability": "dataset",
+            "configuration": {
+                "system_instruction": "dataset",
+                "functions": [
+                    {"name": "activate_capability"},
+                    {"name": "dataset.find"},
+                    {"name": "dataset.read"},
+                ],
+            },
+            "context": {"scope": "dataset"},
+            "response": {"selected": "dataset"},
+        }
+
+
+class CapabilityProvider:
+    def __init__(self):
+        self.messages = []
+        self.events = None
+
+    async def run(self, *, session, reader, on_event):
+        self.events = on_event
+        start = await reader.readline()
+        self.messages.append(start)
+        on_event({"type": "ready", "model": session.model})
+        while True:
+            line = await reader.readline()
+            if not line:
+                return
+            self.messages.append(line)
+            message = __import__("json").loads(line)
+            if message.get("type") == "reconfigure":
+                on_event(
+                    {
+                        "type": "capability_transition_started",
+                        "transition_id": message["transition_id"],
+                        "capability": message["capability"],
+                    }
+                )
+                on_event(
+                    {
+                        "type": "capability_ready",
+                        "transition_id": message["transition_id"],
+                        "capability": message["capability"],
+                    }
+                )
+            if message.get("type") == "stop":
+                return
+
+
+class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_router_reconfigures_before_tool_response(self):
+        adapter = CapabilityAdapter()
+        provider = CapabilityProvider()
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            managed_runner=provider.run,
+            ready_timeout_ms=500,
+            reconfigure_timeout_ms=500,
+        )
+        actor = {"subject": "a", "tenant_id": "t"}
+        started = await host.start(resource_id="story1", actor=actor)
+        session = host.sessions[started["session_id"]]
+        provider.events(
+            {
+                "type": "tool_call",
+                "calls": [
+                    {
+                        "name": "activate_capability",
+                        "id": "cap1",
+                        "args": {"capability": "dataset"},
+                    }
+                ],
+            }
+        )
+        for _ in range(40):
+            decoded = [__import__("json").loads(item) for item in provider.messages]
+            if any(item.get("type") == "tool_response" for item in decoded):
+                break
+            await asyncio.sleep(0)
+        decoded = [__import__("json").loads(item) for item in provider.messages]
+        reconfigure = next(item for item in decoded if item.get("type") == "reconfigure")
+        response = next(item for item in decoded if item.get("type") == "tool_response")
+        self.assertEqual(reconfigure["capability"], "dataset")
+        self.assertEqual(len(reconfigure["configuration"]["functions"]), 3)
+        self.assertEqual(
+            response["responses"][0]["response"]["result"]["capability"], "dataset"
+        )
+        self.assertEqual(session.capability, "dataset")
+        self.assertTrue(
+            any(
+                event.get("type") == "capability_transition_requested"
+                and event.get("to_capability") == "dataset"
+                for event in session.events
+            )
+        )
+        await host.stop(
+            resource_id="story1",
+            session_id=started["session_id"],
+            actor=actor,
+        )
+
+    async def test_capability_bundle_limit_is_structured_tool_error(self):
+        class TooBig(CapabilityAdapter):
+            async def resolve_capability(self, _session, _call):
+                return {
+                    "capability": "too_big",
+                    "configuration": {
+                        "functions": [{"name": f"f{i}"} for i in range(10)]
+                    },
+                }
+
+        adapter = TooBig()
+        provider = CapabilityProvider()
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            managed_runner=provider.run,
+            ready_timeout_ms=500,
+            reconfigure_timeout_ms=100,
+        )
+        actor = {"subject": "a", "tenant_id": "t"}
+        started = await host.start(resource_id="story2", actor=actor)
+        provider.events(
+            {
+                "type": "tool_call",
+                "calls": [
+                    {"name": "activate_capability", "id": "cap2", "args": {}}
+                ],
+            }
+        )
+        for _ in range(40):
+            decoded = [__import__("json").loads(item) for item in provider.messages]
+            if any(item.get("type") == "tool_response" for item in decoded):
+                break
+            await asyncio.sleep(0)
+        decoded = [__import__("json").loads(item) for item in provider.messages]
+        self.assertFalse(any(item.get("type") == "reconfigure" for item in decoded))
+        response = next(item for item in decoded if item.get("type") == "tool_response")
+        self.assertEqual(
+            response["responses"][0]["response"]["error"]["code"],
+            "LIVE_CAPABILITY_LIMIT",
+        )
+        await host.stop(
+            resource_id="story2",
+            session_id=started["session_id"],
+            actor=actor,
+        )
+
+
 class SlowAdapter(Adapter):
     def __init__(self):
         super().__init__()
