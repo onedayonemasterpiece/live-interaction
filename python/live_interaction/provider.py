@@ -9,6 +9,7 @@ import re
 import sys
 import time
 from urllib.parse import quote
+from websockets.exceptions import ConnectionClosed
 
 ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
@@ -156,6 +157,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         'handle_event': asyncio.Event(),
         'handle_generation': 0,
         'transition_handle_event': asyncio.Event(),
+        'transition_started_event': asyncio.Event(),
         'transition_wait': None,
         'drop_inputs_before': 0,
         'context': start.get('context') or {},
@@ -233,6 +235,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 wait = {'baseline':state['handle_generation'],'router_response_sent':False}
                 state['transition_wait'] = wait
                 state['transition_handle_event'].clear()
+                state['transition_started_event'].clear()
                 state['handle'] = None
                 state['handle_event'].clear()
                 try:
@@ -240,20 +243,25 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     wait['router_response_sent'] = True
                     emit({'type':'capability_transition_acknowledged','transition_id':transition_id,'capability':capability})
                     await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=FRESH_HANDLE_WAIT_SECONDS)
-                except TimeoutError:
+                    if wait.get('connection_closed'):
+                        raise ConnectionError('router connection closed before fresh checkpoint')
+                except (TimeoutError, ConnectionClosed, ConnectionError) as exc:
+                    if _is_resource_failure(exc):
+                        raise
                     # The provider can finish the router call yet never issue a
-                    # post-response checkpoint. The old handle is unsafe. Restore
-                    # bounded dialogue context on a new connection with the same
-                    # model/key, then inject the accepted intent exactly once.
+                    # post-response checkpoint, or close before acknowledging it.
+                    # The old handle is unsafe. Restore bounded dialogue context
+                    # on a new connection with the same model/key and intent.
                     state['handle'] = None
                     emit({'type':'capability_transition_recovered','transition_id':transition_id,
-                          'capability':capability,'reason':'fresh_handle_unavailable',
+                          'capability':capability,'reason':'router_connection_closed' if not isinstance(exc,TimeoutError) else 'fresh_handle_unavailable',
                           'history_turns':len(state['history'])})
                 state['transition_wait'] = None
                 state['configuration'] = configuration
                 if isinstance(context, dict):
                     state['context'] = context
                 state['transition'] = {'transition_id':transition_id,'capability':capability,'continuation':continuation.strip()}
+                state['transition_started_event'].set()
                 state['drop_inputs_before'] = round(time.time() * 1000)
                 emit({'type':'capability_transition_started','transition_id':transition_id,'capability':capability})
                 await ws.close()
@@ -382,6 +390,14 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     raise state['resource_error']
                 if _is_resource_failure(exc):
                     raise
+                wait = state.get('transition_wait')
+                if wait is not None:
+                    wait['connection_closed'] = True
+                    state['transition_handle_event'].set()
+                    try:
+                        await asyncio.wait_for(state['transition_started_event'].wait(), timeout=1)
+                    except TimeoutError:
+                        pass
                 if state.get('transition'):
                     continue
                 message = str(exc).replace(key, '[REDACTED]').replace(quote(key, safe=''), '[REDACTED]')

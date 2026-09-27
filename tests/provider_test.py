@@ -163,6 +163,79 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_router_socket_close_after_ack_restores_intent_without_provider_error(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live-extended-thinking',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingAfterAckSocket(_FakeSocket):
+            async def send(self,payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    self.incoming.put_nowait(self._CLOSED)
+        first=ClosingAfterAckSocket([{'setupComplete':{}},
+            {'sessionResumptionUpdate':{'resumable':True,'newHandle':'pre-call-handle'}}])
+        second=_FakeSocket([{'setupComplete':{}}])
+        sockets=[first,second]
+        events=[]
+        with patch('websockets.connect',side_effect=lambda *_args,**_kwargs:sockets.pop(0)):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            for _ in range(100):
+                if any(e.get('type')=='resumption_state' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-ack-closed','capability':'asset_library',
+                'configuration':{'system_instruction':'asset_library','functions':[{'name':'inspect_media_asset'}]},
+                'continuation':'describe the image on this slide',
+                'router_response':{'name':'activate_capability','id':'route-image',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            for _ in range(200):
+                if any(e.get('type')=='capability_ready' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='capability_transition_acknowledged' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_transition_recovered' and
+                e.get('reason')=='router_connection_closed' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_ready' for e in events))
+            self.assertEqual(second.sent[0]['setup']['sessionResumption'],{})
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_router_socket_close_restores_intent_instead_of_ending_live(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live-extended-thinking',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingRouterSocket(_FakeSocket):
+            async def send(self,payload):
+                if 'toolResponse' in json.loads(payload):
+                    raise ConnectionError('closed before router acknowledgement')
+                await super().send(payload)
+        first=ClosingRouterSocket([{'setupComplete':{}},
+            {'sessionResumptionUpdate':{'resumable':True,'newHandle':'pre-call-handle'}}])
+        second=_FakeSocket([{'setupComplete':{}}])
+        sockets=[first,second]
+        events=[]
+        with patch('websockets.connect',side_effect=lambda *_args,**_kwargs:sockets.pop(0)):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            for _ in range(100):
+                if any(e.get('type')=='resumption_state' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-closed','capability':'asset_library',
+                'configuration':{'system_instruction':'asset_library','functions':[{'name':'inspect_media_asset'}]},
+                'continuation':'describe the image on this slide',
+                'router_response':{'name':'activate_capability','id':'route-image',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            for _ in range(200):
+                if any(e.get('type')=='capability_ready' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='capability_transition_recovered' and
+                e.get('reason')=='router_connection_closed' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_ready' and
+                e.get('capability')=='asset_library' for e in events))
+            self.assertEqual(second.sent[0]['setup']['sessionResumption'],{})
+            self.assertTrue(any('clientContent' in item for item in second.sent))
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
     async def test_missing_post_response_checkpoint_restores_bounded_history_and_intent(self):
         reader=_QueueReader()
         reader.feed({'type':'start','model':'gemini-3.8-live','history':[

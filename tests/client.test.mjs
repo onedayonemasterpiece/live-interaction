@@ -2,6 +2,37 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createLiveClient} from '../browser/client.js';
 const tick=()=>new Promise(r=>setImmediate(r));
+test('short first provider audio chunk is buffered until following audio can play continuously',async()=>{
+ const originalAudio=globalThis.AudioContext,starts=[],created=performance.now();
+ let releasePoll,polls=0;
+ class FakeAudioContext{
+  state='running';destination={};
+  get currentTime(){return (performance.now()-created)/1000;}
+  createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
+  createBufferSource(){const context=this;return {buffer:null,onended:null,connect(){},disconnect(){},start(at){starts.push({at,receivedAt:context.currentTime,duration:this.buffer.duration});},stop(){}};}
+  async resume(){}
+ }
+ globalThis.AudioContext=FakeAudioContext;
+ const client=createLiveClient({request:url=>{
+  if(url==='/live')return Promise.resolve({session_id:'one',model:'gemini-3.8-live-extended-thinking'});
+  if(url.includes('/events')){polls++;return new Promise(resolve=>{releasePoll=resolve;});}
+  return Promise.resolve({ok:true});
+ }});
+ const audio=(seq,length)=>({seq,type:'audio',data:Buffer.alloc(length*2).toString('base64'),mime_type:'audio/pcm;rate=24000'});
+ try{
+  await client.start({url:'/live',microphone:false});
+  for(let i=0;i<30&&!releasePoll;i++)await tick();
+  releasePoll({events:[audio(1,1200)],cursor:1});
+  for(let i=0;i<30&&starts.length<1;i++)await tick();
+  assert.ok(starts[0].at-starts[0].receivedAt>=.38,'50 ms first chunk starts with jitter reserve');
+  await new Promise(r=>setTimeout(r,300));
+  for(let i=0;i<30&&polls<2;i++)await tick();
+  releasePoll({events:[audio(2,9600)],cursor:2});
+  for(let i=0;i<30&&starts.length<2;i++)await tick();
+  assert.equal(starts.length,2);
+  assert.ok(Math.abs(starts[1].at-(starts[0].at+starts[0].duration))<.005,'following chunk starts exactly at the first chunk end');
+ }finally{client.stop();if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;}
+});
 test('Stop during setup is local; late setup is cleaned without starting a microphone',async()=>{
  let release;const calls=[],states=[];
  const client=createLiveClient({request:(url)=>{calls.push(url);return url==='/live'?new Promise(r=>release=r):Promise.resolve({});},onState:s=>states.push(s)});

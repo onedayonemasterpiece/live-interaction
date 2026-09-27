@@ -58,7 +58,12 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const rate=Number(/rate=(\d+)/.exec(event.mime_type??'')?.[1]??24000),samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
     const buffer=playContext.createBuffer(1,samples.length,rate),channel=buffer.getChannelData(0);for(let i=0;i<samples.length;i++)channel[i]=samples[i]/32768;
     const source=playContext.createBufferSource();source.buffer=buffer;source.connect(playContext.destination);
-    const at=Math.max(playContext.currentTime+.02,nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
+    // Gemini can emit a very short first chunk (for example 50 ms) hundreds of
+    // milliseconds before the next one. Hold the start of each playback run so
+    // normal provider/poll jitter does not become an audible gap.
+    const runStart=nextPlayAt<=playContext.currentTime;
+    const at=Math.max(playContext.currentTime+(runStart?.4:.02),nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
+    if(runStart)onTiming('playback_buffering',{buffer_ms:400,first_chunk_ms:buffer.duration*1000});
     onTiming('audio_scheduled',{seq:event.seq,pcm_bytes:bytes.byteLength,duration_ms:buffer.duration*1000,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
     source.onended=()=>{playing.delete(source);source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',{seq:event.seq,duration_ms:buffer.duration*1000});};source.start(at);
   }
