@@ -1,8 +1,8 @@
 # Live Interaction
 
-Shared Live runtime for Wonderful Lections and future product adapters.
-The first consumer is Wonderful Lections Review. This is a small extraction of
-its tested audio/lifecycle paths, not a general agent framework.
+Shared Live runtime for Wonderful Lections and other product adapters.
+It owns tested audio/provider lifecycle and provider-neutral capability transitions;
+domain agents, permissions and product tools remain in consumer adapters.
 
 - `browser/client.js`: microphone, bounded ordered PCM sender, conservative silence
   gate, playback, polling/cursor drain, local Stop, confirmed Russian voice Stop,
@@ -16,12 +16,12 @@ its tested audio/lifecycle paths, not a general agent framework.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.1.9`). Read the canonical
+Use versioned releases (current release `0.2.0`). Read the canonical
 [Live agent architecture](docs/live-agent-architecture.md) before integrating a
 consumer, then follow the [integration contract](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.
 No browser key, alternate-model fallback, key rotation, or automatic replay of
-speech/mutations. Release 0.1.9 distinguishes provider-native Google Search from an application-provided search function so disabling or losing native search does not suppress a product search tool. Release 0.1.8 can capture and buffer the first user speech locally while a manually started Live session is still being created, closing the push-to-toggle startup gap without opening a second microphone. Release 0.1.7 keeps the strict steady-state audio queue/age guards while giving audio HTTP delivery a 10s absolute ceiling so a bounded startup handoff is not falsely aborted by the older 2.5s generic request timeout. Release 0.1.6 separates an intentional bounded microphone-handoff catch-up from the normal 1.5s network queue guard; after catch-up, the original steady-state queue and age limits apply unchanged. Release 0.1.5 keeps the 0.1.4 runtime while aligning Node and Python package metadata. Release 0.1.3 adds an optional provider resource guard. A
+speech/mutations. Release 0.2.0 adds progressive capability transitions: an adapter may resolve a model router call into a bounded capability configuration (maximum 9 function declarations); the shared host reconfigures Gemini through the existing session-resumption handle and returns the router tool result only after `capability_ready`. Configuration digests/function counts/schema bytes are observable without logging prompts or tool arguments. Native Google Search and an application search function are mutually exclusive in one provider setup. Release 0.1.9 distinguishes provider-native Google Search from an application-provided search function so disabling or losing native search does not suppress a product search tool. Release 0.1.8 can capture and buffer the first user speech locally while a manually started Live session is still being created, closing the push-to-toggle startup gap without opening a second microphone. Release 0.1.7 keeps the strict steady-state audio queue/age guards while giving audio HTTP delivery a 10s absolute ceiling so a bounded startup handoff is not falsely aborted by the older 2.5s generic request timeout. Release 0.1.6 separates an intentional bounded microphone-handoff catch-up from the normal 1.5s network queue guard; after catch-up, the original steady-state queue and age limits apply unchanged. Release 0.1.5 keeps the 0.1.4 runtime while aligning Node and Python package metadata. Release 0.1.3 adds an optional provider resource guard. A
 guarded consumer checks its lease before connect/setup/send/receive, charges
 outbound provider payloads before transmission, and keeps the same guarded key
 through provider resumption. Resource-controller failures are terminal and are

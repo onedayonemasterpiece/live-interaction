@@ -102,7 +102,8 @@ introduced by voice control.
 ## Node adapter
 
 `createLiveSessionHost({adapterFactory,createWorker,ErrorClass?,models?,
-readyTimeoutMs?,maxSessions?})` returns start/input/events/stop/stopAll/size.
+readyTimeoutMs?,reconfigureTimeoutMs?,maxSessions?})` returns
+start/input/events/stop/stopAll/size.
 The public host args are `resourceId`, `actor`, and, after setup, `sessionId`.
 Start also takes model/history and adapter-specific arguments. Authenticate before
 calling the host; it additionally binds subject+tenant+resource to each session.
@@ -111,9 +112,14 @@ Do not expose the internal actor-omitting stopAll path over HTTP.
 `adapterFactory({emit,write,measure,timing})` returns:
 
 - `initialize({resourceId,actor,model,...args})` validates access and returns
-  `{state,context,configuration,response}`. No mutation during initialization.
-- `executeTool(session,{id,name,args})` authorizes each tool, validates arguments,
+  `{state,capability?,context,configuration,response}`. No mutation during initialization.
+- `executeTool(session,{id,name,args})` authorizes each ordinary tool, validates arguments,
   and runs the product's normal prepare/apply/readback semantics.
+- Optional `resolveCapability(session,call)` (Python: `resolve_capability`) is a
+  side-effect-free router resolver. Return null for an ordinary tool or
+  `{capability,configuration,context?,response?}` for a capability transition.
+  Capability IDs are bounded identifiers; a transition bundle contains at most
+  nine functions and at most 256 KiB serialized configuration.
 - Optional `input`, `onStarted`, `onResumed`, `onStopped` for product context and
   latest-only frame updates. Clear timers on Stop, resend latest image on resume.
 
@@ -121,7 +127,13 @@ Do not expose the internal actor-omitting stopAll path over HTTP.
 `functions` (Gemini declarations), `voice` (default Aoede), `search_enabled`
 (default false). Never accept arbitrary declarations/instructions from a browser.
 The host caches successful tool results by provider call ID and serializes tools;
-application idempotency must still survive process/session restarts.
+application idempotency must still survive process/session restarts. If
+`resolveCapability` selects a transition, that router call must be the only tool
+call in its provider batch. The host sends a `reconfigure` worker command, waits
+for the provider to resume with the same model/key/session handle, updates the
+active capability/configuration digest, and only then sends the router tool
+response. A transition error is returned as a structured tool error; it is not
+silently converted into a fresh conversation.
 
 `createWorker({model,actor,resourceId})` returns a child with stdin/stdout/stderr
 and kill(). Spawn the shared Python provider or a **thin credential adapter**.
@@ -135,7 +147,12 @@ quota failure never triggers key hopping. No shared global default credential po
 
 Start: `{type:'start',model,context,configuration,history}`. Inputs: audio
 (base64 PCM16, 16kHz mono), audio_stream_end, text, snapshot (JPEG+context),
-tool_response, stop. Writes include numeric `queued_at` for delay measurement.
+tool_response, `reconfigure`, stop. `reconfigure` carries a server-owned
+transition ID, capability ID, full bounded configuration and optional context.
+Gemini reconfiguration waits for a resumable handle, closes only the current
+provider WebSocket intentionally, resumes the same model/session with the new
+configuration, then emits `capability_ready`. Writes include numeric
+`queued_at` for delay measurement.
 Snapshot uses video input only, never an implicit user text turn. Product images
 must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
