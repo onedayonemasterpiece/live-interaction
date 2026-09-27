@@ -99,6 +99,18 @@ class ProviderContract(unittest.TestCase):
         self.assertEqual(s['sessionResumption']['handle'], 'test-handle')
         self.assertIn('slidingWindow', s['contextWindowCompression'])
 
+    def test_manual_activity_setup_and_lossless_transcript(self):
+        setup = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={'manual_activity_detection': True},
+        )['setup']
+        self.assertTrue(setup['realtimeInputConfig']['automaticActivityDetection']['disabled'])
+        events = []
+        text = 'x' * 5000
+        handle_server_message({'serverContent': {'inputTranscription': {'text': text}}}, emit=events.append)
+        self.assertEqual(events[0]['text'], text)
+
     def test_audio_tail_is_emitted_before_completion(self):
         events=[]
         handle_server_message({'serverContent':{'modelTurn':{'parts':[{'inlineData':{'mimeType':'audio/pcm;rate=24000','data':'AAAA'}}]},'turnComplete':True}},emit=events.append)

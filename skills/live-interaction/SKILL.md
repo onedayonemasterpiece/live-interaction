@@ -42,6 +42,16 @@ may have a longer absolute ceiling than the steady queue/age limits; the sender 
 the primary steady-state liveness guard. A Show/cohost
 adapter should start read-only; do not inherit Review mutation permissions.
 
+A deliberate buffered source is different from transport reconnect replay. When a
+product must deliver one already-durable long recording as one logical Live turn,
+use the shared manual-activity session contract: enable
+`configuration.manual_activity_detection`, send `activity_start`, ordered PCM,
+then `activity_end`; do not substitute `audio_stream_end` or a product-local
+transport. Trusted product `on_event` observers receive the full provider
+transcription before the bounded polling/UI projection. A durable source sink must
+persist or durably enqueue that trusted event before returning; never reconstruct an
+archive from the 320-event ring or browser transcript preview.
+
 Surface waits after 15s with elapsed mm:ss, truthful transport/provider stage,
 Stop, and explicit restart after 120s. Restart must not replay a pending mutation.
 Do not promise external provider latency or resumption success.
