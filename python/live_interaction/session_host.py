@@ -85,6 +85,8 @@ class _Session:
     configuration_digest: str = ""
     pending_transition_id: str | None = None
     pending_transition: asyncio.Future | None = None
+    manual_activity_detection: bool = False
+    activity_open: bool = False
 
 
 def _now_ms() -> int:
@@ -264,7 +266,8 @@ class LiveSessionHost:
         session_id = "live_" + uuid.uuid4().hex
         reader = _QueueReader()
         loop = asyncio.get_running_loop()
-        initial_meta = _configuration_meta(initialized.get("configuration") or {})
+        configuration = initialized.get("configuration") or {}
+        initial_meta = _configuration_meta(configuration)
         initial_state = dict(initialized.get("state") or {})
         session = _Session(
             id=session_id,
@@ -277,6 +280,7 @@ class LiveSessionHost:
             last_client_at_ms=_now_ms(),
             capability=str(initialized.get("capability") or initial_state.get("capability") or "core"),
             configuration_digest=initial_meta["configuration_digest"],
+            manual_activity_detection=bool(configuration.get("manual_activity_detection")),
         )
         self.sessions[session_id] = session
         key = None
@@ -292,8 +296,14 @@ class LiveSessionHost:
                 observed = self.adapter.on_event(session, event)
                 if inspect.isawaitable(observed):
                     asyncio.create_task(observed)
+            projected = event
+            if kind in {"input_transcript", "output_transcript"} and isinstance(event.get("text"), str):
+                text = event["text"]
+                projected = {**event, "text": text[:2000]}
+                if len(text) > 2000:
+                    projected["truncated"] = True
             if kind == "capability_ready":
-                self._emit(session, event)
+                self._emit(session, projected)
                 if (
                     session.pending_transition
                     and not session.pending_transition.done()
@@ -302,7 +312,7 @@ class LiveSessionHost:
                     session.pending_transition.set_result(event)
                 return
             if kind == "capability_transition_error":
-                self._emit(session, event)
+                self._emit(session, projected)
                 if (
                     session.pending_transition
                     and not session.pending_transition.done()
@@ -316,12 +326,12 @@ class LiveSessionHost:
                     )
                 return
             if kind == "ready":
-                self._emit(session, event)
+                self._emit(session, projected)
                 if session.ready and not session.ready.done():
                     session.ready.set_result(event)
                 return
             if kind == "error":
-                self._emit(session, event)
+                self._emit(session, projected)
                 if session.ready and not session.ready.done():
                     session.ready.set_exception(
                         LiveError("LIVE_PROVIDER_ERROR", str(event.get("message") or "Gemini Live error")[:500])
@@ -346,7 +356,7 @@ class LiveSessionHost:
                 )
                 asyncio.create_task(self._handle_tool_calls(session, calls))
                 return
-            self._emit(session, event)
+            self._emit(session, projected)
 
         async def runner() -> None:
             try:
@@ -488,6 +498,10 @@ class LiveSessionHost:
             await asyncio.wait_for(asyncio.shield(future), timeout=self.reconfigure_timeout_ms / 1000)
             session.capability = resolved["capability"]
             session.configuration_digest = resolved["configuration_digest"]
+            session.manual_activity_detection = bool(
+                resolved["configuration"].get("manual_activity_detection")
+            )
+            session.activity_open = False
             result = {
                 "capability": session.capability,
                 "ready": True,
@@ -689,13 +703,31 @@ class LiveSessionHost:
         received_at = received_at or _now_ms()
         written_at = None
 
+        if message.get("activity_start"):
+            if not session.manual_activity_detection:
+                raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
+            if session.activity_open:
+                raise LiveError("INVALID_ARGUMENT", "Activity is already open")
+            written_at = self._write(session, {"type": "activity_start"})
+            session.activity_open = True
         if "audio_base64" in message:
             audio = message.get("audio_base64")
             if not isinstance(audio, str) or len(audio) > 16_000:
                 raise LiveError("INVALID_ARGUMENT", "Audio chunk is invalid")
+            if session.manual_activity_detection and not session.activity_open:
+                raise LiveError("INVALID_ARGUMENT", "activity_start is required before buffered audio")
             written_at = self._write(session, {"type": "audio", "data": audio})
         if message.get("audio_stream_end"):
+            if session.manual_activity_detection:
+                raise LiveError("INVALID_ARGUMENT", "Use activity_end when manual activity is enabled")
             self._write(session, {"type": "audio_stream_end"})
+        if message.get("activity_end"):
+            if not session.manual_activity_detection:
+                raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
+            if not session.activity_open:
+                raise LiveError("INVALID_ARGUMENT", "No activity is open")
+            self._write(session, {"type": "activity_end"})
+            session.activity_open = False
         if "text" in message:
             text = message.get("text")
             if not isinstance(text, str) or not text.strip() or len(text) > 4_000:

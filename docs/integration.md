@@ -50,6 +50,14 @@ characters, paginates a 320-event ring, serializes tools, deduplicates successfu
 provider call IDs, honors cancellation before execution, and never replays a mutation.
 Applications still authenticate every HTTP route before calling the host.
 
+`configuration.manual_activity_detection=true` creates a session with provider automatic
+activity detection disabled. In that mode the host accepts `activity_start`, one or more
+`audio_base64` chunks, then `activity_end`; `audio_stream_end` is rejected. This is for
+deliberate buffered turns, not normal realtime reconnect replay. Provider transcript events
+remain complete for the trusted adapter `on_event` observer; only the polling/UI ring projects
+transcript text to a bounded 2000-character preview. A durable observer must persist or
+durably enqueue the trusted event before returning.
+
 ## Browser API
 
 `createLiveClient({request?, onEvent, onState, onNotice, onTiming, onWait,

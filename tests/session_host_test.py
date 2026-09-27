@@ -121,6 +121,66 @@ class SessionHostContract(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertIn(("story1", "input_transcript", "Привет"), self.adapter.observed)
 
+    async def test_trusted_transcript_is_full_but_ui_ring_is_bounded(self):
+        text = "x" * 5000
+        self.provider.events({"type": "input_transcript", "text": text})
+        await asyncio.sleep(0)
+        self.assertIn(("story1", "input_transcript", text), self.adapter.observed)
+        session = self.host.sessions[self.started["session_id"]]
+        projected = [e for e in session.events if e["type"] == "input_transcript"][-1]
+        self.assertEqual(len(projected["text"]), 2000)
+        self.assertTrue(projected["truncated"])
+
+    async def test_manual_activity_requires_explicit_boundaries(self):
+        class ManualAdapter(Adapter):
+            def initialize(self, **kwargs):
+                value = super().initialize(**kwargs)
+                value["configuration"]["manual_activity_detection"] = True
+                return value
+
+        adapter = ManualAdapter()
+        provider = Provider()
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: adapter,
+            key_resolver=lambda *_args: "test-key",
+            provider_run=provider.run,
+            ready_timeout_ms=500,
+        )
+        actor = {"subject": "a", "tenant_id": "t"}
+        try:
+            started = await host.start(resource_id="buffered", actor=actor)
+            with self.assertRaises(LiveError):
+                await host.input(
+                    resource_id="buffered",
+                    session_id=started["session_id"],
+                    actor=actor,
+                    message={"audio_base64": "AAAA"},
+                )
+            await host.input(
+                resource_id="buffered",
+                session_id=started["session_id"],
+                actor=actor,
+                message={"activity_start": True},
+            )
+            await host.input(
+                resource_id="buffered",
+                session_id=started["session_id"],
+                actor=actor,
+                message={"audio_base64": "AAAA"},
+            )
+            await host.input(
+                resource_id="buffered",
+                session_id=started["session_id"],
+                actor=actor,
+                message={"activity_end": True},
+            )
+            await asyncio.sleep(0)
+            payloads = b"".join(provider.inputs).decode("utf-8")
+            self.assertIn('"type":"activity_start"', payloads)
+            self.assertIn('"type":"activity_end"', payloads)
+        finally:
+            await host.stop_all()
+
     async def test_stop_is_bounded_and_removes_session(self):
         session_id = self.started["session_id"]
         result = await self.host.stop(
