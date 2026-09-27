@@ -30,6 +30,50 @@ test('an Extended tool wait survives intermediate turnComplete and clears on IDL
 });
 
 
+test('captureDuringStart preserves speech spoken while the Live session is still being created',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  let getUserMediaCalls=0,stopCalls=0,releaseStart;const processors=[],contexts=[],inputs=[];
+  const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+  const liveStream={getTracks:()=>[track]};
+  class FakeNode{connect(){return this;}disconnect(){}}
+  class FakeProcessor extends FakeNode{onaudioprocess=null;}
+  class FakeContext{
+    sampleRate=48000;state='running';destination={};
+    constructor(){contexts.push(this);}
+    createMediaStreamSource(stream){assert.equal(stream,liveStream);return new FakeNode();}
+    createScriptProcessor(){const p=new FakeProcessor();processors.push(p);return p;}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return liveStream;}}},configurable:true});
+  globalThis.AudioContext=FakeContext;
+  const client=createLiveClient({request:async(url,options={})=>{
+    if(url==='/live')return new Promise(resolve=>releaseStart=resolve);
+    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));return {ok:true};}
+    if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
+    if(url==='/live/one/stop')return {ok:true};
+    throw new Error('unexpected '+url);
+  }});
+  try{
+    const starting=client.start({url:'/live',captureDuringStart:true});
+    for(let i=0;i<20&&!releaseStart;i++)await tick();
+    assert.equal(getUserMediaCalls,1,'microphone capture starts before session creation resolves');
+    assert.equal(processors.length,1);
+    const chunk=new Float32Array(4096).fill(.2);
+    for(let i=0;i<4;i++)processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>chunk}});
+    releaseStart({session_id:'one',model:'gemini-3.8-live'});
+    const started=await starting;assert.equal(started.session_id,'one');
+    assert.equal(getUserMediaCalls,1,'the startup capture stream is reused after session creation');
+    for(let i=0;i<30&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,10));
+    assert.ok(inputs.some(item=>typeof item.audio_base64==='string'&&item.audio_base64.length>100),'buffered startup speech reaches Live');
+    assert.equal(contexts[0].state,'closed','temporary startup AudioContext is retired after handoff');
+    client.stop();assert.equal(stopCalls,1);assert.equal(track.readyState,'ended');
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
+
 test('microphone handoff reuses the existing stream and sends buffered PCM before live capture',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
   let getUserMediaCalls=0,stopCalls=0,handoffCalls=0;

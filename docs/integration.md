@@ -50,10 +50,14 @@ Applications still authenticate every HTTP route before calling the host.
 voiceControl?})` returns `start`, `stop`, `input` and read-only `sessionId`,
 `starting`, `generation`, `playingCount`.
 
-`start({url,body,authorize,takeMicrophoneHandoff?,microphone?})`: same-origin authenticated collection URL, application
+`start({url,body,authorize,takeMicrophoneHandoff?,microphone?,captureDuringStart?})`: same-origin authenticated collection URL, application
 start arguments (model/context IDs/history, never a key), async authorization. A
 microphone handoff reuses the existing MediaStream and may seed buffered PCM captured
 while the server/provider session was starting; it must not open a second microphone.
+For a manual push-to-toggle start with no already-open microphone,
+`captureDuringStart:true` opens local capture immediately after local authorization,
+buffers up to the existing 20s startup bound while the session POST is pending,
+then reuses that same MediaStream and buffered PCM when Live becomes ready.
 Default HTTP protocol: POST collection -> `{session_id,model,...app metadata}`;
 POST `/:id/input` -> `{ok:true}`; GET `/:id/events?after=N` ->
 `{events,cursor,has_more,gap,closed}`; POST `/:id/stop` -> `{ok:true}`.
