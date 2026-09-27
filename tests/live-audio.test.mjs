@@ -16,6 +16,33 @@ test('batches ordered PCM below server limit; silence gate keeps pre-roll and ta
  assert.deepEqual(speech,Array.from({length:12},(_,i)=>Array(1365).fill(i+1)).flat());
  assert.ok(timings.some(t=>t.e==='speech_end'));sender.stop();
 });
+test('bounded handoff catch-up drains a startup backlog then restores the steady-state queue guard',async()=>{
+ let releaseFirst,releaseSteady,error,holdSteady=false;const sent=[];
+ const sender=createLiveAudioSender({
+  send:message=>{
+   sent.push(message);
+   if(sent.length===1)return new Promise(resolve=>releaseFirst=resolve);
+   if(holdSteady)return new Promise(resolve=>releaseSteady=resolve);
+   return Promise.resolve();
+  },
+  onError:e=>error=e
+ });
+ const frames=Array.from({length:64},()=>({pcm:new Int16Array(1486).fill(1000),rms:.05}));
+ assert.equal(sender.seed(frames),true);
+ assert.equal(error,undefined);
+ assert.equal(sender.stats().catchup,true);
+ assert.ok(sender.stats().queued_pcm_bytes>48000);
+ releaseFirst();
+ for(let i=0;i<100&&sender.stats().catchup;i++)await tick();
+ assert.equal(error,undefined);
+ assert.equal(sender.stats().catchup,false);
+ assert.ok(sender.stats().queued_pcm_bytes<=48000);
+ holdSteady=true;
+ for(let i=0;i<30&&!error;i++)sender.push(new Int16Array(1486).fill(1000),.05);
+ assert.match(error?.message??'',/Сеть/);
+ releaseSteady?.();await tick();
+});
+
 test('slow transport is bounded; stop discards pending audio and never waits for network',async()=>{
  let release,count=0,error;const sender=createLiveAudioSender({send:()=>{count++;return new Promise(r=>release=r);},onError:e=>error=e});
  for(let i=0;i<30;i++)sender.push(new Int16Array(1365),.1);

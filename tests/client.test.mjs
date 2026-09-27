@@ -49,7 +49,7 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
   const inputs=[];
   const client=createLiveClient({request:async(url,options={})=>{
     if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
-    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));return {ok:true};}
+    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));await new Promise(r=>setTimeout(r,25));return {ok:true};}
     if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
     if(url==='/live/one/stop')return {ok:true};
     throw new Error('unexpected '+url);
@@ -58,13 +58,14 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
     const chunk=new Float32Array(4096).fill(.2);
     const started=await client.start({
       url:'/live',
-      takeMicrophoneHandoff:async()=>{handoffCalls++;return {stream:handedStream,sampleRate:48000,chunks:[chunk,chunk,chunk,chunk]};}
+      takeMicrophoneHandoff:async()=>{handoffCalls++;return {stream:handedStream,sampleRate:48000,chunks:Array.from({length:64},()=>chunk)};}
     });
     assert.equal(started.session_id,'one');
     assert.equal(handoffCalls,1);
     assert.equal(getUserMediaCalls,0);
-    for(let i=0;i<10&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,20));
+    for(let i=0;i<30&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,20));
     assert.ok(inputs.some(item=>typeof item.audio_base64==='string'&&item.audio_base64.length>100));
+    assert.equal(client.sessionId,'one');
     assert.equal(track.readyState,'live');
     client.stop();
     assert.equal(stopCalls,1);

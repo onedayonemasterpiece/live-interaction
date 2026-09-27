@@ -88,11 +88,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       sender=createLiveAudioSender({send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),onTiming:(event,metrics)=>{
         onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
       },onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}});
+      const handoffFrames=[];
       for(const chunk of handoff?.chunks??[]){
         const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk),pcm=pcm16(samples,handoff.sampleRate);
         let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
-        sender.push(pcm,Math.sqrt(energy/Math.max(1,samples.length)));
+        handoffFrames.push({pcm,rms:Math.sqrt(energy/Math.max(1,samples.length))});
       }
+      if(handoffFrames.length&&!sender.seed(handoffFrames))return false;
       processor.onaudioprocess=event=>{
         if(epoch!==generation||!sessionId)return;
         const samples=event.inputBuffer.getChannelData(0);let energy=0;for(let i=0;i<samples.length;i++)energy+=samples[i]*samples[i];
