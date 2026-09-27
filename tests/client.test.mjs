@@ -76,6 +76,35 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
   }
 });
 
+test('audio input has a catch-up-safe HTTP ceiling while text stays fast-bounded',async()=>{
+  const descriptor=Object.getOwnPropertyDescriptor(AbortSignal,'timeout');
+  const observed=[];
+  Object.defineProperty(AbortSignal,'timeout',{configurable:true,writable:true,value:ms=>{
+    observed.push(ms);
+    return new AbortController().signal;
+  }});
+  let releaseEvents;
+  const client=createLiveClient({request:async(url)=>{
+    if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+    if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+    if(url==='/live/one/input')return {ok:true};
+    if(url==='/live/one/stop')return {ok:true};
+    throw new Error('unexpected '+url);
+  }});
+  try{
+    await client.start({url:'/live',microphone:false});
+    observed.length=0;
+    await client.input({text:'hello'});
+    await client.input({audio_base64:'AAAA'});
+    await client.input({audio_stream_end:true});
+    assert.deepEqual(observed,[2500,10000,10000]);
+    client.stop();
+    releaseEvents?.({events:[],cursor:0,closed:true});
+  }finally{
+    if(descriptor)Object.defineProperty(AbortSignal,'timeout',descriptor);
+  }
+});
+
 test('text-only start does not request microphone and microphone can be enabled later in the same session',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
   let getUserMediaCalls=0,stopCalls=0;

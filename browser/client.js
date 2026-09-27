@@ -67,7 +67,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function input(message){
     if(!sessionId)return Promise.resolve();
     if(message.text){awaitingReply=true;beginWait();}
-    return request(`${root}/${encodeURIComponent(sessionId)}/input`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(message),signal:AbortSignal.any([abort.signal,AbortSignal.timeout(2500)])});
+    const audio=message.audio_base64!==undefined||message.audio_stream_end===true;
+    // The ordered audio sender owns the tight steady-state liveness bound:
+    // 1.5s queued PCM / 2.5s item age. A longer absolute HTTP ceiling here
+    // lets an intentional startup handoff drain without a false local timeout,
+    // while a genuinely stalled steady stream still fails via the sender first.
+    const timeoutMs=audio?10000:2500;
+    return request(`${root}/${encodeURIComponent(sessionId)}/input`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(message),signal:AbortSignal.any([abort.signal,AbortSignal.timeout(timeoutMs)])});
   }
   function closeMic(){
     sender?.stop();sender=null;
