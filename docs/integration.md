@@ -182,8 +182,10 @@ must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
 normal domain reconciliation.
 
-Current measured defaults: 256ms batch; <=11000 PCM bytes / <=16000 base64
-characters; 1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
+Current measured defaults: 256ms batch; <=11000 PCM bytes per browser-to-server
+request (binary only when the consumer opts in with `binaryAudio: true` and
+supports `application/octet-stream`); then <=16000 base64 characters on the server-to-provider JSON wire;
+1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
 250ms preroll; conservative RMS gate; 2s quiet tail. An intentional startup
 microphone handoff may seed at most 20s of PCM and temporarily uses a separate
 bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog is

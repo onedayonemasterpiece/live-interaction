@@ -1,7 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createLiveClient} from '../browser/client.js';
+const decodedInput=options=>options.headers?.['content-type']==='application/octet-stream'
+  ?{pcm:new Uint8Array(options.body)}:JSON.parse(options.body);
 const tick=()=>new Promise(r=>setImmediate(r));
+test('browser sends PCM as binary and reports HTTP versus server receive-to-ack time',async()=>{
+  const requests=[],timings=[];let releaseEvents;
+  const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{
+    if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+    if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+    if(url==='/live/one/input'){requests.push(options);return {timing:{received_at:100,handled_at:112}};}
+    if(url==='/live/one/stop')return {ok:true};
+    throw Error('Unexpected request');
+  },onTiming:(event,metrics)=>timings.push({event,...metrics})});
+  await client.start({url:'/live',microphone:false});
+  await client.input({pcm:new Int16Array([0,32767,-32768,123])});
+  assert.equal(requests[0].headers['content-type'],'application/octet-stream');
+  assert.deepEqual([...requests[0].body],[0,0,255,127,0,128,123,0]);
+  assert.equal(timings.find(item=>item.event==='audio_http')?.server_receive_to_ack_ms,12);
+  client.stop();releaseEvents?.({events:[],cursor:0,closed:true});
+});
 test('short first provider audio chunk is buffered until following audio can play continuously',async()=>{
  const originalAudio=globalThis.AudioContext,starts=[],created=performance.now();
  let releasePoll,polls=0;
@@ -78,9 +96,9 @@ test('captureDuringStart preserves speech spoken while the Live session is still
   }
   Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return liveStream;}}},configurable:true});
   globalThis.AudioContext=FakeContext;
-  const client=createLiveClient({request:async(url,options={})=>{
+  const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{
     if(url==='/live')return new Promise(resolve=>releaseStart=resolve);
-    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));return {ok:true};}
+    if(url==='/live/one/input'){inputs.push(decodedInput(options));return {ok:true};}
     if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
     if(url==='/live/one/stop')return {ok:true};
     throw new Error('unexpected '+url);
@@ -95,8 +113,8 @@ test('captureDuringStart preserves speech spoken while the Live session is still
     releaseStart({session_id:'one',model:'gemini-3.8-live'});
     const started=await starting;assert.equal(started.session_id,'one');
     assert.equal(getUserMediaCalls,1,'the startup capture stream is reused after session creation');
-    for(let i=0;i<30&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,10));
-    assert.ok(inputs.some(item=>typeof item.audio_base64==='string'&&item.audio_base64.length>100),'buffered startup speech reaches Live');
+    for(let i=0;i<30&&!inputs.some(item=>item.pcm);i++)await new Promise(r=>setTimeout(r,10));
+    assert.ok(inputs.some(item=>item.pcm?.byteLength>100),'buffered startup speech reaches Live as binary PCM');
     assert.equal(contexts[0].state,'closed','temporary startup AudioContext is retired after handoff');
     client.stop();assert.equal(stopCalls,1);assert.equal(track.readyState,'ended');
   }finally{
@@ -122,9 +140,9 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
   Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;throw new Error('must not open a second microphone');}}},configurable:true});
   globalThis.AudioContext=FakeContext;
   const inputs=[];
-  const client=createLiveClient({request:async(url,options={})=>{
+  const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{
     if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
-    if(url==='/live/one/input'){inputs.push(JSON.parse(options.body));await new Promise(r=>setTimeout(r,25));return {ok:true};}
+    if(url==='/live/one/input'){inputs.push(decodedInput(options));await new Promise(r=>setTimeout(r,25));return {ok:true};}
     if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
     if(url==='/live/one/stop')return {ok:true};
     throw new Error('unexpected '+url);
@@ -138,8 +156,8 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
     assert.equal(started.session_id,'one');
     assert.equal(handoffCalls,1);
     assert.equal(getUserMediaCalls,0);
-    for(let i=0;i<30&&!inputs.some(item=>item.audio_base64);i++)await new Promise(r=>setTimeout(r,20));
-    assert.ok(inputs.some(item=>typeof item.audio_base64==='string'&&item.audio_base64.length>100));
+    for(let i=0;i<30&&!inputs.some(item=>item.pcm);i++)await new Promise(r=>setTimeout(r,20));
+    assert.ok(inputs.some(item=>item.pcm?.byteLength>100));
     assert.equal(client.sessionId,'one');
     assert.equal(track.readyState,'live');
     client.stop();

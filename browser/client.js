@@ -14,7 +14,7 @@ export async function liveJson(url,options){
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
-export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null}={}){
+export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false}={}){
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
   let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
@@ -70,13 +70,22 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function input(message){
     if(!sessionId)return Promise.resolve();
     if(message.text){awaitingReply=true;beginWait();}
-    const audio=message.audio_base64!==undefined||message.audio_stream_end===true;
+    const pcm=message.pcm instanceof Int16Array?new Uint8Array(message.pcm.buffer,message.pcm.byteOffset,message.pcm.byteLength):null;
+    const audio=pcm!==null||message.audio_base64!==undefined||message.audio_stream_end===true;
     // The ordered audio sender owns the tight steady-state liveness bound:
     // 1.5s queued PCM / 2.5s item age. A longer absolute HTTP ceiling here
     // lets an intentional startup handoff drain without a false local timeout,
     // while a genuinely stalled steady stream still fails via the sender first.
     const timeoutMs=audio?10000:2500;
-    return request(`${root}/${encodeURIComponent(sessionId)}/input`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(message),signal:AbortSignal.any([abort.signal,AbortSignal.timeout(timeoutMs)])});
+    const startedAt=performance.now();
+    return request(`${root}/${encodeURIComponent(sessionId)}/input`,{method:'POST',headers:{'content-type':pcm?'application/octet-stream':'application/json'},body:pcm??JSON.stringify(message),signal:AbortSignal.any([abort.signal,AbortSignal.timeout(timeoutMs)])})
+      .then(result=>{
+        if(pcm)onTiming('audio_http',{duration_ms:performance.now()-startedAt,pcm_bytes:pcm.byteLength,server_receive_to_ack_ms:Math.max(0,(result?.timing?.handled_at??0)-(result?.timing?.received_at??0))});
+        return result;
+      },error=>{
+        if(pcm)onTiming('audio_http_error',{duration_ms:performance.now()-startedAt,pcm_bytes:pcm.byteLength});
+        throw error;
+      });
   }
   function releaseStartupCapture({stopTracks=true,event='startup_capture_cancelled'}={}){
     const capture=startupCapture;startupCapture=null;
@@ -122,7 +131,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
       sender=createLiveAudioSender({
-        send:message=>input(message.pcm?{audio_base64:base64(new Uint8Array(message.pcm.buffer))}:message),
+        send:message=>input(message.pcm&&!binaryAudio?{audio_base64:base64(new Uint8Array(message.pcm.buffer,message.pcm.byteOffset,message.pcm.byteLength))}:message),
         persist:persistAudio,
         onTiming:(event,metrics)=>{
           onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
