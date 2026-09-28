@@ -128,6 +128,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   }
   async function startMic(epoch,handoff=null){
     if(!microphoneEnabled)return false;
+    if(microphone?.running){onTiming('microphone_reused_after_resume');return true;}
     if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
       sender=createLiveAudioSender({
