@@ -16,7 +16,10 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.2.9`). Read the canonical
+Use versioned releases (current release `0.2.10`). Release 0.2.10 coalesces
+transcription chunks into bounded turns, restores cold history through Gemini's
+initial client-content history contract, and closes timed-out capability
+transitions so late provider events cannot change the active tool set. Read the canonical
 [Live agent architecture](docs/live-agent-architecture.md) before integrating a
 consumer, then follow the [integration contract](docs/integration.md).
 Run `npm test` and `npm run test:python`. Runtime Python requires websockets 15–16.

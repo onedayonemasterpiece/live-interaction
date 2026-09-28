@@ -3,6 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 from live_interaction.provider import (
+    DialogueHistory,
     _guarded_recv,
     _guarded_send,
     _is_resource_failure,
@@ -10,6 +11,30 @@ from live_interaction.provider import (
     run,
     setup_config,
 )
+
+class DialogueHistoryContract(unittest.TestCase):
+    def test_streamed_reply_keeps_prior_user_constraint_as_one_turn(self):
+        history=DialogueHistory()
+        history.input_started()
+        history.transcript('user','Не меняй выбранную фотографию; сначала проверь ревизию 17.')
+        for index in range(12):
+            history.transcript('model',f'Фрагмент {index}.')
+        history.complete()
+        turns=history.snapshot()
+        self.assertEqual([item['role'] for item in turns],['user','model'])
+        self.assertIn('Не меняй выбранную фотографию',turns[0]['text'])
+        self.assertIn('Фрагмент 11',turns[1]['text'])
+        history.transcript('user','И сохрани ограничение по лицензии.')
+        self.assertIn('лицензии',history.snapshot()[0]['text'])
+
+    def test_long_utterance_keeps_both_constraint_and_selected_object(self):
+        history=DialogueHistory()
+        history.input_started()
+        history.transcript('user','Только с моим подтверждением. ' + 'Детали. '*100 + 'Выбран asset-42, revision 17.')
+        turns=history.snapshot()
+        self.assertLessEqual(len(turns[0]['text']),700)
+        self.assertIn('Только с моим подтверждением',turns[0]['text'])
+        self.assertIn('asset-42, revision 17',turns[0]['text'])
 
 class _Guard:
     def __init__(self):
@@ -163,6 +188,70 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_delayed_setup_cannot_emit_late_ready_after_transition_deadline(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingAfterAck(_FakeSocket):
+            async def send(self,payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    self.incoming.put_nowait(self._CLOSED)
+        first=ClosingAfterAck([{'setupComplete':{}}])
+        delayed=_FakeSocket([])
+        sockets=[first,delayed]
+        events=[]
+        with patch('websockets.connect',side_effect=lambda *_args,**_kwargs:sockets.pop(0)), \
+             patch('live_interaction.provider.TRANSITION_DEADLINE_SECONDS',.05), \
+             patch('live_interaction.provider.MAX_TRANSITION_CONNECTION_ATTEMPTS',1):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            for _ in range(100):
+                if any(e.get('type')=='ready' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-timeout','capability':'dataset',
+                'configuration':{'system_instruction':'dataset','functions':[{'name':'dataset.find'}]},
+                'continuation':'read the dataset',
+                'router_response':{'name':'activate_capability','id':'route-timeout',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            await asyncio.wait_for(task,1)
+            delayed.incoming.put_nowait({'setupComplete':{}})
+            self.assertTrue(any(e.get('type')=='capability_transition_error' and
+                e.get('transition_id')=='tr-timeout' and e.get('code')=='LIVE_CAPABILITY_TIMEOUT' for e in events))
+            self.assertFalse(any(e.get('type')=='capability_ready' for e in events))
+            self.assertEqual(len(sockets),0)
+
+    async def test_repeated_transition_connection_failures_are_bounded(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingAfterAck(_FakeSocket):
+            async def send(self,payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    self.incoming.put_nowait(self._CLOSED)
+        first=ClosingAfterAck([{'setupComplete':{}}]); calls=0; events=[]
+        def connect(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            if calls==1:return first
+            raise ConnectionError('fixture setup failure')
+        with patch('websockets.connect',side_effect=connect), \
+             patch('live_interaction.provider.MAX_TRANSITION_CONNECTION_ATTEMPTS',2):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            for _ in range(100):
+                if any(e.get('type')=='ready' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-retries','capability':'media',
+                'configuration':{'system_instruction':'media','functions':[{'name':'open_media_chooser'}]},
+                'continuation':'choose image',
+                'router_response':{'name':'activate_capability','id':'route-retries',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            await asyncio.wait_for(task,1)
+            self.assertEqual(calls,3)
+            self.assertTrue(any(e.get('type')=='capability_transition_error' and
+                e.get('transition_id')=='tr-retries' for e in events))
+            self.assertFalse(any(e.get('type')=='capability_ready' for e in events))
+
     async def test_router_socket_close_after_ack_restores_intent_without_provider_error(self):
         reader=_QueueReader()
         reader.feed({'type':'start','model':'gemini-3.8-live-extended-thinking',
@@ -255,9 +344,15 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                 if any(e.get('type')=='resumption_state' for e in events):break
                 await asyncio.sleep(.001)
             self.assertTrue(any(e.get('type')=='resumption_state' for e in events))
-            reader.feed({'type':'text','text':'attach a dataset','queued_at':1})
+            reader.feed({'type':'text','text':'attach a dataset; do not edit the selected image','queued_at':1})
             for _ in range(100):
                 if any(e.get('type')=='input_timing' for e in events):break
+                await asyncio.sleep(.001)
+            for index in range(12):
+                first.incoming.put_nowait({'serverContent':{'outputTranscription':{'text':f'Ответ {index}. '}}})
+            first.incoming.put_nowait({'serverContent':{'turnComplete':True}})
+            for _ in range(100):
+                if any(e.get('type')=='turn_complete' for e in events):break
                 await asyncio.sleep(.001)
             reader.feed({'type':'reconfigure','transition_id':'tr-restore','capability':'dataset',
                 'configuration':{'system_instruction':'dataset','functions':[{'name':'dataset.find'}]},
@@ -270,10 +365,16 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sockets),0)
             self.assertTrue(first.closed)
             self.assertEqual(second.sent[0]['setup']['sessionResumption'],{})
+            self.assertEqual(second.sent[0]['setup']['historyConfig'],{'initialHistoryInClientContent':True})
             system=second.sent[0]['setup']['systemInstruction']['parts'][0]['text']
-            self.assertIn('previous topic',system)
-            self.assertIn('attach a dataset',system)
-            self.assertEqual(len([m for m in second.sent if 'clientContent' in m]),1)
+            self.assertNotIn('previous topic',system)
+            client_turns=[m['clientContent'] for m in second.sent if 'clientContent' in m]
+            self.assertEqual(len(client_turns),2)
+            restored=json.dumps(client_turns[0],ensure_ascii=False)
+            self.assertIn('previous topic',restored)
+            self.assertIn('attach a dataset; do not edit the selected image',restored)
+            self.assertIn('Ответ 11',restored)
+            self.assertIn('attach the national projects dataset',json.dumps(client_turns[1],ensure_ascii=False))
             self.assertTrue(any(e.get('type')=='capability_transition_recovered' and
                 e.get('reason')=='fresh_handle_unavailable' for e in events))
             self.assertTrue(any(e.get('type')=='resumed' and
@@ -287,6 +388,7 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             'type':'start',
             'model':'gemini-3.8-live',
             'context':{'slide':'one'},
+            'history':[{'role':'user','text':'earlier constraint from previous connection'}],
             'configuration':{
                 'system_instruction':'core',
                 'functions':[{'name':'activate_capability'},{'name':'read'}],
@@ -348,6 +450,7 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(connect_calls),2)
             self.assertEqual(first.sent[0]['setup']['sessionResumption'],{})
             self.assertEqual(second.sent[0]['setup']['sessionResumption'],{'handle':'fresh-handle'})
+            self.assertNotIn('earlier constraint from previous connection',second.sent[0]['setup']['systemInstruction']['parts'][0]['text'])
             names=[x['name'] for x in second.sent[0]['setup']['tools'][0]['functionDeclarations']]
             self.assertEqual(names,['activate_capability','dataset.find'])
             continuation=[item for item in second.sent if 'clientContent' in item]

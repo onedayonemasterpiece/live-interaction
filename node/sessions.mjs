@@ -36,9 +36,12 @@ const validateCapabilitySpec=(spec,DomainError)=>{
 // The host owns transport, ordering, capability transitions and event cursors; adapters own domain policy.
 export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=30000,maxSessions=2}={}){
   const DomainError=ErrorClass,sessions=new Map();
+  let adapter;
   const emit=(session,event)=>{
-    session.events.push({seq:session.nextSeq++,at:new Date().toISOString(),...event});
+    const observed={seq:session.nextSeq++,at:new Date().toISOString(),...event};
+    session.events.push(observed);
     while(session.events.length>320)session.events.shift();
+    try{adapter?.onEvent?.(session,observed);}catch{}
   };
   const timing=(session,stage,started)=>emit(session,{type:'timing',stage,duration_ms:Date.now()-started});
   const measure=async(session,stage,fn)=>{const at=Date.now();try{return await fn();}finally{timing(session,stage,at);}};
@@ -77,10 +80,12 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     const continuation=resolved.continuation??fallbackIntent;
     if(continuation.length>1200)throw new DomainError('LIVE_CAPABILITY_INVALID','Capability continuation is invalid');
     const acknowledgement={capability:resolved.capability,accepted:true};
+    let sent=false;
     try{
       write(session,{type:'reconfigure',transition_id:transitionId,capability:resolved.capability,
         configuration:resolved.configuration,context:resolved.context??{},continuation,
         router_response:{name:callName,id:callId,response:{result:acknowledgement},scheduling:'SILENT',willContinue:false}});
+      sent=true;
       let timer;
       try{
         await Promise.race([
@@ -98,6 +103,15 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         from_capability:session.capability,to_capability:resolved.capability,
         code:error.code??'LIVE_CAPABILITY_ERROR'});
       emit(session,{type:'tool_result',name:callName,id:callId,status:'error',code:error.code??'LIVE_CAPABILITY_ERROR'});
+      if(sent&&!session.closed){
+        // The worker may already be reconnecting with the new tool set. Once
+        // the transition is rejected, it cannot safely serve the old allowlist.
+        session.closed=true;
+        adapter.onStopped?.(session);
+        session.stoppedNotified=true;
+        emit(session,{type:'error',code:error.code??'LIVE_CAPABILITY_ERROR',message:'Live capability transition failed; restart the session'});
+        try{session.child.kill('SIGTERM');}catch{}
+      }
     }finally{
       if(session.pendingTransition?.id===transitionId)session.pendingTransition=null;
     }
@@ -150,7 +164,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     }
     sendToolResponses(session,responses);
   };
-  const adapter=adapterFactory({emit,write,measure,timing});
+  adapter=adapterFactory({emit,write,measure,timing});
   const start=async({resourceId,actor,model=models[0],history=[],...args}={})=>{
     if(typeof resourceId!=='string'||!resourceId||resourceId.length>240)throw new DomainError('INVALID_ARGUMENT','resourceId is required');
     if(!models.includes(model))throw new DomainError('INVALID_INPUT','Unknown Live model');
@@ -168,6 +182,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       if(!line.trim())return;
       let event;
       try{event=JSON.parse(line);}catch{return;}
+      if(session.closed)return;
       if(event.type==='capability_ready'){
         emit(session,event);
         if(session.pendingTransition?.id===event.transition_id)session.pendingTransition.resolve(event);
@@ -246,7 +261,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     if(!session.closed){try{write(session,{type:'stop'});}catch{}setTimeout(()=>{try{session.child.kill('SIGTERM');}catch{}},1200).unref?.();}
     session.pendingTransition?.reject?.(new DomainError('LIVE_SESSION_CLOSED','Live session stopped during capability transition'));
     session.pendingTransition=null;
-    session.closed=true;adapter.onStopped?.(session);sessions.delete(session.id);
+    session.closed=true;if(!session.stoppedNotified)adapter.onStopped?.(session);sessions.delete(session.id);
     return {ok:true,session_id:session.id};
   };
   const stopAll=async()=>{await Promise.allSettled([...sessions.values()].map(session=>stop({sessionId:session.id,resourceId:session.resourceId})));};

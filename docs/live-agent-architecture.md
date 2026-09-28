@@ -200,10 +200,20 @@ starting a second transition.
 
 If no fresh post-response resumable handle becomes available within the
 bounded transition window, open a new provider connection with the same model
-and key, bounded application dialogue history and the one accepted intent.
+and key, bounded completed dialogue turns and the one accepted intent. The
+cold connection uses Gemini `historyConfig.initialHistoryInClientContent`: it
+loads text-only history after setup without triggering an old command, then
+sends the accepted continuation once. Native checkpoint resumption does not
+replay application history. A cold restore cannot recreate provider-internal
+audio, tool or reasoning state; product context must carry authoritative
+selected IDs, accepted revision and confirmed mutation receipt where relevant.
+Gemini does not guarantee input transcription order against other messages, so
+late ASR fragments are best-effort additions to the last user turn.
 Never reuse the pre-call handle or replay a mutation. Emit explicit recovery
-metadata. The UI conversation remains continuous; transport identity is an
-implementation detail.
+metadata. If a transition misses its deadline or retry limit, close that
+provider session and require an explicit restart; a late `capability_ready`
+cannot revive an old allowlist. Stop remains immediate locally. The UI
+conversation remains continuous only for a successful transition.
 
 Never switch model or API key merely to load a capability.
 
@@ -305,6 +315,9 @@ a calibrated image/video estimate.
 
 Provider-reported usage is authoritative evidence for calibration; local
 estimates are conservative admission controls, not a substitute tokenizer.
+Repeated `usageMetadata` snapshots within a turn are not additive. Keep the
+current-turn maximum and accumulate completed turns separately; do not call
+one snapshot or the maximum over a session its total bill.
 Progressive disclosure reduces the active tool schema, but it is not a quota
 guarantee: Gemini Live re-processes the retained multimodal context on later
 turns, and a capability change sends a new setup. Measure actual provider

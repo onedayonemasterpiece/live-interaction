@@ -5,6 +5,18 @@ import {PassThrough} from 'node:stream';
 import {createLiveSessionHost,withLiveToolParts} from '../node/sessions.mjs';
 const tick=()=>new Promise(r=>setImmediate(r));
 function worker(){const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>c.emit('close',0);c.stdin.on('data',b=>{if(JSON.parse(b).type==='start')queueMicrotask(()=>c.stdout.write('{"type":"ready"}\n'));});return c;}
+test('trusted event observer receives worker failures without browser polling',async()=>{
+ const c=worker(),observed=[];
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[]}}),
+  executeTool:async()=>({}),onEvent:(_session,event)=>observed.push({type:event.type,code:event.code})
+ })});
+ const actor={subject:'a',tenant_id:'t'},started=await host.start({resourceId:'observed',actor});
+ c.stdout.write('{"type":"error","code":"PROVIDER_TEST"}\n');
+ await tick();
+ assert.ok(observed.some(event=>event.type==='error'&&event.code==='PROVIDER_TEST'));
+ await host.stop({resourceId:'observed',sessionId:started.session_id,actor});
+});
 test('independent product adapters preserve ordered tools, deduplication, owner isolation and cancel-before-start',async()=>{
  const c=worker(),called=[];const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({initialize:({resourceId})=>({state:{},context:{resourceId},configuration:{functions:[{name:'story.read'}]}}),executeTool:async(_,call)=>{called.push(call.id);return {value:'story'};}})});
  const start=await host.start({resourceId:'story1',actor:{subject:'a',tenant_id:'t'}}),base={resourceId:'story1',sessionId:start.session_id,actor:{subject:'a',tenant_id:'t'}};
@@ -104,4 +116,47 @@ test('capability bundles reject more than nine functions without reconfiguring p
  const response=writes.find(x=>x.type==='tool_response');
  assert.equal(response.responses[0].response.error.code,'LIVE_CAPABILITY_LIMIT');
  await host.stop({resourceId:'r2',sessionId:started.session_id,actor:{subject:'a',tenant_id:'t'}});
+});
+
+test('timed-out capability switch closes worker and ignores a late ready',async()=>{
+ const c=worker();let kills=0,transitionId;
+ c.kill=()=>{kills++;c.emit('close',0);};
+ c.stdin.on('data',chunk=>{for(const line of chunk.toString().split('\n').filter(Boolean)){
+  const message=JSON.parse(line);if(message.type==='reconfigure')transitionId=message.transition_id;
+ }});
+ const actor={subject:'a',tenant_id:'t'};
+ const host=createLiveSessionHost({createWorker:()=>c,reconfigureTimeoutMs:20,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[{name:'activate_capability'}]}}),
+  resolveCapability:()=>({capability:'dataset',configuration:{functions:[{name:'activate_capability'},{name:'dataset.find'}]}}),
+  executeTool:async()=>({ok:true})
+ })});
+ const started=await host.start({resourceId:'r3',actor});
+ const base={resourceId:'r3',sessionId:started.session_id,actor};
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'late',args:{intent:'read dataset'}}]})+'\n');
+ await new Promise(resolve=>setTimeout(resolve,45));
+ assert.equal(kills,1);
+ assert.ok(host.events(base).events.some(e=>e.type==='capability_transition_failed'&&e.code==='LIVE_CAPABILITY_TIMEOUT'));
+ c.stdout.write(JSON.stringify({type:'capability_ready',transition_id:transitionId,capability:'dataset'})+'\n');
+ await tick();
+ const events=host.events(base).events;
+ assert.equal(events.some(e=>e.type==='capability_ready'),false);
+ assert.equal(events.some(e=>e.type==='tool_result'&&e.id==='late'&&e.status==='ok'),false);
+ assert.throws(()=>host.input({...base,message:{text:'continue'}}),{code:'LIVE_SESSION_CLOSED'});
+ await host.stop(base);
+});
+
+test('Stop remains immediate during a pending capability switch',async()=>{
+ const c=worker();const actor={subject:'a',tenant_id:'t'};
+ const host=createLiveSessionHost({createWorker:()=>c,reconfigureTimeoutMs:1000,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[{name:'activate_capability'}]}}),
+  resolveCapability:()=>({capability:'media',configuration:{functions:[{name:'activate_capability'},{name:'open_media_chooser'}]}}),
+  executeTool:async()=>({ok:true})
+ })});
+ const started=await host.start({resourceId:'r4',actor});
+ const base={resourceId:'r4',sessionId:started.session_id,actor};
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'stopped',args:{intent:'choose image'}}]})+'\n');
+ await tick();
+ const before=Date.now();await host.stop(base);
+ assert.ok(Date.now()-before<100);
+ assert.equal(host.size(),0);
 });
