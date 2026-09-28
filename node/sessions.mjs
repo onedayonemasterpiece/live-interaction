@@ -194,7 +194,13 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         return;
       }
       if(event.type==='ready'){emit(session,event);readyResolve(event);return;}
-      if(event.type==='error'){emit(session,event);readyReject(new DomainError('LIVE_PROVIDER_ERROR',trimText(event.message??'Gemini Live error',500)));return;}
+      if(event.type==='error'){
+        emit(session,event);
+        const failure=new DomainError(event.code??'LIVE_PROVIDER_ERROR',trimText(event.message??'Gemini Live error',500));
+        session.pendingTransition?.reject?.(failure);
+        readyReject(failure);
+        return;
+      }
       if(event.type==='tool_cancelled'){for(const id of event.ids??[])session.cancelled.add(id);}
       if(event.type==='resumed'){adapter.onResumed?.(session);}
       if(event.type==='audio'&&session.awaitingAudio){timing(session,'first_audio_after_tool_response',session.toolResponseAt);session.awaitingAudio=false;}

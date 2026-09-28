@@ -145,6 +145,24 @@ test('timed-out capability switch closes worker and ignores a late ready',async(
  await host.stop(base);
 });
 
+test('resource denial during capability setup remains the transition failure code',async()=>{
+ const c=worker(),actor={subject:'a',tenant_id:'t'};
+ const host=createLiveSessionHost({createWorker:()=>c,reconfigureTimeoutMs:500,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[{name:'activate_capability'}]}}),
+  resolveCapability:()=>({capability:'media',configuration:{functions:[{name:'activate_capability'},{name:'open_media_chooser'}]}}),
+  executeTool:async()=>({ok:true})
+ })});
+ const started=await host.start({resourceId:'denial',actor});
+ const base={resourceId:'denial',sessionId:started.session_id,actor};
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'denied',args:{intent:'choose image'}}]})+'\n');
+ await tick();
+ c.stdout.write('{"type":"error","code":"RESOURCE_TOKEN_BUDGET","message":"RESOURCE_TOKEN_BUDGET"}\n');
+ for(let i=0;i<20&&!host.events(base).events.some(e=>e.type==='capability_transition_failed');i++)await tick();
+ assert.ok(host.events(base).events.some(e=>e.type==='capability_transition_failed'&&e.code==='RESOURCE_TOKEN_BUDGET'));
+ assert.equal(host.events(base).events.some(e=>e.type==='tool_result'&&e.id==='denied'&&e.status==='ok'),false);
+ await host.stop(base);
+});
+
 test('Stop remains immediate during a pending capability switch',async()=>{
  const c=worker();const actor={subject:'a',tenant_id:'t'};
  const host=createLiveSessionHost({createWorker:()=>c,reconfigureTimeoutMs:1000,adapterFactory:()=>({

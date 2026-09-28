@@ -16,7 +16,9 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.2.10`). Release 0.2.10 coalesces
+Use versioned releases (current release `0.2.11`). Release 0.2.11 preserves the
+specific provider/resource denial as the capability-transition failure code.
+Release 0.2.10 coalesces
 transcription chunks into bounded turns, restores cold history through Gemini's
 initial client-content history contract, and closes timed-out capability
 transitions so late provider events cannot change the active tool set. Read the canonical
