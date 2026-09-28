@@ -144,13 +144,14 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         handoffFrames.push({pcm:pcm16(samples,handoff.sampleRate),rms:frameRms(samples)});
       }
       if(handoffFrames.length&&!sender.seed(handoffFrames))return false;
-      microphone=createMicrophoneCapture({
+      const capture=createMicrophoneCapture({
         onFrame:(pcm,rms)=>{if(epoch===generation&&sessionId)sender?.push(pcm,rms);},
         onTiming,
         onError:error=>{if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
       });
-      const started=await microphone.start({stream:handoff?.stream??null,constraints:microphoneConstraints});
-      if(epoch!==generation||!microphoneEnabled){microphone.stop();microphone=null;return false;}
+      microphone=capture;
+      const started=await capture.start({stream:handoff?.stream??null,constraints:microphoneConstraints});
+      if(epoch!==generation||!microphoneEnabled){capture.stop();if(microphone===capture)microphone=null;return false;}
       if(started){onState('listening');return true;}
       return false;
     }catch(error){if(epoch!==generation)return false;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);return false;}

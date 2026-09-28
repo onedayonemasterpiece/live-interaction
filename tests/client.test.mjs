@@ -4,6 +4,30 @@ import {createLiveClient} from '../browser/client.js';
 const decodedInput=options=>options.headers?.['content-type']==='application/octet-stream'
   ?{pcm:new Uint8Array(options.body)}:JSON.parse(options.body);
 const tick=()=>new Promise(r=>setImmediate(r));
+test('Stop while getUserMedia is pending leaves no live track after late permission',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let grant,stops=0,contexts=0;
+ const track={readyState:'live',stop(){stops++;this.readyState='ended';}};
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:()=>new Promise(resolve=>{grant=resolve;})}},configurable:true});
+ globalThis.AudioContext=class{constructor(){contexts++;}async resume(){}};
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(()=>{}):Promise.resolve({ok:true})});
+ try{
+  const pending=client.start({url:'/live'});
+  for(let i=0;i<20&&!grant;i++)await tick();
+  assert.equal(typeof grant,'function');
+  client.stop();
+  grant({getTracks:()=>[track]});
+  await pending;
+  assert.equal(track.readyState,'ended');
+  assert.equal(stops,1);
+  assert.equal(contexts,1,'playback context may start, but capture must not');
+  assert.equal(client.sessionId,null);
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
 test('browser sends PCM as binary and reports HTTP versus server receive-to-ack time',async()=>{
   const requests=[],timings=[];let releaseEvents;
   const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{

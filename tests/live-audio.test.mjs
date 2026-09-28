@@ -36,7 +36,7 @@ test('bounded handoff catch-up drains a startup backlog then restores the steady
  for(let i=0;i<100&&sender.stats().catchup;i++)await tick();
  assert.equal(error,undefined);
  assert.equal(sender.stats().catchup,false);
- assert.ok(sender.stats().queued_pcm_bytes<=24000);
+ assert.ok(sender.stats().queued_pcm_bytes<=40000);
  holdSteady=true;
  for(let i=0;i<30&&!error;i++)sender.push(new Int16Array(1486).fill(1000),.05);
  assert.match(error?.message??'',/Сеть/);
@@ -64,16 +64,30 @@ test('handoff catch-up retains headroom while a queued HTTP batch is in flight',
   releases.shift()();await tick();
  }
  assert.equal(sender.stats().catchup,false);
- assert.ok(sender.stats().queued_pcm_bytes<=24000);
+ assert.ok(sender.stats().queued_pcm_bytes<=40000);
  sender.stop();
  for(const release of releases)release();
 });
 
 test('slow transport is bounded; stop discards pending audio and never waits for network',async()=>{
  let release,count=0,error;const sender=createLiveAudioSender({send:()=>{count++;return new Promise(r=>release=r);},onError:e=>error=e});
- for(let i=0;i<30;i++)sender.push(new Int16Array(1365),.1);
+ for(let i=0;i<45;i++)sender.push(new Int16Array(1365),.1);
  assert.equal(count,1);assert.match(error.message,/Сеть/);assert.equal(sender.stats().queued_pcm_bytes,0);
  sender.stop();release();await tick();assert.equal(count,1);
+});
+test('a short in-flight stall may queue the observed 49 KiB burst without aborting speech',async()=>{
+ let release,error,count=0;
+ const sender=createLiveAudioSender({send:()=>{count++;return count===1?new Promise(resolve=>{release=resolve;}):Promise.resolve();},onError:value=>{error=value;}});
+ for(let i=0;i<22;i++)sender.push(new Int16Array(1365).fill(1000),.1);
+ assert.ok(sender.stats().queued_pcm_bytes>48000);
+ assert.equal(error,undefined);
+ const finishing=sender.finish();
+ release();
+ await finishing;
+ for(let i=0;i<30&&sender.stats().queued_pcm_bytes;i++)await tick();
+ assert.equal(error,undefined);
+ assert.equal(sender.stats().queued_pcm_bytes,0);
+ sender.stop();
 });
 test('stop during an in-flight request prevents all further sends',async()=>{
  let release,count=0;const sender=createLiveAudioSender({send:()=>{count++;return new Promise(r=>release=r);}});

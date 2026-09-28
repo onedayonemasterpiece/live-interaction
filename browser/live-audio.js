@@ -1,4 +1,4 @@
-// One ordered sender; at most 1.5 seconds of steady-state PCM waiting, never a promise per frame.
+// One ordered sender; at most 2.5 seconds of steady-state PCM waiting, never a promise per frame.
 // PCM16/16kHz is the Gemini Live wire format. Keep each batch below 16000 base64 bytes.
 // A microphone handoff may intentionally contain up to 20 seconds captured while Live starts.
 // That seed gets a separate bounded catch-up window; once drained below half the
@@ -9,8 +9,8 @@ export function createLiveAudioSender({
   onError=()=>{},
   now=()=>performance.now(),
   batchMs=256,
-  maxQueueMs=1500,
-  maxAgeMs=2500,
+  maxQueueMs=2500,
+  maxAgeMs=3500,
   maxBootstrapMs=20000,
   persist=null
 }={}){

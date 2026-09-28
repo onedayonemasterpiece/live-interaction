@@ -4,6 +4,28 @@ import {createMicrophoneCapture,createDurableMicrophoneCapture} from '../browser
 
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
+test('Stop closes a microphone granted after the permission request was cancelled',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  let grant,stops=0,contexts=0;
+  const track={readyState:'live',stop(){stops++;this.readyState='ended';}};
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:()=>new Promise(resolve=>{grant=resolve;})}},configurable:true});
+  globalThis.AudioContext=class{constructor(){contexts++;}};
+  const capture=createMicrophoneCapture();
+  try{
+    const pending=capture.start();
+    capture.stop();
+    grant({getTracks:()=>[track]});
+    assert.equal(await pending,false);
+    assert.equal(track.readyState,'ended');
+    assert.equal(stops,1);
+    assert.equal(contexts,0);
+    assert.equal(capture.stream,null);
+  }finally{
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
+
 test('shared microphone capture owns getUserMedia, resampling and ordered frame delivery',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
   const processors=[];let getUserMediaCalls=0,stops=0;

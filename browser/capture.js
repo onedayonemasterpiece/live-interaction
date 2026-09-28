@@ -24,7 +24,7 @@ export function createMicrophoneCapture({
   now=()=>globalThis.performance?.now?.()??Date.now(),
   maxPendingFrames=32,
 }={}){
-  let stream=null,context=null,inputSource=null,processor=null,running=false,failed=false,pending=0;
+  let stream=null,context=null,inputSource=null,processor=null,running=false,failed=false,pending=0,generation=0;
   let chain=Promise.resolve();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
 
@@ -45,11 +45,13 @@ export function createMicrophoneCapture({
 
   async function start({stream:provided=null,constraints=microphoneConstraints}={}){
     if(running)return true;
+    const epoch=++generation;
     failed=false;
     if(!provided&&!globalThis.navigator?.mediaDevices?.getUserMedia){
       const error=new Error('Microphone unavailable');error.code='MICROPHONE_UNAVAILABLE';throw error;
     }
     const captured=provided??await globalThis.navigator.mediaDevices.getUserMedia(constraints);
+    if(epoch!==generation){for(const track of captured.getTracks?.()??[])track.stop();return false;}
     const Context=Audio();
     if(!Context){
       for(const track of captured.getTracks?.()??[])track.stop();
@@ -74,12 +76,19 @@ export function createMicrophoneCapture({
         .finally(()=>{pending=Math.max(0,pending-1);});
     };
     inputSource.connect(processor);processor.connect(context.destination);
-    await context.resume().catch(()=>{});
+    const startedContext=context;
+    await startedContext.resume().catch(()=>{});
+    if(epoch!==generation){
+      if(stream===captured)closeHardware();
+      else{for(const track of captured.getTracks?.()??[])track.stop();void startedContext.close().catch(()=>{});}
+      return false;
+    }
     onTiming('microphone_capture_started',{sample_rate:context.sampleRate,max_pending_frames:maxPendingFrames});
     return true;
   }
 
   function stop({stopTracks=true}={}){
+    ++generation;
     if(!running&&!stream)return;
     running=false;closeHardware(stopTracks);onTiming('microphone_capture_stopped',{pending_frames:pending});
   }
