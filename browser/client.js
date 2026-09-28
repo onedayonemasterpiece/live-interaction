@@ -185,6 +185,12 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         else if(event.type==='resumed'&&microphoneEnabled){void startMic(epoch);}
         if(epoch!==generation)return;
         onEvent(event,epoch);cursor=event.seq??cursor;
+        if(event.type==='error'){
+          // A terminal provider error may precede the server's closed flag.
+          // Release the browser microphone as soon as the error is observed.
+          stop({reason:'provider_error',preservePlayback:true});
+          return;
+        }
       }
       cursor=result.cursor??cursor;
       if(epoch!==generation)return;

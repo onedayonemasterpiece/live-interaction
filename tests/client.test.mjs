@@ -28,6 +28,29 @@ test('Stop while getUserMedia is pending leaves no live track after late permiss
   if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
  }
 });
+test('terminal provider error releases the active browser microphone before closed poll flag',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let releaseEvents,stopCalls=0;const states=[];
+ const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+ class FakeNode{connect(){}disconnect(){}}
+ class FakeContext{sampleRate=48000;state='running';destination={};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track]})}},configurable:true});
+ globalThis.AudioContext=FakeContext;
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:s=>states.push(s)});
+ try{
+  await client.start({url:'/live'});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  assert.equal(track.readyState,'live');
+  releaseEvents({events:[{seq:1,type:'error',code:'RESOURCE_TOKEN_BUDGET',message:'Live capability transition failed'}],cursor:1,closed:false});
+  for(let i=0;i<30&&track.readyState==='live';i++)await tick();
+  assert.equal(track.readyState,'ended');assert.equal(stopCalls,1);
+  assert.equal(client.sessionId,null);assert.equal(states.at(-1),'off');
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
 test('browser sends PCM as binary and reports HTTP versus server receive-to-ack time',async()=>{
   const requests=[],timings=[];let releaseEvents;
   const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{

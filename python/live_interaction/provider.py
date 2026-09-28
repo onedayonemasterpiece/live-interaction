@@ -16,6 +16,8 @@ MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
 FRESH_HANDLE_WAIT_SECONDS = 8
 TRANSITION_DEADLINE_SECONDS = 25
 MAX_TRANSITION_CONNECTION_ATTEMPTS = 3
+MAX_TRANSITION_BUDGET_RETRIES = 3
+TRANSITION_BUDGET_RETRY_SECONDS = 4
 MAX_HISTORY_TURNS = 8
 MAX_HISTORY_TEXT = 700
 
@@ -493,6 +495,22 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if state.get('resource_error') is not None:
                     raise state['resource_error']
                 if _is_resource_failure(exc):
+                    transition = state.get('transition')
+                    # A denied setup grant commits no tokens. During a tool-bundle
+                    # switch the previous socket is already closed, so wait for a
+                    # short rolling-budget refill within the existing deadline.
+                    if (transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
+                            and transition.get('budget_retries', 0) < MAX_TRANSITION_BUDGET_RETRIES
+                            and transition['deadline'] - loop.time() > TRANSITION_BUDGET_RETRY_SECONDS + 1):
+                        transition['budget_retries'] = transition.get('budget_retries', 0) + 1
+                        transition['attempts'] -= 1
+                        emit({'type': 'capability_budget_wait',
+                              'transition_id': transition['transition_id'],
+                              'capability': transition['capability'],
+                              'retry': transition['budget_retries'],
+                              'wait_ms': TRANSITION_BUDGET_RETRY_SECONDS * 1000})
+                        await asyncio.sleep(TRANSITION_BUDGET_RETRY_SECONDS)
+                        continue
                     raise
                 wait = state.get('transition_wait')
                 if wait is not None:

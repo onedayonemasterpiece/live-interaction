@@ -188,6 +188,50 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_transition_retries_denied_setup_grant_before_aborting(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingAfterAck(_FakeSocket):
+            async def send(self,payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    self.incoming.put_nowait(self._CLOSED)
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+        class Guard(_Guard):
+            setup_attempts=0
+            async def before_send(self,payload):
+                if 'setup' in payload:
+                    self.setup_attempts += 1
+                    if self.setup_attempts == 2:raise BudgetFailure('denied')
+                self.payloads.append(payload)
+        first=ClosingAfterAck([{'setupComplete':{}}])
+        denied=_FakeSocket([])
+        resumed=_FakeSocket([{'setupComplete':{}}])
+        sockets=[first,denied,resumed];events=[]
+        with patch('websockets.connect',side_effect=lambda *_args,**_kwargs:sockets.pop(0)), \
+             patch('live_interaction.provider.FRESH_HANDLE_WAIT_SECONDS',.01), \
+             patch('live_interaction.provider.TRANSITION_BUDGET_RETRY_SECONDS',.01):
+            task=asyncio.create_task(run(reader=reader,on_event=events.append,resource_guard=Guard()))
+            for _ in range(100):
+                if any(e.get('type')=='ready' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-budget','capability':'slide_edit',
+                'configuration':{'system_instruction':'edit','functions':[{'name':'prepare_slide_change'}]},
+                'continuation':'add one item',
+                'router_response':{'name':'activate_capability','id':'route-budget',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            for _ in range(300):
+                if any(e.get('type')=='capability_ready' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='capability_budget_wait' and e.get('retry')==1 for e in events))
+            self.assertTrue(any(e.get('type')=='capability_ready' and e.get('capability')=='slide_edit' for e in events))
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            self.assertEqual(len(sockets),0)
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
     async def test_delayed_setup_cannot_emit_late_ready_after_transition_deadline(self):
         reader=_QueueReader()
         reader.feed({'type':'start','model':'gemini-3.8-live',
