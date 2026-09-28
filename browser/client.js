@@ -16,7 +16,7 @@ function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=St
 // go through this client, including Stop while setup or a poll is still pending.
 export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false}={}){
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
-  let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null;
+  let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null,budgetPaused=false;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false;
@@ -127,7 +127,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     microphone?.stop();microphone=null;
   }
   async function startMic(epoch,handoff=null){
-    if(!microphoneEnabled)return false;
+    if(!microphoneEnabled||budgetPaused)return false;
     if(microphone?.running){onTiming('microphone_reused_after_resume');return true;}
     if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
@@ -183,7 +183,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         else if(event.type==='turn_complete'){
           if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
         }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
-        else if(event.type==='resumed'&&microphoneEnabled){void startMic(epoch);}
+        else if(event.type==='resource_budget_wait'){
+          beginWait();waitStage='resource';
+          if(!budgetPaused){budgetPaused=true;closeMic();onState('budget_wait');onNotice('resource_budget_wait');}
+        }else if(event.type==='resource_budget_ready'){
+          budgetPaused=false;waitStage='provider';onState('budget_ready');
+          if(microphoneEnabled)void startMic(epoch);
+        }else if(event.type==='resumed'&&microphoneEnabled&&!budgetPaused){void startMic(epoch);}
         if(epoch!==generation)return;
         onEvent(event,epoch);cursor=event.seq??cursor;
         if(event.type==='error'){
@@ -204,7 +210,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function stop({keepalive=false,reason='user_stop',preservePlayback=false}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();closeMic();clearTimeout(pollTimer);pollTimer=null;
-    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;
+    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
   async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true,captureDuringStart=false}){

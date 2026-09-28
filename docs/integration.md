@@ -87,7 +87,7 @@ only on provider closure/transport failure, never for a user's explicit Stop.
 `onEvent(event,generation)` must not block playback with a long domain refresh.
 Before applying asynchronous UI results, compare the generation to the current
 client generation. Tools and mutation busy/readback indicators remain app policy.
-`onState`: starting, started, listening, answering, reconnecting, off,
+`onState`: starting, started, listening, answering, budget_wait, budget_ready, reconnecting, off,
 microphone_unavailable, connection_error, start_error.
 `onNotice`: voice_stop_confirmation_requested, voice_stop_cancelled,
 voice_stop_expired, event_gap, transport_error, microphone_error,
@@ -95,7 +95,7 @@ connection_error, start_error; second argument may be an Error.
 `onTiming` contains bounded numeric diagnostics, not speech/secret payloads.
 `onWait(null | {elapsed_ms,stage,can_restart})` stays hidden below 15 seconds;
 show mm:ss, a gentle pulse honoring reduced motion, and an immediate Stop.
-Stage is transport until worker-send/ASR evidence, then provider; outstanding tool calls use action so a slow application is not blamed on Google. Extended intermediate turnComplete does not complete an outstanding wait. At 120 seconds,
+Stage is transport until worker-send/ASR evidence, then provider; outstanding tool calls use action so a slow application is not blamed on Google. A rolling resource grant refusal uses resource: capture is paused until the same unsent control message is admitted, while Stop remains immediate. Optional video frames are dropped on budget refusal. Extended intermediate turnComplete does not complete an outstanding wait. At 120 seconds,
 offer explicit Stop+Start without replaying the old command. Never auto-restart
 or automatically retry a mutation. Already accepted writes may still finish;
 refresh authoritative product state after reconnect.
@@ -181,7 +181,11 @@ and sends one bounded `LIVE_CONTINUATION` application turn. Inputs queued
 during the handoff are dropped rather than replayed; the audio-end barrier
 keeps the speech that triggered a transition ahead of that boundary. Writes include
 numeric `queued_at` for delay measurement.
-Snapshot uses video input only, never an implicit user text turn. Product images
+Snapshot uses video input only, never an implicit user text turn. A product may
+mark a replaceable frame `optional:true`: a denied rolling image grant drops that
+frame and emits `input_dropped`, preserving the Live conversation. Required
+frames retain fail-closed semantics. Already executed tools are never rerun
+while their unsent FunctionResponse waits for an available grant. Product images
 must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
 normal domain reconciliation.

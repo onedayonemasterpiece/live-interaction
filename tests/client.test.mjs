@@ -74,6 +74,33 @@ test('capability resume reuses the active microphone and Stop ends its only trac
   if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
  }
 });
+test('rolling budget wait pauses capture and resumes the same Live session',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let releaseEvents,getUserMediaCalls=0;const tracks=[],states=[],notices=[];
+ class FakeNode{connect(){}disconnect(){}}
+ class FakeContext{sampleRate=48000;state='running';destination={};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;const track={readyState:'live',stop(){this.readyState='ended';}};tracks.push(track);return {getTracks:()=>[track]};}}},configurable:true});
+ globalThis.AudioContext=FakeContext;
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:s=>states.push(s),onNotice:s=>notices.push(s)});
+ try{
+  await client.start({url:'/live'});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  releaseEvents({events:[{seq:1,type:'resource_budget_wait',input_type:'tool_response',retry:1,wait_ms:3000}],cursor:1,closed:false});
+  for(let i=0;i<30&&tracks[0].readyState==='live';i++)await tick();
+  assert.equal(tracks[0].readyState,'ended');assert.equal(client.sessionId,'one');
+  assert.ok(states.includes('budget_wait'));assert.deepEqual(notices,['resource_budget_wait']);
+  await new Promise(resolve=>setTimeout(resolve,180));
+  releaseEvents({events:[{seq:2,type:'resource_budget_ready',input_type:'tool_response',retries:1}],cursor:2,closed:false});
+  for(let i=0;i<30&&getUserMediaCalls<2;i++)await tick();
+  assert.equal(getUserMediaCalls,2);assert.equal(tracks[1].readyState,'live');
+  assert.equal(client.sessionId,'one');assert.ok(states.includes('budget_ready'));
+  client.stop();assert.equal(tracks[1].readyState,'ended');
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
 test('browser sends PCM as binary and reports HTTP versus server receive-to-ack time',async()=>{
   const requests=[],timings=[];let releaseEvents;
   const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{

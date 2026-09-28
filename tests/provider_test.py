@@ -6,6 +6,7 @@ from live_interaction.provider import (
     DialogueHistory,
     _guarded_recv,
     _guarded_send,
+    _send_with_budget_wait,
     _is_resource_failure,
     handle_server_message,
     run,
@@ -226,6 +227,8 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                 if any(e.get('type')=='capability_ready' for e in events):break
                 await asyncio.sleep(.001)
             self.assertTrue(any(e.get('type')=='capability_budget_wait' and e.get('retry')==1 for e in events))
+            self.assertTrue(any(e.get('type')=='resource_budget_wait' and e.get('input_type')=='setup' for e in events))
+            self.assertTrue(any(e.get('type')=='resource_budget_ready' and e.get('input_type')=='setup' for e in events))
             self.assertTrue(any(e.get('type')=='capability_ready' and e.get('capability')=='slide_edit' for e in events))
             self.assertFalse(any(e.get('type')=='error' for e in events))
             self.assertEqual(len(sockets),0)
@@ -509,6 +512,40 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,1)
 
 class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_frame_budget_denial_does_not_close_session(self):
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+        class Guard(_Guard):
+            async def before_send(self,payload):
+                raise BudgetFailure('denied')
+        ws=_Ws();events=[];state={'stopped':False,'ws':ws,'drop_inputs_before':0}
+        sent=await _send_with_budget_wait(ws,{'realtimeInput':{'video':{'data':'AAAA'}}},Guard(),events.append,'snapshot',state,optional=True)
+        self.assertFalse(sent)
+        self.assertEqual(ws.sent,[])
+        self.assertEqual(events,[{'type':'input_dropped','reason':'resource_budget','input_type':'snapshot'}])
+        with self.assertRaises(BudgetFailure):
+            await _send_with_budget_wait(ws,{'realtimeInput':{'video':{'data':'AAAA'}}},Guard(),events.append,'snapshot',state)
+
+    async def test_tool_result_waits_for_grant_without_rerunning_tool(self):
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+            retry_after_ms=1
+        class Guard(_Guard):
+            attempts=0
+            async def before_send(self,payload):
+                self.attempts+=1
+                if self.attempts==1:raise BudgetFailure('denied')
+                self.payloads.append(payload)
+        guard=Guard();ws=_Ws();events=[];state={'stopped':False,'ws':ws,'drop_inputs_before':0}
+        payload={'toolResponse':{'functionResponses':[{'name':'apply','id':'one','response':{'result':{'revision':19}}}]}}
+        sent=await _send_with_budget_wait(ws,payload,guard,events.append,'tool_response',state,deadline_seconds=1)
+        self.assertTrue(sent)
+        self.assertEqual(guard.attempts,2)
+        self.assertEqual(len(ws.sent),1)
+        self.assertEqual(json.loads(ws.sent[0]),payload)
+        self.assertEqual([e['type'] for e in events],['resource_budget_wait','resource_budget_ready'])
+        self.assertGreater(state['drop_inputs_before'],0)
+
     async def test_guarded_send_charges_before_provider_write(self):
         guard = _Guard()
         ws = _Ws()

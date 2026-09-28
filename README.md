@@ -16,7 +16,7 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.2.16`). Release 0.2.16 reuses an active microphone across capability resumption, so Stop still owns its only stream. Release 0.2.15 retries a denied setup grant during a capability transition within the existing deadline and stops browser capture immediately on a terminal provider error. Release 0.2.14 closes late microphone grants after Stop and gives the bounded sender room for a short in-flight HTTP stall. Release 0.2.13 keeps quiet
+Use versioned releases (current release `0.2.17`). Release 0.2.17 waits on rolling resource-budget refusals for the same unsent tool response or text, pauses browser capture until admission recovers, and drops only explicitly optional frames. A bounded capability transition can wait for the same budget without rerunning product mutations. Release 0.2.16 reuses an active microphone across capability resumption, so Stop still owns its only stream. Release 0.2.15 retries a denied setup grant during a capability transition within the existing deadline and stops browser capture immediately on a terminal provider error. Release 0.2.14 closes late microphone grants after Stop and gives the bounded sender room for a short in-flight HTTP stall. Release 0.2.13 keeps quiet
 speech within an active microphone turn and waits for that turn's provider
 audio-end acknowledgement before a capability switch. Release 0.2.12 allows a
 consumer to opt into binary PCM between browser and product server and reports

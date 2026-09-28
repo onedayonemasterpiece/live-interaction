@@ -34,7 +34,7 @@ const validateCapabilitySpec=(spec,DomainError)=>{
 };
 
 // The host owns transport, ordering, capability transitions and event cursors; adapters own domain policy.
-export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=30000,maxSessions=2}={}){
+export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=105000,maxSessions=2}={}){
   const DomainError=ErrorClass,sessions=new Map();
   let adapter;
   const emit=(session,event)=>{
