@@ -2,7 +2,7 @@
 
 Status: canonical shared design for products using `@onedayonemasterpiece/live-interaction`.
 
-Last reviewed: 2026-09-27.
+Last reviewed: 2026-09-28.
 
 This document defines how a product should expose prompts, tools, capabilities,
 conversation state, visual context, resource accounting and diagnostics to a
@@ -35,13 +35,17 @@ preference:
   non-conflicting instructions, explicit tool use/avoid rules, and keeping tool
   availability synchronized with the prompt.
   https://developers.openai.com/api/docs/guides/voice-prompting
-- OpenAI Tool Search loads deferred tool definitions only when needed and
-  recommends clear namespaces with fewer than 10 functions for token efficiency
-  and model performance.
+- OpenAI Tool Search loads deferred definitions in the **Responses API** and
+  recommends clear namespaces with fewer than 10 functions. This is design
+  evidence for small bundles, not an API feature of Gemini Live or GPT-Live.
   https://developers.openai.com/api/docs/guides/tools-tool-search
-- OpenAI Realtime allows tools at session or response scope and recommends a
-  narrow allowed tool surface for MCP integrations.
+- OpenAI Realtime allows function tools at session or response scope. GPT-Live
+  instead keeps the voice prompt short and delegates detailed work to a
+  backend; its supported session updates and instruction appends have different
+  semantics. Neither API is the transport used by this Gemini implementation.
   https://developers.openai.com/api/docs/guides/realtime-mcp
+  https://developers.openai.com/api/docs/guides/live-prompting
+  https://developers.openai.com/api/docs/guides/live-delegation
 - Gemini Live recommends one persona/role at a time, explicit invocation
   conditions, prompt chaining instead of lengthy multi-page prompts, and notes
   that Live performs best on tasks involving a small number of function calls.
@@ -152,10 +156,13 @@ be used after the task completes.
 The shared runtime models capability loading as a state transition even though
 providers expose different primitives.
 
-### OpenAI Realtime
+### OpenAI APIs
 
-Use provider-native session/response tool scoping or deferred tool search when
-available. Do not send definitions for unrelated namespaces.
+For an actual Realtime consumer, use its documented session/response tool
+scoping. For GPT-Live, keep the conversation prompt short and configure or
+update tools in its delegated backend within that API's supported fields.
+Responses `tool_search` is a separate mechanism; do not assume it can update
+an active voice model or reuse it as a Gemini implementation detail.
 
 ### Gemini Live
 
@@ -298,6 +305,11 @@ a calibrated image/video estimate.
 
 Provider-reported usage is authoritative evidence for calibration; local
 estimates are conservative admission controls, not a substitute tokenizer.
+Progressive disclosure reduces the active tool schema, but it is not a quota
+guarantee: Gemini Live re-processes the retained multimodal context on later
+turns, and a capability change sends a new setup. Measure actual provider
+usage and separate setup, audio, image and tool-response admission events.
+https://ai.google.dev/gemini-api/docs/live-api/best-practices#pricing-and-billing
 
 ## 9. Observability contract
 
