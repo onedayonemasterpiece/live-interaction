@@ -87,6 +87,11 @@ class _Session:
     pending_transition: asyncio.Future | None = None
     manual_activity_detection: bool = False
     activity_open: bool = False
+    audio_turn_generation: int = 0
+    audio_turn_open: bool = False
+    audio_end_sent_generation: int = 0
+    audio_end_awaiting_ack: deque[int] = field(default_factory=deque)
+    audio_end_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 def _now_ms() -> int:
@@ -339,6 +344,12 @@ class LiveSessionHost:
                 return
             if kind == "tool_cancelled":
                 session.cancelled.update(str(v) for v in (event.get("ids") or []))
+            if kind == "input_timing" and event.get("audio_stream_end_sent_at"):
+                if session.audio_end_awaiting_ack:
+                    session.audio_end_sent_generation = max(
+                        session.audio_end_sent_generation, session.audio_end_awaiting_ack.popleft()
+                    )
+                session.audio_end_event.set()
             if kind == "resumed" and hasattr(self.adapter, "on_resumed"):
                 asyncio.create_task(_maybe_await(self.adapter.on_resumed(session)))
             if kind == "audio" and session.awaiting_audio and session.tool_response_at is not None:
@@ -452,6 +463,20 @@ class LiveSessionHost:
         self, session: _Session, call: dict[str, Any], spec: Any
     ) -> None:
         resolved = _validate_capability_spec(spec)
+        generation = session.audio_turn_generation
+        if generation > session.audio_end_sent_generation:
+            started = _now_ms()
+            self._emit(session, {"type": "capability_waiting_for_audio_end"})
+            try:
+                async with asyncio.timeout(30):
+                    while not session.closed and session.audio_end_sent_generation < generation:
+                        session.audio_end_event.clear()
+                        await session.audio_end_event.wait()
+            except TimeoutError as exc:
+                raise LiveError("LIVE_AUDIO_TURN_PENDING", "Speech did not finish before capability transition") from exc
+            if session.closed:
+                raise LiveError("LIVE_SESSION_CLOSED", "Live-сессия закрыта")
+            self._emit(session, {"type": "capability_audio_end_ready", "duration_ms": _now_ms() - started})
         transition_id = "cap_" + uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -717,10 +742,16 @@ class LiveSessionHost:
             if session.manual_activity_detection and not session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "activity_start is required before buffered audio")
             written_at = self._write(session, {"type": "audio", "data": audio})
+            if not session.manual_activity_detection and not session.audio_turn_open:
+                session.audio_turn_generation += 1
+                session.audio_turn_open = True
         if message.get("audio_stream_end"):
             if session.manual_activity_detection:
                 raise LiveError("INVALID_ARGUMENT", "Use activity_end when manual activity is enabled")
             self._write(session, {"type": "audio_stream_end"})
+            if session.audio_turn_open:
+                session.audio_end_awaiting_ack.append(session.audio_turn_generation)
+                session.audio_turn_open = False
         if message.get("activity_end"):
             if not session.manual_activity_detection:
                 raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
@@ -776,6 +807,7 @@ class LiveSessionHost:
 
     async def _discard(self, session: _Session, graceful: bool = False) -> None:
         session.closed = True
+        session.audio_end_event.set()
         if session.pending_transition and not session.pending_transition.done():
             session.pending_transition.set_exception(
                 LiveError("LIVE_SESSION_CLOSED", "Live session stopped during capability transition")

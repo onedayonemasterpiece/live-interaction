@@ -326,6 +326,39 @@ class CapabilityProvider:
 
 
 class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_router_waits_for_audio_end_at_provider(self):
+        provider = CapabilityProvider()
+        host = LiveSessionHost(
+            adapter_factory=lambda **_kw: CapabilityAdapter(),
+            managed_runner=provider.run,
+            ready_timeout_ms=500,
+            reconfigure_timeout_ms=500,
+        )
+        actor = {"subject": "a", "tenant_id": "t"}
+        started = await host.start(resource_id="speech", actor=actor)
+        base = {"resource_id": "speech", "session_id": started["session_id"], "actor": actor}
+        await host.input(**base, message={"audio_base64": "AAAA"})
+        provider.events({"type": "tool_call", "calls": [{
+            "name": "activate_capability", "id": "route",
+            "args": {"capability": "dataset", "intent": "finish spoken question"},
+        }]})
+        await asyncio.sleep(0)
+        await host.input(**base, message={"audio_base64": "BBBB"})
+        await host.input(**base, message={"audio_stream_end": True})
+        await asyncio.sleep(0)
+        decoded = [__import__("json").loads(item) for item in provider.messages]
+        self.assertFalse(any(item.get("type") == "reconfigure" for item in decoded))
+        provider.events({"type": "input_timing", "audio_stream_end_sent_at": 123, "audio_chunks": 2})
+        for _ in range(40):
+            decoded = [__import__("json").loads(item) for item in provider.messages]
+            if any(item.get("type") == "reconfigure" for item in decoded):
+                break
+            await asyncio.sleep(0)
+        self.assertEqual([item["data"] for item in decoded if item.get("type") == "audio"], ["AAAA", "BBBB"])
+        self.assertLess(next(i for i, item in enumerate(decoded) if item.get("type") == "audio_stream_end"),
+                        next(i for i, item in enumerate(decoded) if item.get("type") == "reconfigure"))
+        await host.stop(**base)
+
     async def test_capability_router_delegates_acknowledgement_to_provider(self):
         adapter = CapabilityAdapter()
         provider = CapabilityProvider()

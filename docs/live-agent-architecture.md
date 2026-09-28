@@ -180,8 +180,10 @@ switching therefore uses a **safe session-resumption boundary**:
    issued after that router response**. Google explicitly marks function-call
    and generation states as non-resumable, so reusing a handle from before the
    router response can lose the pending tool-call state.
-5. Only after that fresh handle exists, pause the provider connection. Input
-   captured during this bounded handoff is not replayed as stale speech.
+5. If the current microphone turn is still open, wait for its audio end to be
+   sent to the provider before acknowledging the router call. Only after that
+   and a fresh handle exists, pause the provider connection. Input captured
+   during the bounded handoff is not replayed as stale speech.
 6. Resume the same model and key with:
    - that fresh resumption handle;
    - the same core prompt;

@@ -91,6 +91,16 @@ test('does not flush provider audio before its measured silence window',async()=
  assert.equal(sent.filter(m=>m.audio_stream_end).length,1);sender.stop();
 });
 
+test('quiet speech above the reduced gate stays in the same audio turn',async()=>{
+ const sent=[];let at=0;
+ const sender=createLiveAudioSender({send:async message=>sent.push(message),now:()=>at});
+ sender.push(new Int16Array(1600).fill(1000),.05);await tick();
+ for(let i=0;i<30;i++){at+=100;sender.push(new Int16Array(1600).fill(100),.004);await tick();}
+ assert.equal(sent.filter(message=>message.audio_stream_end).length,0);
+ assert.ok(sent.some(message=>message.pcm?.some(sample=>sample===100)));
+ sender.stop();
+});
+
 test('a delayed end-of-stream marker is flushed even after the audio age bound',async()=>{
  let at=0,release,error;const sent=[];
  const sender=createLiveAudioSender({now:()=>at,send:m=>{sent.push(m);if(m.pcm&&at===2000)return new Promise(r=>release=r);return Promise.resolve();},onError:e=>error=e});

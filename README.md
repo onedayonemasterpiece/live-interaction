@@ -16,7 +16,9 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current release `0.2.12`). Release 0.2.12 allows a
+Use versioned releases (current release `0.2.13`). Release 0.2.13 keeps quiet
+speech within an active microphone turn and waits for that turn's provider
+audio-end acknowledgement before a capability switch. Release 0.2.12 allows a
 consumer to opt into binary PCM between browser and product server and reports
 audio HTTP timing; the server still encodes its Gemini wire message. Existing
 JSON consumers keep their wire contract. Release 0.2.11 preserves the

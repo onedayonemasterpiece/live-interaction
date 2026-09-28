@@ -143,7 +143,8 @@ export function createLiveAudioSender({
     // provider VAD (700/1200ms tails failed real Gemini audio acceptance).
     // Responses can start before the tail finishes; prolonged idle silence is not sent.
     // Server VAD still decides turns; stream_end flushes the final tail before idle silence.
-    if(rms>=0.008){
+    // Keep onset conservative, but do not cut quiet words after a turn began.
+    if(rms>=(active?0.003:0.008)){
       if(!active){
         active=true;
         for(const previous of preRoll)stage(previous);

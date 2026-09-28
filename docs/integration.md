@@ -145,6 +145,9 @@ application idempotency must still survive process/session restarts. If
 call in its provider batch. The host sends one bounded `reconfigure` worker
 command containing the server-owned configuration, a router acknowledgement and
 the bounded continuation intent. For Gemini the worker sends that acknowledgement
+only after any already-started microphone turn has reached its `audio_stream_end`
+at the provider. A 30-second bound fails the router call visibly if the turn
+never ends; the host does not silently drop its remaining PCM. The worker then sends that acknowledgement
 on the old connection first, waits for a **fresh post-response** resumable handle,
 then resumes the same model/key/session with the new bundle. If Gemini does not issue a fresh checkpoint within the bounded wait, the worker discards the old handle, opens a new connection with the same model/key, restores bounded completed turns through `historyConfig.initialHistoryInClientContent`, and delivers the one accepted continuation. A checkpoint resume does not replay application history. After
 `capability_ready` the host updates active capability/configuration state but
@@ -175,7 +178,8 @@ invalidates the old resumption token, waits for a fresh resumable handle issued
 after the acknowledgement, closes only that WebSocket intentionally, resumes
 the same model/session with the new configuration, emits `capability_ready`,
 and sends one bounded `LIVE_CONTINUATION` application turn. Inputs queued
-before the handoff completes are dropped rather than replayed. Writes include
+during the handoff are dropped rather than replayed; the audio-end barrier
+keeps the speech that triggered a transition ahead of that boundary. Writes include
 numeric `queued_at` for delay measurement.
 Snapshot uses video input only, never an implicit user text turn. Product images
 must be current and bounded before transport. Do not replay captured audio on
@@ -186,7 +190,8 @@ Current measured defaults: 256ms batch; <=11000 PCM bytes per browser-to-server
 request (binary only when the consumer opts in with `binaryAudio: true` and
 supports `application/octet-stream`); then <=16000 base64 characters on the server-to-provider JSON wire;
 1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
-250ms preroll; conservative RMS gate; 2s quiet tail. An intentional startup
+250ms preroll; conservative 0.008 RMS onset and 0.003 RMS continuation gates;
+2s quiet tail. An intentional startup
 microphone handoff may seed at most 20s of PCM and temporarily uses a separate
 bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog is
 back within the ordinary watermark, queued ages are rebased once and the strict

@@ -65,8 +65,34 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       emit(session,{type:'timing',stage:'tool_response_written'});
     }
   };
+  const settleAudioEndWaiters=(session,error=null)=>{
+    for(const waiter of [...session.audioEndWaiters]){
+      if(!error&&session.audioEndSentGeneration<waiter.generation)continue;
+      clearTimeout(waiter.timer);
+      session.audioEndWaiters.delete(waiter);
+      if(error)waiter.reject(error);
+      else waiter.resolve();
+    }
+  };
+  const waitForAudioTurnEnd=async session=>{
+    const generation=session.audioTurnGeneration;
+    if(!generation||session.audioEndSentGeneration>=generation)return;
+    const started=Date.now();
+    emit(session,{type:'capability_waiting_for_audio_end'});
+    await new Promise((resolve,reject)=>{
+      const waiter={generation,resolve,reject,timer:null};
+      waiter.timer=setTimeout(()=>{
+        session.audioEndWaiters.delete(waiter);
+        reject(new DomainError('LIVE_AUDIO_TURN_PENDING','Speech did not finish before capability transition'));
+      },30000);
+      session.audioEndWaiters.add(waiter);
+    });
+    if(session.closed)throw new DomainError('LIVE_SESSION_CLOSED','Live-сессия закрыта');
+    emit(session,{type:'capability_audio_end_ready',duration_ms:Date.now()-started});
+  };
   const transitionCapability=async(session,call,spec)=>{
     const resolved=validateCapabilitySpec(spec,DomainError);
+    await waitForAudioTurnEnd(session);
     const transitionId='cap_'+randomUUID().replaceAll('-','');
     let resolveReady,rejectReady;
     const ready=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject;});
@@ -174,6 +200,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     const child=createWorker({model,actor,resourceId});
     const initialMeta=configurationMeta(initialized.configuration??{});
     const session={...initialized.state,id,resourceId,actor,model,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map(),
+      audioTurnGeneration:0,audioTurnOpen:false,audioEndSentGeneration:0,audioEndAwaitingAck:[],audioEndWaiters:new Set(),
       capability:initialized.capability??initialized.state?.capability??'core',configurationDigest:initialMeta.configuration_digest,pendingTransition:null};
     sessions.set(id,session);
     let readyResolve,readyReject;
@@ -202,6 +229,11 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         return;
       }
       if(event.type==='tool_cancelled'){for(const id of event.ids??[])session.cancelled.add(id);}
+      if(event.type==='input_timing'&&event.audio_stream_end_sent_at){
+        const generation=session.audioEndAwaitingAck.shift();
+        if(generation)session.audioEndSentGeneration=Math.max(session.audioEndSentGeneration,generation);
+        settleAudioEndWaiters(session);
+      }
       if(event.type==='resumed'){adapter.onResumed?.(session);}
       if(event.type==='audio'&&session.awaitingAudio){timing(session,'first_audio_after_tool_response',session.toolResponseAt);session.awaitingAudio=false;}
       if(event.type==='tool_call'){
@@ -223,6 +255,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       session.pendingTransition?.reject?.(new DomainError('LIVE_PROVIDER_CLOSED','Live provider closed during capability transition'));
       session.pendingTransition=null;
       session.closed=true;emit(session,{type:'closed',code});
+      settleAudioEndWaiters(session,new DomainError('LIVE_PROVIDER_CLOSED','Live provider closed while speech was finishing'));
     });
     write(session,{type:'start',model,configuration:initialized.configuration,context:initialized.context,history:Array.isArray(history)?history.slice(-8).filter(m=>['user','model'].includes(m?.role)&&typeof m.text==='string').map(m=>({role:m.role,text:m.text.slice(-700)})):[]});
     let timer;
@@ -248,8 +281,12 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     if(message?.audio_base64!==undefined){
       if(typeof message.audio_base64!=='string'||message.audio_base64.length>16000)throw new DomainError('INVALID_ARGUMENT','Audio chunk is invalid');
       writtenAt=write(session,{type:'audio',data:message.audio_base64});
+      if(!session.audioTurnOpen){session.audioTurnGeneration++;session.audioTurnOpen=true;}
     }
-    if(message?.audio_stream_end)write(session,{type:'audio_stream_end'});
+    if(message?.audio_stream_end){
+      write(session,{type:'audio_stream_end'});
+      if(session.audioTurnOpen){session.audioEndAwaitingAck.push(session.audioTurnGeneration);session.audioTurnOpen=false;}
+    }
     if(message?.text!==undefined){
       if(typeof message.text!=='string'||!message.text.trim()||message.text.length>4000)throw new DomainError('INVALID_ARGUMENT','Text turn is invalid');
       write(session,{type:'text',text:message.text.trim()});
@@ -267,6 +304,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     if(!session.closed){try{write(session,{type:'stop'});}catch{}setTimeout(()=>{try{session.child.kill('SIGTERM');}catch{}},1200).unref?.();}
     session.pendingTransition?.reject?.(new DomainError('LIVE_SESSION_CLOSED','Live session stopped during capability transition'));
     session.pendingTransition=null;
+    settleAudioEndWaiters(session,new DomainError('LIVE_SESSION_CLOSED','Live-сессия закрыта'));
     session.closed=true;if(!session.stoppedNotified)adapter.onStopped?.(session);sessions.delete(session.id);
     return {ok:true,session_id:session.id};
   };

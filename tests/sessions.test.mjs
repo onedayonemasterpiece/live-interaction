@@ -101,6 +101,34 @@ test('capability router delegates safe acknowledgement and continuation to provi
  await host.stop(base);
 });
 
+test('capability transition waits until the current speech tail reached the provider',async()=>{
+ const c=worker(),writes=[];
+ c.stdin.on('data',chunk=>{for(const line of chunk.toString().split('\n').filter(Boolean)){
+   const message=JSON.parse(line);writes.push(message);
+   if(message.type==='reconfigure')queueMicrotask(()=>c.stdout.write(JSON.stringify({type:'capability_ready',transition_id:message.transition_id,capability:message.capability})+'\n'));
+ }});
+ const host=createLiveSessionHost({createWorker:()=>c,reconfigureTimeoutMs:1000,adapterFactory:()=>({
+   initialize:()=>({state:{},capability:'core',context:{},configuration:{functions:[{name:'activate_capability'}]}}),
+   resolveCapability:()=>({capability:'lecture',configuration:{functions:[{name:'activate_capability'},{name:'read_concept'}]},continuation:'finish the spoken question'}),
+   executeTool:async()=>({ok:true})
+ })});
+ const actor={subject:'a',tenant_id:'t'},started=await host.start({resourceId:'speech',actor}),base={resourceId:'speech',sessionId:started.session_id,actor};
+ host.input({...base,message:{audio_base64:'AAAA'}});
+ c.stdout.write(JSON.stringify({type:'tool_call',calls:[{name:'activate_capability',id:'route',args:{capability:'lecture',intent:'finish the spoken question'}}]})+'\n');
+ await tick();
+ assert.equal(writes.some(message=>message.type==='reconfigure'),false);
+ host.input({...base,message:{audio_base64:'BBBB'}});
+ host.input({...base,message:{audio_stream_end:true}});
+ await tick();
+ assert.equal(writes.some(message=>message.type==='reconfigure'),false,'HTTP acknowledgement is not provider audio delivery');
+ c.stdout.write(JSON.stringify({type:'input_timing',audio_stream_end_sent_at:Date.now(),audio_chunks:2})+'\n');
+ for(let i=0;i<30&&!writes.some(message=>message.type==='reconfigure');i++)await tick();
+ assert.deepEqual(writes.filter(message=>message.type==='audio').map(message=>message.data),['AAAA','BBBB']);
+ assert.ok(writes.findIndex(message=>message.type==='audio_stream_end')<writes.findIndex(message=>message.type==='reconfigure'));
+ assert.ok(host.events(base).events.some(event=>event.type==='capability_audio_end_ready'));
+ await host.stop(base);
+});
+
 test('capability bundles reject more than nine functions without reconfiguring provider',async()=>{
  const c=worker(),writes=[];c.stdin.on('data',b=>{for(const line of b.toString().split('\n').filter(Boolean))writes.push(JSON.parse(line));});
  const adapter={
