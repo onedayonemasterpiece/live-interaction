@@ -73,8 +73,8 @@ class ProviderContract(unittest.TestCase):
         low=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_LOW'})['setup']
         high=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_HIGH'})['setup']
         default=setup_config('gemini-3.8-live',{},configuration={})['setup']
-        self.assertEqual(low['generationConfig']['mediaResolution'],{'level':'MEDIA_RESOLUTION_LOW'})
-        self.assertEqual(high['generationConfig']['mediaResolution'],{'level':'MEDIA_RESOLUTION_HIGH'})
+        self.assertEqual(low['generationConfig']['mediaResolution'],'MEDIA_RESOLUTION_LOW')
+        self.assertEqual(high['generationConfig']['mediaResolution'],'MEDIA_RESOLUTION_HIGH')
         self.assertNotIn('mediaResolution',default['generationConfig'])
         with self.assertRaisesRegex(ValueError,'Unsupported media_resolution'):
             setup_config('gemini-3.8-live',{},configuration={'media_resolution':'LOWISH'})
