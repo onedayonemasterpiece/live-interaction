@@ -76,7 +76,7 @@ acknowledgement. Provider events are pushed immediately; output PCM is binary. A
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
-Release 0.3.5 accepts an optional capability-level `media_resolution` setting and serializes it into Gemini Live `generationConfig.mediaResolution.level`. Consumers can therefore use low-resolution vision for routine verification and high resolution for dedicated image inspection without changing transport semantics.
+Release 0.3.6 serializes capability-level `media_resolution` as the scalar Gemini Live `generationConfig.mediaResolution` enum. Release 0.3.5 introduced the consumer setting, but object-wrapping the scalar is rejected by the Live setup schema. Consumers can therefore use low-resolution vision for routine verification and high resolution for dedicated image inspection without changing transport semantics.
 
 Release 0.3.4 makes each browser WSS audio send complete only after the relay ACK for that frame. The ordered audio sender therefore naturally paces startup/catch-up audio instead of dumping a valid multi-second handoff into WebSocket.bufferedAmount. ACK timeout remains fail-closed with bounded socket metrics.
 
