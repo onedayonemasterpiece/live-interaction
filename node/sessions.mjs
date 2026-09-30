@@ -216,6 +216,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     const session={...initialized.state,id,resourceId,actor,model,attemptId,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map(),subscribers:new Set(),
       audioTurnGeneration:0,audioTurnOpen:false,audioEndSentGeneration:0,audioEndAwaitingAck:[],audioEndWaiters:new Set(),
       inputDamaged:false,damageRecoveryGeneration:0,connectionGeneration:0,socketTicketHash:null,socketTicketExpiresAt:0,socketTicketUsed:false,
+      manualActivityDetection:Boolean(initialized.configuration?.manual_activity_detection),activityOpen:false,
       capability:initialized.capability??initialized.state?.capability??'core',configurationDigest:initialMeta.configuration_digest,pendingTransition:null};
     sessions.set(id,session);
     let readyResolve,readyReject;
@@ -244,7 +245,7 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
         return;
       }
       if(event.type==='tool_cancelled'){for(const id of event.ids??[])session.cancelled.add(id);}
-      if(event.type==='input_timing'&&event.audio_stream_end_sent_at){
+      if(event.type==='input_timing'&&(event.audio_stream_end_sent_at||event.activity_end_sent_at)){
         const generation=session.audioEndAwaitingAck.shift();
         if(generation)session.audioEndSentGeneration=Math.max(session.audioEndSentGeneration,generation);
         if(generation&&session.inputDamaged&&session.damageRecoveryGeneration&&generation>=session.damageRecoveryGeneration){
@@ -298,8 +299,13 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     let writtenAt=null;
     const session=getSession(sessionId,resourceId,actor);
     adapter.input?.(session,message);
+    if(message?.activity_start){
+      if(!session.manualActivityDetection||session.activityOpen)throw new DomainError('INVALID_ARGUMENT','Manual activity cannot start');
+      write(session,{type:'activity_start'});session.activityOpen=true;
+    }
     if(message?.audio_base64!==undefined){
       if(typeof message.audio_base64!=='string'||message.audio_base64.length>16000)throw new DomainError('INVALID_ARGUMENT','Audio chunk is invalid');
+      if(session.manualActivityDetection&&!session.activityOpen)throw new DomainError('INVALID_ARGUMENT','activity_start is required');
       writtenAt=write(session,{type:'audio',data:message.audio_base64});
       if(!session.audioTurnOpen){
         session.audioTurnGeneration++;session.audioTurnOpen=true;
@@ -308,7 +314,13 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       if(Number.isInteger(frameSeq)&&frameSeq>0&&frameSeq%10===0)emit(session,{type:'browser_audio_progress',frame_seq:frameSeq,capture_age_ms:Number.isFinite(captureAgeMs)?Math.round(captureAgeMs):null,connection_generation:Number.isInteger(connectionGeneration)?connectionGeneration:null,worker_stdin_delay_ms:writtenAt?Math.max(0,writtenAt-receivedAt):null});
     }
     if(message?.audio_stream_end){
+      if(session.manualActivityDetection)throw new DomainError('INVALID_ARGUMENT','Use activity_end for manual activity');
       write(session,{type:'audio_stream_end'});
+      if(session.audioTurnOpen){session.audioEndAwaitingAck.push(session.audioTurnGeneration);session.audioTurnOpen=false;}
+    }
+    if(message?.activity_end){
+      if(!session.manualActivityDetection||!session.activityOpen)throw new DomainError('INVALID_ARGUMENT','No manual activity is open');
+      write(session,{type:'activity_end'});session.activityOpen=false;
       if(session.audioTurnOpen){session.audioEndAwaitingAck.push(session.audioTurnGeneration);session.audioTurnOpen=false;}
     }
     if(message?.text!==undefined){
@@ -337,7 +349,8 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       transportGap(meta={}){
         emit(session,{type:'transport_gap',transport:'wss',connection_generation:Number(meta.connection_generation)||session.connectionGeneration,reason:String(meta.reason??'socket_closed').slice(0,80),audio_turn_open:session.audioTurnOpen});
         if(session.audioTurnOpen&&!session.closed){
-          try{write(session,{type:'audio_stream_end'});}catch{}
+          try{write(session,{type:session.manualActivityDetection?'activity_end':'audio_stream_end'});}catch{}
+          session.activityOpen=false;
           session.audioEndAwaitingAck.push(session.audioTurnGeneration);session.audioTurnOpen=false;session.inputDamaged=true;session.damageRecoveryGeneration=0;
         }
       },

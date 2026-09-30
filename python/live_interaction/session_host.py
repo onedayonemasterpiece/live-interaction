@@ -344,7 +344,7 @@ class LiveSessionHost:
                 return
             if kind == "tool_cancelled":
                 session.cancelled.update(str(v) for v in (event.get("ids") or []))
-            if kind == "input_timing" and event.get("audio_stream_end_sent_at"):
+            if kind == "input_timing" and (event.get("audio_stream_end_sent_at") or event.get("activity_end_sent_at")):
                 if session.audio_end_awaiting_ack:
                     session.audio_end_sent_generation = max(
                         session.audio_end_sent_generation, session.audio_end_awaiting_ack.popleft()
@@ -735,6 +735,8 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Activity is already open")
             written_at = self._write(session, {"type": "activity_start"})
             session.activity_open = True
+            session.audio_turn_generation += 1
+            session.audio_turn_open = True
         if "audio_base64" in message:
             audio = message.get("audio_base64")
             if not isinstance(audio, str) or len(audio) > 16_000:
@@ -759,6 +761,9 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "No activity is open")
             self._write(session, {"type": "activity_end"})
             session.activity_open = False
+            if session.audio_turn_open:
+                session.audio_end_awaiting_ack.append(session.audio_turn_generation)
+                session.audio_turn_open = False
         if "text" in message:
             text = message.get("text")
             if not isinstance(text, str) or not text.strip() or len(text) > 4_000:

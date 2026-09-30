@@ -1,74 +1,71 @@
 ---
 name: live-interaction
-description: Integrate or change interactive Live voice/video sessions in Wonderful Lections, street-story, idea-hub or another product using the shared live-interaction framework. Use for microphone transport, model playback, Live lifecycle, recovery or new Live product adapters; ordinary recorded voice-review is a separate flow.
+description: Integrate or change interactive Live voice/video in Wonderful Lections, Street Story, KenigEvents or future products. Use the shared runtime and platform bindings; ordinary durable voice-review is a separate flow.
 ---
 
 # Shared Live interaction
 
-Canonical implementation: `onedayonemasterpiece/live-interaction` (public),
-local checkout `/home/dev/projects/live-interaction`. Read its
-[adapter contract](https://github.com/onedayonemasterpiece/live-interaction/blob/main/docs/integration.md)
-from the local checkout or versioned dependency before implementation. The repository and its versioned GitHub release archives are public.
+Canonical implementation: `onedayonemasterpiece/live-interaction` (public), local
+checkout `/home/dev/projects/live-interaction`. Read `docs/live-agent-architecture.md`
+and `docs/integration.md` before integration. For native/Python WSS also read
+`docs/native-wss.md`, including the multi-project runtime decision and RC limitations.
 
-Use semantic release versions. For npm consumers, the framework source helper
-`scripts/update-consumer.mjs <product> <version|latest> <managed-artifacts>` updates
-the release archive and lockfile; run build/acceptance before deploying. Never
-auto-update a running session.
+Use semantic release versions with archive digests/lockfile integrity. Never
+silently update a running product/session. Framework fixes belong here, not in
+copies of transport code inside consumers. Release candidates are not production
+acceptance. Keep existing stable consumers pinned while candidate acceptance runs.
 
-Use the shared browser client and Python provider; Node hosts also use the shared
-session host. Add product tools/context/UI/authorization as adapters. Improve a
-missing transport capability in the shared repository, then update the consumer's
-versioned release dependency and lockfile. Do not fork/copy an independent audio queue,
-provider websocket, playback or Stop implementation into a product.
+Python products use `LiveSocketSessionHost` (an extension of the existing host)
+and the framework-neutral `serve_socket` relay. FastAPI/aiohttp products only
+provide authorized HTTP routes and socket I/O callbacks. Do not add a Node
+sidecar merely because the first WSS consumer was Node. Node products keep the
+existing Node binding and shared Python provider. Common protocol/conformance
+checks cover both; backend language choice is not a performance guarantee.
 
-For 0.3.x migrations prefer the versioned WSS contract: authenticated HTTP session
-bootstrap, one-use socket ticket in the WebSocket subprotocol, matching
-`wl-live-v1` hello acknowledgement, binary PCM, pushed provider events/audio and no
-silent fallback to the legacy HTTP audio/polling path. Keep browser/server/provider
-connection generations separate and reject damaged-turn mutations after reconnect.
+Android products consume the native Java socket binding from the same immutable
+archive as a generated source set; never edit or copy a fork into a product.
+The app retains capture/VAD/playback/UI. Browser products use the existing shared
+AudioWorklet client and generated assets, not a product-local microphone engine.
 
-Build browser modules from the installed package; generated copies are ignored
-and covered by the consumer's asset hash/cache manifest. Enforce semantic release versioning, release archive digest,
-lockfile provenance and generated-asset equality in the consumer's CI/build.
-Wonderful Lections has `scripts/verify-live-framework.mjs` as the first example.
-This guard plus review enforces known integration paths; a skill alone does not
-prove arbitrary future code cannot diverge.
+WSS: authenticated HTTP bootstrap/renewal, 15-second one-use ticket in subprotocol,
+matching `wl-live-v1` hello_ack before readiness, binary PCM, pushed events/audio,
+bounded ordered sender and ACK pacing. No credential/ticket/resumption handle in
+URLs. No polling or silent HTTP-audio fallback in a migrated session. A damaged
+input turn cannot authorize tools until a later clean provider boundary is proven.
+Native RC reconnect is explicit Stop/Start with no speech replay. Python browser
+RC does not accept 20-second startup replay; disable captureDuringStart and show
+setup state until that catch-up path has independent acceptance.
 
-Keep key resolution server-side and specific to the product/deployment. Different
-products may use different keys. Resolve once per session, keep the same binding
-on resume, whitelist child environment, and never rotate keys to mask quota failure.
-Do not ask the user to paste credentials or put them in browser config/receipts.
+Keep resource/actor authorization, product functions, immutable revision binding,
+state, prompts/persona and credential selection in product adapters. Preserve
+small prompt layers, progressive capabilities and context continuity. No raw
+provider calls outside the shared resource controller. The model/key binding is
+sticky after ready; quota failures are not an excuse for key/provider hopping.
+Missing credentials and authority failures remain visible and fail closed.
 
-Preserve one ordered bounded sender, silence preroll/tail, immediate local Stop,
-no stale speech replay, full received output playback, separate spoken Stop
-confirmation, owner/resource checks and serialized authorized tools. An intentional
-same-microphone startup handoff may use the framework's bounded catch-up seed; do not
-weaken the normal steady-state queue/age limits to accommodate it. Audio HTTP delivery
-may have a longer absolute ceiling than the steady queue/age limits; the sender remains
-the primary steady-state liveness guard. A Show/cohost
-adapter should start read-only; do not inherit Review mutation permissions.
+Preserve one bounded ordered sender, preroll/tail, immediate local Stop, no stale
+speech replay, complete already-received playback, separate confirmed spoken Stop,
+serialized authorized tools and mutation deduplication/readback. A button Stop
+needs no voice confirmation. Do not start a new conversation just to change a
+capability or recover transport; refresh authoritative product state and never
+replay an accepted write.
 
-A deliberate buffered source is different from transport reconnect replay. When a
-product must deliver one already-durable long recording as one logical Live turn,
-use the shared manual-activity session contract: enable
-`configuration.manual_activity_detection`, send `activity_start`, ordered PCM,
-then `activity_end`; do not substitute `audio_stream_end` or a product-local
-transport. Trusted product `on_event` observers receive the full provider
-transcription before the bounded polling/UI projection. A durable source sink must
-persist or durably enqueue that trusted event before returning; never reconstruct an
-archive from the 320-event ring or browser transcript preview.
+Deliberate durable recordings are distinct from reconnect replay: use manual
+activity_start -> ordered PCM -> activity_end. A trusted durable sink consumes
+full provider transcription before bounded UI projection; do not reconstruct an
+archive from the event ring. Interactive packet-loss recovery never replays old
+recordings automatically.
 
-Surface waits after 15s with elapsed mm:ss, truthful transport/provider stage,
-Stop, and explicit restart after 120s. Restart must not replay a pending mutation.
-Do not promise external provider latency or resumption success.
+Surface waits truthfully as transport, provider, resource or tool/action wait;
+after 15 seconds show elapsed time and immediate Stop. After 120 seconds allow
+explicit Stop/Start without replaying the pending command. Do not promise external
+provider latency. Routine diagnostics contain only bounded identifiers, timings,
+counts and codes, never credentials, raw media or full transcripts/tool payloads.
 
-Run shared Node/Python contracts and affected consumer regressions. For transport
-changes run real browser speech acceptance (10 turns plus product actions,
-context changes, Stop/restart, full playback and spoken confirmation), and long
-session/recovery checks where relevant. Keep receipts with exact source receipts and dependency
-versions, timings and provider failures. Unit tests and setup success are not Live
-acceptance. Use managed artifact storage where provided by the environment.
-
-Internet search via a separate lightweight model remains an unverified technical
-debt hypothesis. Do not implement or advertise it as available unless the user
-requests it and a real provider probe verifies capability.
+Verify Node/Python contracts, native mock-WebSocket contracts, affected consumer
+regressions and actual public TLS upgrade. Real voice acceptance needs consecutive
+audio turns, application read/write tools, search when requested, Stop/restart,
+full playback and result readback. Distinguish prepared PCM from a physical mic.
+Long-session/resumption checks and real provider receipts are required before
+claiming those properties; a unit test, setup handshake or APK build is not Live
+acceptance. Keep managed artifacts and exact source/dependency versions.
