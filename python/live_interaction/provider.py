@@ -188,6 +188,12 @@ def setup_config(model, context, history=None, *, configuration=None, search=Fal
         if not (search and application_search and str(item.get('name') or '') == application_search)
     ]
     generation = {'responseModalities': ['AUDIO'], 'speechConfig': {'voiceConfig': {'prebuiltVoiceConfig': {'voiceName': configuration.get('voice', 'Aoede')}}}}
+    media_resolution = configuration.get('media_resolution')
+    if media_resolution is not None:
+        allowed={'MEDIA_RESOLUTION_LOW','MEDIA_RESOLUTION_MEDIUM','MEDIA_RESOLUTION_HIGH','MEDIA_RESOLUTION_ULTRA_HIGH'}
+        if media_resolution not in allowed:
+            raise ValueError('Unsupported media_resolution')
+        generation['mediaResolution']={'level':media_resolution}
     if extended:
         generation['thinkingConfig'] = {'thinkingLevel': 'MEDIUM'}
     system = configuration.get('system_instruction', '')
