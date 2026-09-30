@@ -61,7 +61,11 @@ export function createLiveAudioSender({
     closed=true;clearTimeout(timer);timer=null;
     queue=[];preRoll=[];bytes=0;catchup=false;catchupSealed=false;
   };
-  const fail=error=>{report('transport_error',{error_code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)});stop();onError(error);};
+  const fail=error=>{
+    const transportMetrics=error?.metrics&&typeof error.metrics==='object'?error.metrics:{};
+    report('transport_error',{...transportMetrics,error_code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)});
+    stop();onError(error);
+  };
 
   async function pump(){
     if(closed||busy||!queue.length)return;

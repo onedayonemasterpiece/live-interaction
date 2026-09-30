@@ -16,7 +16,7 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current source release `0.3.3`). Release 0.3.3 keeps steady-state PCM byte/age bounds authoritative over render-quantum object count, retains a large fragmentation fuse, assigns stable sender failure codes, and reports safe output PCM/WebAudio playback facts for diagnostics. Release 0.3.2 keeps the
+Use versioned releases (current source release `0.3.4`). Release 0.3.4 paces browser WSS input by server audio acknowledgements, so a valid startup handoff cannot fill WebSocket.bufferedAmount faster than the relay accepts it. Socket backpressure errors carry bounded queue metrics. Release 0.3.3 keeps steady-state PCM byte/age bounds authoritative over render-quantum object count, retains a large fragmentation fuse, assigns stable sender failure codes, and reports safe output PCM/WebAudio playback facts for diagnostics. Release 0.3.2 keeps the
 20-second startup handoff byte-bounded while allowing the thousands of small
 AudioWorklet quanta a real browser can accumulate during provider setup; the
 fragment-count fuse remains bounded but no longer falsely reports network lag. Release 0.3.1 hardens the
