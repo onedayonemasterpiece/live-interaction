@@ -14,8 +14,11 @@ from websockets.exceptions import ConnectionClosed
 ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
 FRESH_HANDLE_WAIT_SECONDS = 8
-TRANSITION_DEADLINE_SECONDS = 25
+TRANSITION_DEADLINE_SECONDS = 95
 MAX_TRANSITION_CONNECTION_ATTEMPTS = 3
+MAX_TRANSITION_BUDGET_RETRIES = 30
+TRANSITION_BUDGET_RETRY_SECONDS = 3
+SEND_BUDGET_DEADLINE_SECONDS = 95
 MAX_HISTORY_TURNS = 8
 MAX_HISTORY_TEXT = 700
 
@@ -113,6 +116,41 @@ async def _guarded_send(ws, payload, resource_guard=None):
         _guard_check(resource_guard)
     await ws.send(json.dumps(payload))
     _guard_check(resource_guard)
+
+
+async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False, deadline_seconds=SEND_BUDGET_DEADLINE_SECONDS):
+    """Retry admission for one unsent control message; never rerun a product tool.
+
+    A frame is optional and can be dropped. Live PCM cannot safely wait behind a
+    rolling quota because the real-time queue would become stale, so it remains
+    fail-fast. Tool results and text are already durable/ordered before send.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + deadline_seconds
+    retries = 0
+    while True:
+        try:
+            await _guarded_send(ws, payload, resource_guard)
+            if retries:
+                state['drop_inputs_before'] = round(time.time() * 1000)
+                emit({'type':'resource_budget_ready','input_type':kind,'retries':retries})
+            return True
+        except Exception as exc:
+            if not (_is_resource_failure(exc) and getattr(exc,'code',None)=='RESOURCE_TOKEN_BUDGET'):
+                raise
+            if kind == 'snapshot' and optional:
+                emit({'type':'input_dropped','reason':'resource_budget','input_type':kind})
+                return False
+            if kind not in ('tool_response','text','audio_stream_end','activity_end','activity_start'):
+                raise
+            remaining = deadline - loop.time()
+            if remaining <= 0 or state['stopped'] or state['ws'] is not ws:
+                raise
+            retries += 1
+            state['drop_inputs_before'] = round(time.time() * 1000)
+            wait_seconds = min(remaining, max(.05, min(5, getattr(exc,'retry_after_ms',3000) / 1000 or 3)))
+            emit({'type':'resource_budget_wait','input_type':kind,'retry':retries,'wait_ms':round(wait_seconds*1000)})
+            await asyncio.sleep(wait_seconds)
 
 
 async def _guarded_recv(ws, resource_guard=None):
@@ -369,7 +407,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if kind in ('audio', 'audio_stream_end'):
                     max_stdin_delay_ms = max(max_stdin_delay_ms, max(0, started_ms - message.get('queued_at', started_ms)))
                     audio_chunks += int(kind == 'audio')
-                await _guarded_send(ws, payload, resource_guard)
+                sent = await _send_with_budget_wait(ws,payload,resource_guard,emit,kind,state,optional=message.get('optional') is True)
+                if not sent:
+                    continue
                 if kind == 'text':
                     dialogue.transcript('user', message.get('text'))
                     dialogue.complete()
@@ -461,6 +501,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                                 {'role':'user','parts':[{'text':continuation_text}]}
                             ], 'turnComplete': True}}, resource_guard)
                             emit({'type':'capability_continuation_sent','capability':transition['capability']})
+                        if transition.get('budget_retries'):
+                            state['drop_inputs_before'] = round(time.time() * 1000)
+                            emit({'type':'resource_budget_ready','input_type':'setup','retries':transition['budget_retries']})
                     else:
                         emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})
                     while not state['stopped']:
@@ -493,6 +536,25 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if state.get('resource_error') is not None:
                     raise state['resource_error']
                 if _is_resource_failure(exc):
+                    transition = state.get('transition')
+                    # A denied setup grant commits no tokens. During a tool-bundle
+                    # switch the previous socket is already closed, so wait for a
+                    # short rolling-budget refill within the existing deadline.
+                    if (transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
+                            and transition.get('budget_retries', 0) < MAX_TRANSITION_BUDGET_RETRIES
+                            and transition['deadline'] - loop.time() > TRANSITION_BUDGET_RETRY_SECONDS + 1):
+                        transition['budget_retries'] = transition.get('budget_retries', 0) + 1
+                        transition['attempts'] -= 1
+                        emit({'type': 'capability_budget_wait',
+                              'transition_id': transition['transition_id'],
+                              'capability': transition['capability'],
+                              'retry': transition['budget_retries'],
+                              'wait_ms': TRANSITION_BUDGET_RETRY_SECONDS * 1000})
+                        emit({'type':'resource_budget_wait','input_type':'setup',
+                              'retry':transition['budget_retries'],
+                              'wait_ms':TRANSITION_BUDGET_RETRY_SECONDS * 1000})
+                        await asyncio.sleep(TRANSITION_BUDGET_RETRY_SECONDS)
+                        continue
                     raise
                 wait = state.get('transition_wait')
                 if wait is not None:

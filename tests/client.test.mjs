@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createLiveClient} from '../browser/client.js';
+const originalAudioWorkletNode=globalThis.AudioWorkletNode;
+globalThis.AudioWorkletNode=class TestAudioWorkletNode {
+  constructor(){this.port={onmessage:null};globalThis.__liveTestWorklets?.push?.(this);}
+  connect(){return this;}disconnect(){}
+};
+
 const decodedInput=options=>options.headers?.['content-type']==='application/octet-stream'
   ?{pcm:new Uint8Array(options.body)}:JSON.parse(options.body);
 const tick=()=>new Promise(r=>setImmediate(r));
@@ -28,6 +34,79 @@ test('Stop while getUserMedia is pending leaves no live track after late permiss
   if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
  }
 });
+test('terminal provider error releases the active browser microphone before closed poll flag',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let releaseEvents,stopCalls=0;const states=[];
+ const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+ class FakeNode{connect(){}disconnect(){}}
+ class FakeContext{sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track]})}},configurable:true});
+ globalThis.AudioContext=FakeContext;
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:s=>states.push(s)});
+ try{
+  await client.start({url:'/live'});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  assert.equal(track.readyState,'live');
+  releaseEvents({events:[{seq:1,type:'error',code:'RESOURCE_TOKEN_BUDGET',message:'Live capability transition failed'}],cursor:1,closed:false});
+  for(let i=0;i<30&&track.readyState==='live';i++)await tick();
+  assert.equal(track.readyState,'ended');assert.equal(stopCalls,1);
+  assert.equal(client.sessionId,null);assert.equal(states.at(-1),'off');
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
+test('capability resume reuses the active microphone and Stop ends its only track',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let releaseEvents,getUserMediaCalls=0,stopCalls=0;
+ const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+ class FakeNode{connect(){}disconnect(){}}
+ class FakeContext{sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return {getTracks:()=>[track]};}}},configurable:true});
+ globalThis.AudioContext=FakeContext;
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true})});
+ try{
+  await client.start({url:'/live'});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  assert.equal(getUserMediaCalls,1);
+  releaseEvents({events:[{seq:1,type:'resumed',capability:'slide_edit'}],cursor:1,closed:false});
+  for(let i=0;i<30;i++)await tick();
+  assert.equal(getUserMediaCalls,1,'a capability switch must not orphan the existing stream');
+  client.stop();assert.equal(stopCalls,1);assert.equal(track.readyState,'ended');
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
+test('rolling budget wait pauses capture and resumes the same Live session',async()=>{
+ const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+ let releaseEvents,getUserMediaCalls=0;const tracks=[],states=[],notices=[];
+ class FakeNode{connect(){}disconnect(){}}
+ class FakeContext{sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
+ Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;const track={readyState:'live',stop(){this.readyState='ended';}};tracks.push(track);return {getTracks:()=>[track]};}}},configurable:true});
+ globalThis.AudioContext=FakeContext;
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:s=>states.push(s),onNotice:s=>notices.push(s)});
+ try{
+  await client.start({url:'/live'});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  releaseEvents({events:[{seq:1,type:'resource_budget_wait',input_type:'tool_response',retry:1,wait_ms:3000}],cursor:1,closed:false});
+  for(let i=0;i<30&&tracks[0].readyState==='live';i++)await tick();
+  assert.equal(tracks[0].readyState,'ended');assert.equal(client.sessionId,'one');
+  assert.ok(states.includes('budget_wait'));assert.deepEqual(notices,['resource_budget_wait']);
+  await new Promise(resolve=>setTimeout(resolve,180));
+  releaseEvents({events:[{seq:2,type:'resource_budget_ready',input_type:'tool_response',retries:1}],cursor:2,closed:false});
+  for(let i=0;i<30&&getUserMediaCalls<2;i++)await tick();
+  assert.equal(getUserMediaCalls,2);assert.equal(tracks[1].readyState,'live');
+  assert.equal(client.sessionId,'one');assert.ok(states.includes('budget_ready'));
+  client.stop();assert.equal(tracks[1].readyState,'ended');
+ }finally{
+  client.stop();
+  if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
 test('browser sends PCM as binary and reports HTTP versus server receive-to-ack time',async()=>{
   const requests=[],timings=[];let releaseEvents;
   const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{
@@ -48,7 +127,7 @@ test('short first provider audio chunk is buffered until following audio can pla
  const originalAudio=globalThis.AudioContext,starts=[],created=performance.now();
  let releasePoll,polls=0;
  class FakeAudioContext{
-  state='running';destination={};
+  state='running';destination={};audioWorklet={addModule:async()=>{}};
   get currentTime(){return (performance.now()-created)/1000;}
   createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
   createBufferSource(){const context=this;return {buffer:null,onended:null,connect(){},disconnect(){},start(at){starts.push({at,receivedAt:context.currentTime,duration:this.buffer.duration});},stop(){}};}
@@ -105,21 +184,20 @@ test('an Extended tool wait survives intermediate turnComplete and clears on IDL
 
 test('captureDuringStart preserves speech spoken while the Live session is still being created',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
-  let getUserMediaCalls=0,stopCalls=0,releaseStart;const processors=[],contexts=[],inputs=[];
+  let getUserMediaCalls=0,stopCalls=0,releaseStart;const processors=[],contexts=[],inputs=[];globalThis.__liveTestWorklets=processors;
   const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
   const liveStream={getTracks:()=>[track]};
   class FakeNode{connect(){return this;}disconnect(){}}
   class FakeProcessor extends FakeNode{onaudioprocess=null;}
   class FakeContext{
-    sampleRate=48000;state='running';destination={};
+    sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};
     constructor(){contexts.push(this);}
     createMediaStreamSource(stream){assert.equal(stream,liveStream);return new FakeNode();}
     createScriptProcessor(){const p=new FakeProcessor();processors.push(p);return p;}
     async resume(){}
     async close(){this.state='closed';}
   }
-  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return liveStream;}}},configurable:true});
-  globalThis.AudioContext=FakeContext;
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{getUserMediaCalls++;return liveStream;}}},configurable:true});  globalThis.AudioContext=FakeContext;
   const client=createLiveClient({binaryAudio:true,request:async(url,options={})=>{
     if(url==='/live')return new Promise(resolve=>releaseStart=resolve);
     if(url==='/live/one/input'){inputs.push(decodedInput(options));return {ok:true};}
@@ -133,14 +211,14 @@ test('captureDuringStart preserves speech spoken while the Live session is still
     assert.equal(getUserMediaCalls,1,'microphone capture starts before session creation resolves');
     assert.equal(processors.length,1);
     const chunk=new Float32Array(4096).fill(.2);
-    for(let i=0;i<4;i++)processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>chunk}});
+    for(let i=0;i<4;i++)processors[0].port.onmessage({data:chunk});
     releaseStart({session_id:'one',model:'gemini-3.8-live'});
     const started=await starting;assert.equal(started.session_id,'one');
     assert.equal(getUserMediaCalls,1,'the startup capture stream is reused after session creation');
     for(let i=0;i<30&&!inputs.some(item=>item.pcm);i++)await new Promise(r=>setTimeout(r,10));
     assert.ok(inputs.some(item=>item.pcm?.byteLength>100),'buffered startup speech reaches Live as binary PCM');
-    assert.equal(contexts[0].state,'closed','temporary startup AudioContext is retired after handoff');
-    client.stop();assert.equal(stopCalls,1);assert.equal(track.readyState,'ended');
+    assert.equal(contexts[0].state,'running','startup AudioWorklet context is handed off instead of reopening the microphone');
+    client.stop();assert.equal(contexts[0].state,'closed');assert.equal(stopCalls,1);assert.equal(track.readyState,'ended');
   }finally{
     if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
     if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
@@ -155,7 +233,7 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
   class FakeNode{connect(){return this;}disconnect(){}}
   class FakeProcessor extends FakeNode{onaudioprocess=null;}
   class FakeContext{
-    sampleRate=48000;state='running';destination={};
+    sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(stream){assert.equal(stream,handedStream);return new FakeNode();}
     createScriptProcessor(){return new FakeProcessor();}
     async resume(){}
@@ -230,7 +308,7 @@ test('text-only start does not request microphone and microphone can be enabled 
   class FakeNode{connect(){return this;}disconnect(){}}
   class FakeProcessor extends FakeNode{onaudioprocess=null;}
   class FakeContext{
-    sampleRate=48000;state='running';destination={};
+    sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(stream){assert.equal(stream,liveStream);return new FakeNode();}
     createScriptProcessor(){return new FakeProcessor();}
     async resume(){}
@@ -262,12 +340,12 @@ test('text-only start does not request microphone and microphone can be enabled 
 
 test('createLiveClient persists accepted microphone PCM before HTTP transport',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
-  const processors=[];let releasePersist;const order=[];
+  const processors=[];globalThis.__liveTestWorklets=processors;let releasePersist;const order=[];
   const track={stop(){}},stream={getTracks:()=>[track]};
   class Node{connect(){return this;}disconnect(){}}
   class Processor extends Node{onaudioprocess=null;}
   class Context{
-    sampleRate=16000;state='running';destination={};
+    sampleRate=16000;state='running';destination={};audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(){return new Node();}
     createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
     async resume(){}
@@ -292,7 +370,7 @@ test('createLiveClient persists accepted microphone PCM before HTTP transport',a
   try{
     await client.start({url:'/live'});
     const speech=new Float32Array(1600).fill(.2);
-    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    processors[0].port.onmessage({data:speech});
     for(let i=0;i<20&&!releasePersist;i++)await tick();
     assert.deepEqual(order,['persist_pcm']);
     releasePersist();

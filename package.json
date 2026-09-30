@@ -1,12 +1,13 @@
 {
   "name": "@onedayonemasterpiece/live-interaction",
-  "version": "0.2.14",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Shared browser audio lifecycle and Gemini Live transport with application adapters",
   "exports": {
     "./browser": "./browser/client.js",
     "./node": "./node/sessions.mjs",
+    "./websocket": "./node/websocket.mjs",
     "./assets": "./node/assets.mjs",
     "./package.json": "./package.json"
   },

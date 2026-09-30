@@ -1,4 +1,4 @@
-import {createHash,randomUUID} from 'node:crypto';
+import {createHash,randomBytes,randomUUID,timingSafeEqual} from 'node:crypto';
 export const LIVE_SESSION_MODELS=Object.freeze(['gemini-3.8-live','gemini-3.8-live-extended-thinking']);
 export class LiveError extends Error {constructor(code,message){super(message);this.code=code;}}
 const TOOL_PARTS=Symbol('live_tool_response_parts');
@@ -34,13 +34,14 @@ const validateCapabilitySpec=(spec,DomainError)=>{
 };
 
 // The host owns transport, ordering, capability transitions and event cursors; adapters own domain policy.
-export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=30000,maxSessions=2}={}){
+export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_SESSION_MODELS,ErrorClass=LiveError,readyTimeoutMs=30000,reconfigureTimeoutMs=105000,maxSessions=2}={}){
   const DomainError=ErrorClass,sessions=new Map();
   let adapter;
   const emit=(session,event)=>{
     const observed={seq:session.nextSeq++,at:new Date().toISOString(),...event};
     session.events.push(observed);
     while(session.events.length>320)session.events.shift();
+    for(const listener of session.subscribers??[])try{listener(observed);}catch{}
     try{adapter?.onEvent?.(session,observed);}catch{}
   };
   const timing=(session,stage,started)=>emit(session,{type:'timing',stage,duration_ms:Date.now()-started});
@@ -145,6 +146,12 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
   const handleToolCalls=async(session,calls)=>{
     calls=Array.isArray(calls)?calls:[];
     if(!calls.length||session.closed)return;
+    if(session.inputDamaged){
+      const responses=calls.map(call=>({name:call?.name??'unknown',id:call?.id,response:{error:{code:'LIVE_INPUT_DAMAGED',message:'The preceding speech was interrupted by transport loss; ask the user to repeat the request.'}}}));
+      for(const call of calls)emit(session,{type:'tool_result',name:call?.name,id:call?.id,status:'error',code:'LIVE_INPUT_DAMAGED'});
+      sendToolResponses(session,responses);
+      return;
+    }
     if(calls.length===1&&calls[0]?.id&&session.toolResults.has(calls[0].id)){
       const call=calls[0],result=session.toolResults.get(call.id);
       sendToolResponses(session,[functionResponse(call,result)]);
@@ -191,16 +198,24 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     sendToolResponses(session,responses);
   };
   adapter=adapterFactory({emit,write,measure,timing});
-  const start=async({resourceId,actor,model=models[0],history=[],...args}={})=>{
+  const ticketDigest=value=>createHash('sha256').update(value).digest();
+  const issueTicketForSession=session=>{
+    const ticket=randomBytes(32).toString('base64url');
+    session.socketTicketHash=ticketDigest(ticket);session.socketTicketExpiresAt=Date.now()+15000;session.socketTicketUsed=false;
+    return ticket;
+  };
+  const start=async({resourceId,actor,model=models[0],history=[],attemptId=null,...args}={})=>{
     if(typeof resourceId!=='string'||!resourceId||resourceId.length>240)throw new DomainError('INVALID_ARGUMENT','resourceId is required');
     if(!models.includes(model))throw new DomainError('INVALID_INPUT','Unknown Live model');
+    if(attemptId!==null&&(typeof attemptId!=='string'||!/^attempt_[A-Za-z0-9_-]{8,80}$/.test(attemptId)))throw new DomainError('INVALID_ARGUMENT','Live attempt id is invalid');
     if(sessions.size>=maxSessions)throw new DomainError('LIVE_BUSY','Live session limit reached');
     const initialized=adapter.initialize({resourceId,actor,model,...args});
     const id=`live_${randomUUID().replaceAll('-','')}`;
     const child=createWorker({model,actor,resourceId});
     const initialMeta=configurationMeta(initialized.configuration??{});
-    const session={...initialized.state,id,resourceId,actor,model,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map(),
+    const session={...initialized.state,id,resourceId,actor,model,attemptId,child,events:[],nextSeq:1,buffer:'',closed:false,toolChain:Promise.resolve(),cancelled:new Set(),toolResults:new Map(),subscribers:new Set(),
       audioTurnGeneration:0,audioTurnOpen:false,audioEndSentGeneration:0,audioEndAwaitingAck:[],audioEndWaiters:new Set(),
+      inputDamaged:false,damageRecoveryGeneration:0,connectionGeneration:0,socketTicketHash:null,socketTicketExpiresAt:0,socketTicketUsed:false,
       capability:initialized.capability??initialized.state?.capability??'core',configurationDigest:initialMeta.configuration_digest,pendingTransition:null};
     sessions.set(id,session);
     let readyResolve,readyReject;
@@ -232,6 +247,10 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       if(event.type==='input_timing'&&event.audio_stream_end_sent_at){
         const generation=session.audioEndAwaitingAck.shift();
         if(generation)session.audioEndSentGeneration=Math.max(session.audioEndSentGeneration,generation);
+        if(generation&&session.inputDamaged&&session.damageRecoveryGeneration&&generation>=session.damageRecoveryGeneration){
+          session.inputDamaged=false;session.damageRecoveryGeneration=0;
+          emit(session,{type:'transport_recovered',audio_turn_generation:generation});
+        }
         settleAudioEndWaiters(session);
       }
       if(event.type==='resumed'){adapter.onResumed?.(session);}
@@ -267,21 +286,26 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     adapter.onStarted?.(session);
     emit(session,{type:'configuration_ready',capability:session.capability,
       configuration_digest:session.configurationDigest,function_count:initialMeta.function_count,schema_bytes:initialMeta.schema_bytes});
-    return {session_id:id,model,capability:session.capability,configuration_digest:session.configurationDigest,...initialized.response};
+    const socketTicket=issueTicketForSession(session);
+    return {session_id:id,model,capability:session.capability,configuration_digest:session.configurationDigest,attempt_id:attemptId,transport_protocol:'wl-live-v1',socket_ticket:socketTicket,...initialized.response};
   };
   const getSession=(sessionId,resourceId,actor)=>{
     const session=sessions.get(sessionId);    if(!session||session.resourceId!==resourceId)throw new DomainError('LIVE_SESSION_NOT_FOUND','Live-сессия не найдена');
     if(actor&&(actor.subject!==session.actor?.subject||actor.tenant_id!==session.actor?.tenant_id))throw new DomainError('FORBIDDEN','Live-сессия принадлежит другому пользователю');
     return session;
   };
-  const input=({sessionId,resourceId,message,receivedAt=Date.now(),actor}={})=>{
+  const input=({sessionId,resourceId,message,receivedAt=Date.now(),actor,frameSeq=null,captureAgeMs=null,connectionGeneration=null}={})=>{
     let writtenAt=null;
     const session=getSession(sessionId,resourceId,actor);
     adapter.input?.(session,message);
     if(message?.audio_base64!==undefined){
       if(typeof message.audio_base64!=='string'||message.audio_base64.length>16000)throw new DomainError('INVALID_ARGUMENT','Audio chunk is invalid');
       writtenAt=write(session,{type:'audio',data:message.audio_base64});
-      if(!session.audioTurnOpen){session.audioTurnGeneration++;session.audioTurnOpen=true;}
+      if(!session.audioTurnOpen){
+        session.audioTurnGeneration++;session.audioTurnOpen=true;
+        if(session.inputDamaged&&!session.damageRecoveryGeneration)session.damageRecoveryGeneration=session.audioTurnGeneration;
+      }
+      if(Number.isInteger(frameSeq)&&frameSeq>0&&frameSeq%10===0)emit(session,{type:'browser_audio_progress',frame_seq:frameSeq,capture_age_ms:Number.isFinite(captureAgeMs)?Math.round(captureAgeMs):null,connection_generation:Number.isInteger(connectionGeneration)?connectionGeneration:null,worker_stdin_delay_ms:writtenAt?Math.max(0,writtenAt-receivedAt):null});
     }
     if(message?.audio_stream_end){
       write(session,{type:'audio_stream_end'});
@@ -292,6 +316,34 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       write(session,{type:'text',text:message.text.trim()});
     }
     return {ok:true,session_id:session.id,timing:{received_at:receivedAt,worker_stdin_at:writtenAt,handled_at:Date.now()}};
+  };
+  const issueSocketTicket=({sessionId,resourceId,actor}={})=>{
+    const session=getSession(sessionId,resourceId,actor);
+    return {socket_ticket:issueTicketForSession(session),transport_protocol:'wl-live-v1',expires_in_ms:15000,attempt_id:session.attemptId};
+  };
+  const openSocket=({sessionId,ticket}={})=>{
+    const session=sessions.get(sessionId);
+    if(!session)throw new DomainError('LIVE_SESSION_NOT_FOUND','Live-сессия не найдена');
+    if(typeof ticket!=='string'||!session.socketTicketHash||session.socketTicketUsed||Date.now()>session.socketTicketExpiresAt)throw new DomainError('LIVE_SOCKET_TICKET','Live socket ticket expired or already used');
+    const actual=ticketDigest(ticket),expected=session.socketTicketHash;
+    if(actual.length!==expected.length||!timingSafeEqual(actual,expected))throw new DomainError('LIVE_SOCKET_TICKET','Live socket ticket is invalid');
+    session.socketTicketUsed=true;session.socketTicketHash=null;
+    return {
+      attemptId:session.attemptId,
+      subscribe(listener){session.subscribers.add(listener);return()=>session.subscribers.delete(listener);},
+      events(after=0){return events({sessionId:session.id,resourceId:session.resourceId,after,actor:session.actor});},
+      input(message,meta={}){return input({sessionId:session.id,resourceId:session.resourceId,message,receivedAt:meta.receivedAt??Date.now(),actor:session.actor,frameSeq:meta.frame_seq,captureAgeMs:meta.capture_age_ms,connectionGeneration:meta.connection_generation});},
+      transportConnected(meta={}){session.connectionGeneration=Number(meta.connection_generation)||session.connectionGeneration+1;emit(session,{type:'transport_connected',transport:'wss',connection_generation:session.connectionGeneration});},
+      transportGap(meta={}){
+        emit(session,{type:'transport_gap',transport:'wss',connection_generation:Number(meta.connection_generation)||session.connectionGeneration,reason:String(meta.reason??'socket_closed').slice(0,80),audio_turn_open:session.audioTurnOpen});
+        if(session.audioTurnOpen&&!session.closed){
+          try{write(session,{type:'audio_stream_end'});}catch{}
+          session.audioEndAwaitingAck.push(session.audioTurnGeneration);session.audioTurnOpen=false;session.inputDamaged=true;session.damageRecoveryGeneration=0;
+        }
+      },
+      stop(){return stop({sessionId:session.id,resourceId:session.resourceId,actor:session.actor});},
+      close(){}
+    };
   };
   const events=({sessionId,resourceId,after=0,actor}={})=>{
     const session=getSession(sessionId,resourceId,actor);
@@ -309,5 +361,5 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     return {ok:true,session_id:session.id};
   };
   const stopAll=async()=>{await Promise.allSettled([...sessions.values()].map(session=>stop({sessionId:session.id,resourceId:session.resourceId})));};
-  return {start,input,events,stop,stopAll,size:()=>sessions.size};
+  return {start,input,events,issueSocketTicket,openSocket,stop,stopAll,size:()=>sessions.size};
 }

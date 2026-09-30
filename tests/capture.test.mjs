@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createMicrophoneCapture,createDurableMicrophoneCapture} from '../browser/capture.js';
+const originalAudioWorkletNode=globalThis.AudioWorkletNode;
+globalThis.AudioWorkletNode=class TestAudioWorkletNode {
+  constructor(){this.port={onmessage:null};globalThis.__liveTestWorklets?.push?.(this);}
+  connect(){return this;}disconnect(){}
+};
+
 
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 
@@ -28,13 +34,13 @@ test('Stop closes a microphone granted after the permission request was cancelle
 
 test('shared microphone capture owns getUserMedia, resampling and ordered frame delivery',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
-  const processors=[];let getUserMediaCalls=0,stops=0;
+  const processors=[];globalThis.__liveTestWorklets=processors;let getUserMediaCalls=0,stops=0;
   const track={stop(){stops++;}};
   const stream={getTracks:()=>[track]};
   class Node{connect(){return this;}disconnect(){}}
   class Processor extends Node{onaudioprocess=null;}
   class Context{
-    sampleRate=48000;destination={};state='running';
+    sampleRate=48000;destination={};state='running';audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(value){assert.equal(value,stream);return new Node();}
     createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
     async resume(){}
@@ -47,7 +53,7 @@ test('shared microphone capture owns getUserMedia, resampling and ordered frame 
   try{
     assert.equal(await capture.start(),true);
     const samples=new Float32Array(4096).fill(.25);
-    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>samples}});
+    processors[0].port.onmessage({data:samples});
     await capture.drain();
     assert.equal(getUserMediaCalls,1);
     assert.equal(frames.length,1);
@@ -63,12 +69,12 @@ test('shared microphone capture owns getUserMedia, resampling and ordered frame 
 
 test('offline durable capture uses shared VAD/sender and seals after microphone drain',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
-  const processors=[];let stops=0;
+  const processors=[];globalThis.__liveTestWorklets=processors;let stops=0;
   const track={stop(){stops++;}},stream={getTracks:()=>[track]};
   class Node{connect(){return this;}disconnect(){}}
   class Processor extends Node{onaudioprocess=null;}
   class Context{
-    sampleRate=16000;destination={};state='running';
+    sampleRate=16000;destination={};state='running';audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(){return new Node();}
     createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
     async resume(){}
@@ -81,7 +87,7 @@ test('offline durable capture uses shared VAD/sender and seals after microphone 
   try{
     await capture.start();
     const speech=new Float32Array(1600).fill(.2);
-    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    processors[0].port.onmessage({data:speech});
     await tick();
     await capture.stop();
     assert.equal(stops,1);
@@ -95,12 +101,12 @@ test('offline durable capture uses shared VAD/sender and seals after microphone 
 
 test('offline durable capture stops microphone immediately when persistence fails',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
-  const processors=[];let stops=0,seenError=null;
+  const processors=[];globalThis.__liveTestWorklets=processors;let stops=0,seenError=null;
   const track={stop(){stops++;}},stream={getTracks:()=>[track]};
   class Node{connect(){return this;}disconnect(){}}
   class Processor extends Node{onaudioprocess=null;}
   class Context{
-    sampleRate=16000;destination={};state='running';
+    sampleRate=16000;destination={};state='running';audioWorklet={addModule:async()=>{}};
     createMediaStreamSource(){return new Node();}
     createScriptProcessor(){const p=new Processor();processors.push(p);return p;}
     async resume(){}
@@ -116,7 +122,7 @@ test('offline durable capture stops microphone immediately when persistence fail
   try{
     await capture.start();
     const speech=new Float32Array(1600).fill(.2);
-    processors[0].onaudioprocess({inputBuffer:{getChannelData:()=>speech}});
+    processors[0].port.onmessage({data:speech});
     for(let i=0;i<20&&!seenError;i++)await tick();
     assert.match(seenError.message,/idb unavailable/);
     assert.equal(capture.running,false);

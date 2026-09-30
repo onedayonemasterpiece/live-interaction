@@ -8,9 +8,9 @@ export function createLiveAudioSender({
   onTiming=()=>{},
   onError=()=>{},
   now=()=>performance.now(),
-  batchMs=256,
-  maxQueueMs=2500,
-  maxAgeMs=3500,
+  batchMs=80,
+  maxQueueMs=1500,
+  maxAgeMs=2500,
   maxBootstrapMs=20000,
   persist=null
 }={}){
@@ -74,7 +74,7 @@ export function createLiveAudioSender({
     busy=true;const at=now();
     report('post_start',{capture_at_ms:first.at,batch_chunks:parts.length,pcm_bytes:size,queue_age_ms:at-first.at,stream_end:Boolean(first.end)});
     try{
-      await send(first.end?{audio_stream_end:true}:{pcm});
+      await send(first.end?{audio_stream_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}:{pcm,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)});
       report('post_end',{duration_ms:now()-at,pcm_bytes:size});
     }catch(error){
       if(!closed)fail(error);

@@ -6,6 +6,7 @@ from live_interaction.provider import (
     DialogueHistory,
     _guarded_recv,
     _guarded_send,
+    _send_with_budget_wait,
     _is_resource_failure,
     handle_server_message,
     run,
@@ -188,6 +189,52 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_transition_retries_denied_setup_grant_before_aborting(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live',
+            'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+        class ClosingAfterAck(_FakeSocket):
+            async def send(self,payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    self.incoming.put_nowait(self._CLOSED)
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+        class Guard(_Guard):
+            setup_attempts=0
+            async def before_send(self,payload):
+                if 'setup' in payload:
+                    self.setup_attempts += 1
+                    if self.setup_attempts == 2:raise BudgetFailure('denied')
+                self.payloads.append(payload)
+        first=ClosingAfterAck([{'setupComplete':{}}])
+        denied=_FakeSocket([])
+        resumed=_FakeSocket([{'setupComplete':{}}])
+        sockets=[first,denied,resumed];events=[]
+        with patch('websockets.connect',side_effect=lambda *_args,**_kwargs:sockets.pop(0)), \
+             patch('live_interaction.provider.FRESH_HANDLE_WAIT_SECONDS',.01), \
+             patch('live_interaction.provider.TRANSITION_BUDGET_RETRY_SECONDS',.01):
+            task=asyncio.create_task(run(reader=reader,on_event=events.append,resource_guard=Guard()))
+            for _ in range(100):
+                if any(e.get('type')=='ready' for e in events):break
+                await asyncio.sleep(.001)
+            reader.feed({'type':'reconfigure','transition_id':'tr-budget','capability':'slide_edit',
+                'configuration':{'system_instruction':'edit','functions':[{'name':'prepare_slide_change'}]},
+                'continuation':'add one item',
+                'router_response':{'name':'activate_capability','id':'route-budget',
+                    'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+            for _ in range(300):
+                if any(e.get('type')=='capability_ready' for e in events):break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='capability_budget_wait' and e.get('retry')==1 for e in events))
+            self.assertTrue(any(e.get('type')=='resource_budget_wait' and e.get('input_type')=='setup' for e in events))
+            self.assertTrue(any(e.get('type')=='resource_budget_ready' and e.get('input_type')=='setup' for e in events))
+            self.assertTrue(any(e.get('type')=='capability_ready' and e.get('capability')=='slide_edit' for e in events))
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            self.assertEqual(len(sockets),0)
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
     async def test_delayed_setup_cannot_emit_late_ready_after_transition_deadline(self):
         reader=_QueueReader()
         reader.feed({'type':'start','model':'gemini-3.8-live',
@@ -465,6 +512,40 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,1)
 
 class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_frame_budget_denial_does_not_close_session(self):
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+        class Guard(_Guard):
+            async def before_send(self,payload):
+                raise BudgetFailure('denied')
+        ws=_Ws();events=[];state={'stopped':False,'ws':ws,'drop_inputs_before':0}
+        sent=await _send_with_budget_wait(ws,{'realtimeInput':{'video':{'data':'AAAA'}}},Guard(),events.append,'snapshot',state,optional=True)
+        self.assertFalse(sent)
+        self.assertEqual(ws.sent,[])
+        self.assertEqual(events,[{'type':'input_dropped','reason':'resource_budget','input_type':'snapshot'}])
+        with self.assertRaises(BudgetFailure):
+            await _send_with_budget_wait(ws,{'realtimeInput':{'video':{'data':'AAAA'}}},Guard(),events.append,'snapshot',state)
+
+    async def test_tool_result_waits_for_grant_without_rerunning_tool(self):
+        class BudgetFailure(_ResourceFailure):
+            code='RESOURCE_TOKEN_BUDGET'
+            retry_after_ms=1
+        class Guard(_Guard):
+            attempts=0
+            async def before_send(self,payload):
+                self.attempts+=1
+                if self.attempts==1:raise BudgetFailure('denied')
+                self.payloads.append(payload)
+        guard=Guard();ws=_Ws();events=[];state={'stopped':False,'ws':ws,'drop_inputs_before':0}
+        payload={'toolResponse':{'functionResponses':[{'name':'apply','id':'one','response':{'result':{'revision':19}}}]}}
+        sent=await _send_with_budget_wait(ws,payload,guard,events.append,'tool_response',state,deadline_seconds=1)
+        self.assertTrue(sent)
+        self.assertEqual(guard.attempts,2)
+        self.assertEqual(len(ws.sent),1)
+        self.assertEqual(json.loads(ws.sent[0]),payload)
+        self.assertEqual([e['type'] for e in events],['resource_budget_wait','resource_budget_ready'])
+        self.assertGreater(state['drop_inputs_before'],0)
+
     async def test_guarded_send_charges_before_provider_write(self):
         guard = _Guard()
         ws = _Ws()

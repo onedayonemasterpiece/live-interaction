@@ -287,6 +287,19 @@ For Gemini Live:
 - preserve playback through provider closure when appropriate;
 - never replay captured speech or mutations on recovery.
 
+Context compression and resumption solve context/connection lifetime, not a
+rolling token-admission refusal. When the resource authority returns
+`RESOURCE_TOKEN_BUDGET`, keep the same lease and key. An optional visual frame
+may be dropped without ending the conversation. For a required, already
+constructed text or tool response, wait within a bounded deadline and retry
+the **same unsent provider message** after the authority's retry interval;
+never invoke the product tool or mutation again. Pause browser capture during
+this wait, discard speech captured before recovery, and resume capture only
+after admission succeeds. Show the wait and keep Stop immediate. Realtime PCM
+cannot wait behind a minute-scale quota without losing its timing: if its
+grant is denied, stop visibly rather than replaying stale audio. A bounded
+wait that expires remains a truthful resource error, not a silent restart.
+
 The framework owns provider transport mechanics. Consumers own the semantic
 decision to stay active, pause, yield or stop.
 

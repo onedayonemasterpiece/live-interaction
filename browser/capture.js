@@ -2,13 +2,28 @@ import {createLiveAudioSender} from './live-audio.js';
 
 export const microphoneConstraints={audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false};
 
-export function pcm16(samples,fromRate){
-  const ratio=fromRate/16000,count=Math.max(1,Math.floor(samples.length/ratio)),out=new Int16Array(count);
-  for(let i=0;i<count;i++){
-    const value=Math.max(-1,Math.min(1,samples[Math.min(samples.length-1,Math.floor(i*ratio))]));
-    out[i]=value<0?value*32768:value*32767;
+export function createPcm16Resampler(fromRate,targetRate=16000){
+  if(!Number.isFinite(fromRate)||fromRate<=0||!Number.isFinite(targetRate)||targetRate<=0)throw new TypeError('Invalid sample rate');
+  const ratio=fromRate/targetRate;
+  let totalInput=0,nextSourcePosition=0,outputSamples=0;
+  function push(samples){
+    if(!(samples instanceof Float32Array))samples=new Float32Array(samples??[]);
+    const start=totalInput,end=start+samples.length,values=[];
+    while(nextSourcePosition<end&&samples.length){
+      const local=Math.max(0,Math.min(samples.length-1,Math.floor(nextSourcePosition-start)));
+      const value=Math.max(-1,Math.min(1,samples[local]));
+      values.push(value<0?Math.round(value*32768):Math.round(value*32767));
+      nextSourcePosition+=ratio;
+    }
+    totalInput=end;outputSamples+=values.length;
+    return Int16Array.from(values);
   }
-  return out;
+  function reset(){totalInput=0;nextSourcePosition=0;outputSamples=0;}
+  return {push,reset,get inputSamples(){return totalInput;},get outputSamples(){return outputSamples;}};
+}
+
+export function pcm16(samples,fromRate){
+  return createPcm16Resampler(fromRate).push(samples);
 }
 
 export function frameRms(samples){
@@ -18,18 +33,21 @@ export function frameRms(samples){
 }
 
 export function createMicrophoneCapture({
-  onFrame=()=>{},
+  onFrame:initialOnFrame=()=>{},
   onTiming=()=>{},
   onError=()=>{},
   now=()=>globalThis.performance?.now?.()??Date.now(),
   maxPendingFrames=32,
+  workletUrl=new URL('./capture-worklet.js',import.meta.url),
+  WorkletNode=globalThis.AudioWorkletNode,
 }={}){
-  let stream=null,context=null,inputSource=null,processor=null,running=false,failed=false,pending=0,generation=0;
-  let chain=Promise.resolve();
+  let stream=null,context=null,inputSource=null,processor=null,running=false,failed=false,pending=0,generation=0,resampler=null;
+  let frameHandler=initialOnFrame,chain=Promise.resolve();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
 
   function closeHardware(stopTracks=true){
-    if(processor)processor.onaudioprocess=null;
+    if(processor?.port)processor.port.onmessage=null;
+    else if(processor)processor.onaudioprocess=null;
     try{processor?.disconnect();inputSource?.disconnect();}catch{}
     if(stopTracks)for(const track of stream?.getTracks?.()??[])track.stop();
     const old=context;
@@ -57,13 +75,23 @@ export function createMicrophoneCapture({
       for(const track of captured.getTracks?.()??[])track.stop();
       const error=new Error('AudioContext unavailable');error.code='MICROPHONE_UNAVAILABLE';throw error;
     }
-    stream=captured;context=new Context();inputSource=context.createMediaStreamSource(stream);processor=context.createScriptProcessor(4096,1,1);
+    stream=captured;context=new Context();
+    const startedContext=context;
+    if(!context.audioWorklet?.addModule||typeof WorkletNode!=='function'){
+      closeHardware(true);
+      const error=new Error('AudioWorklet unavailable');error.code='AUDIO_WORKLET_UNAVAILABLE';throw error;
+    }
+    await context.audioWorklet.addModule(String(workletUrl));
+    if(epoch!==generation){closeHardware(true);return false;}
+    inputSource=context.createMediaStreamSource(stream);
+    processor=new WorkletNode(context,'live-microphone-capture-v1',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+    resampler=createPcm16Resampler(context.sampleRate);
     running=true;
-    processor.onaudioprocess=event=>{
+    processor.port.onmessage=event=>{
       if(!running)return;
-      const source=event.inputBuffer.getChannelData(0);
-      const samples=new Float32Array(source);
-      const pcm=pcm16(samples,context.sampleRate),rms=frameRms(samples),capturedAt=now();
+      const samples=event.data instanceof Float32Array?event.data:new Float32Array(event.data??[]);
+      const pcm=resampler.push(samples),rms=frameRms(samples),capturedAt=now();
+      if(!pcm.length)return;
       pending++;
       if(pending>maxPendingFrames){
         pending--;
@@ -71,19 +99,21 @@ export function createMicrophoneCapture({
         error.code='MICROPHONE_CAPTURE_BACKPRESSURE';
         fail(error);return;
       }
-      chain=chain.then(()=>onFrame(pcm,rms,{capture_at_ms:capturedAt,sample_rate:16000}))
+      chain=chain.then(()=>frameHandler(pcm,rms,{capture_at_ms:capturedAt,sample_rate:16000,input_sample_rate:context?.sampleRate??0}))
         .catch(error=>fail(error))
         .finally(()=>{pending=Math.max(0,pending-1);});
     };
     inputSource.connect(processor);processor.connect(context.destination);
-    const startedContext=context;
     await startedContext.resume().catch(()=>{});
     if(epoch!==generation){
       if(stream===captured)closeHardware();
       else{for(const track of captured.getTracks?.()??[])track.stop();void startedContext.close().catch(()=>{});}
       return false;
     }
-    onTiming('microphone_capture_started',{sample_rate:context.sampleRate,max_pending_frames:maxPendingFrames});
+    const track=stream?.getAudioTracks?.()?.[0]??stream?.getTracks?.()?.[0];
+    const settings=track?.getSettings?.()??{};
+    onTiming('microphone_capture_started',{sample_rate:context.sampleRate,context_state:context.state,processor:'audio-worklet',max_pending_frames:maxPendingFrames,
+      device_sample_rate:Number(settings.sampleRate)||undefined,channel_count:Number(settings.channelCount)||undefined,echo_cancellation:settings.echoCancellation,noise_suppression:settings.noiseSuppression,auto_gain_control:settings.autoGainControl});
     return true;
   }
 
@@ -94,9 +124,10 @@ export function createMicrophoneCapture({
   }
 
   async function drain(){await chain;}
+  function setOnFrame(callback){if(typeof callback!=='function')throw new TypeError('onFrame callback is required');frameHandler=callback;}
 
   return {
-    start,stop,drain,
+    start,stop,drain,setOnFrame,
     get running(){return running;},
     get stream(){return stream;},
     get pendingFrames(){return pending;},
