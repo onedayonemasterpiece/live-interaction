@@ -4,21 +4,22 @@ export const microphoneConstraints={audio:{channelCount:1,echoCancellation:true,
 
 export function createPcm16Resampler(fromRate,targetRate=16000){
   if(!Number.isFinite(fromRate)||fromRate<=0||!Number.isFinite(targetRate)||targetRate<=0)throw new TypeError('Invalid sample rate');
-  const ratio=fromRate/targetRate;
-  let totalInput=0,nextSourcePosition=0,outputSamples=0;
+  let totalInput=0,outputSamples=0,phase=0;
   function push(samples){
     if(!(samples instanceof Float32Array))samples=new Float32Array(samples??[]);
-    const start=totalInput,end=start+samples.length,values=[];
-    while(nextSourcePosition<end&&samples.length){
-      const local=Math.max(0,Math.min(samples.length-1,Math.floor(nextSourcePosition-start)));
-      const value=Math.max(-1,Math.min(1,samples[local]));
-      values.push(value<0?Math.round(value*32768):Math.round(value*32767));
-      nextSourcePosition+=ratio;
+    const values=[];
+    for(let i=0;i<samples.length;i++){
+      phase+=targetRate;
+      while(phase>=fromRate){
+        const value=Math.max(-1,Math.min(1,samples[i]));
+        values.push(value<0?Math.round(value*32768):Math.round(value*32767));
+        phase-=fromRate;
+      }
     }
-    totalInput=end;outputSamples+=values.length;
+    totalInput+=samples.length;outputSamples+=values.length;
     return Int16Array.from(values);
   }
-  function reset(){totalInput=0;nextSourcePosition=0;outputSamples=0;}
+  function reset(){totalInput=0;outputSamples=0;phase=0;}
   return {push,reset,get inputSamples(){return totalInput;},get outputSamples(){return outputSamples;}};
 }
 

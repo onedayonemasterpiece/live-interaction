@@ -347,10 +347,12 @@ Debugging a screenshot without correlated runtime evidence is not acceptable.
 ### Required correlation fields
 
 - `session_id`
+- pre-session `attempt_id`
 - product/resource ID
 - consumer
 - provider/model
 - mode
+- browser/server/provider connection generation or epoch where applicable
 - active capability
 - configuration digest/version
 - capability transition ID when applicable
@@ -359,6 +361,8 @@ Debugging a screenshot without correlated runtime evidence is not acceptable.
 
 - session start requested / ready / failed / stopped;
 - provider ready / resumed / GoAway / closed;
+- WSS hello/version, reconnect/gap, socket buffer and original capture-age watermarks;
+- AudioContext state and effective microphone settings, where the browser exposes them;
 - session-resumption handle availability as a boolean (never the handle);
 - capability requested / transition started / ready / failed / released;
 - tool call start / ok / error with tool name and error code;
@@ -395,58 +399,3 @@ Keep failures attributable:
 
 - `provider_error`: provider/session failure;
 - `resource_error`: shared quota/lease/budget failure;
-- `tool_error`: product capability call failed;
-- `transition_error`: capability reconfiguration/resumption failed;
-- `transport_error`: product-to-worker/browser transport;
-- `authorization_error`: actor/resource permission failure.
-
-Do not collapse these into "Live failed".
-
-Do not automatically retry the same write tool with the same arguments after an
-unknown failure. Reconcile first.
-
-## 11. Acceptance and eval matrix
-
-A framework or capability release is not complete with unit tests alone.
-
-### Static/contract tests
-
-- prompt mentions only current tools;
-- each capability bundle is within its tool-count budget;
-- tool schemas are bounded;
-- Show/read-only modes cannot obtain mutation bundles;
-- configuration digest is stable for equivalent input;
-- audit sanitizer rejects transcripts, args, payloads and secrets.
-
-### Model/tool evals
-
-Maintain representative conversations for:
-
-- happy path;
-- ambiguous intent;
-- capability switch;
-- switch back to core;
-- tool failure;
-- repeated failure;
-- interruption/barge-in;
-- background speech/no-op;
-- user changes task midway;
-- reconnect/resume during a long conversation.
-
-Score the actual tool sequence and final product state, not only prose quality.
-
-### Real provider acceptance
-
-For every provider/model/framework combination that matters in production:
-
-- real microphone/audio path;
-- immediate speech after activation;
-- several consecutive turns;
-- capability activation;
-- at least one read and one permitted write;
-- readback after mutation;
-- Stop/restart continuity;
-- interruption;
-- provider session resumption;
-- context compression / long-session evidence;
-- resource accounting readback;
