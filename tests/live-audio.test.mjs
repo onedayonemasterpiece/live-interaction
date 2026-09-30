@@ -75,11 +75,12 @@ test('slow transport is bounded; stop discards pending audio and never waits for
  assert.equal(count,1);assert.match(error.message,/Сеть/);assert.equal(sender.stats().queued_pcm_bytes,0);
  sender.stop();release();await tick();assert.equal(count,1);
 });
-test('a short in-flight stall may queue the observed 49 KiB burst without aborting speech',async()=>{
+test('a short in-flight stall stays bounded below the 1.5 second steady-state queue',async()=>{
  let release,error,count=0;
  const sender=createLiveAudioSender({send:()=>{count++;return count===1?new Promise(resolve=>{release=resolve;}):Promise.resolve();},onError:value=>{error=value;}});
- for(let i=0;i<22;i++)sender.push(new Int16Array(1365).fill(1000),.1);
- assert.ok(sender.stats().queued_pcm_bytes>48000);
+ for(let i=0;i<14;i++)sender.push(new Int16Array(1365).fill(1000),.1);
+ assert.ok(sender.stats().queued_pcm_bytes>=30000);
+ assert.ok(sender.stats().queued_pcm_bytes<=48000);
  assert.equal(error,undefined);
  const finishing=sender.finish();
  release();

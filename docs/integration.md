@@ -58,6 +58,38 @@ remain complete for the trusted adapter `on_event` observer; only the polling/UI
 transcript text to a bounded 2000-character preview. A durable observer must persist or
 durably enqueue the trusted event before returning.
 
+## WSS transport in 0.3.0
+
+A migrated consumer constructs `createLiveClient({transport:'wss', ...})`. The
+session POST is still authenticated with the product's normal HTTP authorization and
+must return `{session_id, transport_protocol:'wl-live-v1', socket_ticket, socket_url}`.
+The ticket is random, stored server-side only as a digest, expires after 15 seconds,
+and is consumed once through the WebSocket subprotocol
+`wl-ticket.<ticket>`; never put bearer credentials, review capabilities, tickets or
+resumption handles in a WebSocket URL.
+
+The browser sends `hello` with a pre-session `attempt_id`, the event cursor and a
+monotonic connection generation. Audio frames are binary PCM16/16 kHz with a bounded
+header carrying frame sequence and capture age. The server may send asynchronous
+`audio_ack` receipt telemetry, but the next audio frame never waits for that
+acknowledgement. Provider events are pushed immediately; output PCM is binary. A new
+WSS consumer must not start the legacy events poller or automatically fall back to
+HTTP input if WSS setup/reconnect fails.
+
+Reconnect obtains a fresh one-use ticket through the authenticated HTTP session
+resource. The browser discards its pending sender queue and restarts capture rather
+than replaying stale speech. If a socket disappears while an audio turn is open, the
+host closes that provider audio boundary, marks the accepted fragment damaged and
+rejects provider tool calls with `LIVE_INPUT_DAMAGED` until a later clean turn reaches
+the provider boundary. This prevents a truncated command from becoming a mutation.
+
+Shared capture is AudioWorklet-only for 0.3.0. One MediaStream/AudioContext is handed
+from startup or wake capture into active Live by replacing the frame callback; it is
+not reacquired. The resampler carries fractional source position across worklet
+blocks, so 44.1/48 kHz input does not accumulate duration drift. Consumers should
+surface unsupported AudioWorklet as a microphone capability failure rather than
+secretly selecting the deprecated ScriptProcessor path.
+
 ## Browser API
 
 `createLiveClient({request?, onEvent, onState, onNotice, onTiming, onWait,
@@ -190,35 +222,14 @@ must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
 normal domain reconciliation.
 
-Current measured defaults: 256ms batch; <=11000 PCM bytes per browser-to-server
+Current 0.3.0 defaults: 80ms browser batch; <=11000 PCM bytes per browser-to-server
 request (binary only when the consumer opts in with `binaryAudio: true` and
 supports `application/octet-stream`); then <=16000 base64 characters on the server-to-provider JSON wire;
 1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
 250ms preroll; conservative 0.008 RMS onset and 0.003 RMS continuation gates;
 2s quiet tail. An intentional startup
 microphone handoff may seed at most 20s of PCM and temporarily uses a separate
-bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog is
-back within the ordinary watermark, queued ages are rebased once and the strict
-1.5s / 2.5s steady-state guards resume. The longer 10s audio HTTP ceiling does not extend that queue/age budget: a continuing stalled microphone stream still fails through the sender first. Silence is suppressed after
-the tail. PCM is required by this provider transport; AAC/OGG would need a measured
-server decoder and new acceptance, not just a MIME rename. Poll 160ms, drain
-has_more immediately, report gaps, and play every received audio buffer before
-considering a provider closure finished. Model mic energy alone is not barge-in.
-
-## Release gate and ownership
-
-Core changes go here and run Node/Python tests. Capability routing, configuration
-digests, provider reconfiguration and audit behaviour are shared framework concerns;
-do not reimplement them independently in a consumer once the corresponding released
-framework primitive exists.
-
-A consumer selects a versioned
-release and verifies generated assets match the installed package. Existing
-Wonderful Lections CI also rejects known duplicate transport implementations.
-Agent instructions/skill route new integrations here, but no skill can prevent
-all future deliberate divergence; code review and versioned dependency checks enforce it.
-
-A new adapter/release requires real browser voice acceptance: 10 turns, authorized
+bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog isA new adapter/release requires real browser voice acceptance: 10 turns, authorized
 product actions, navigation/context changes, immediate Stop/no later audio POST,
 restart, full playback and voice confirmation. For connection/recovery changes,
 include long session and genuine provider resumption receipts. Keep provider

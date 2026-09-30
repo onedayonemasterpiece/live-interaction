@@ -1,6 +1,7 @@
 import {createLiveAudioSender} from './live-audio.js';
 import {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
 import {isLiveStopCommand,liveStopConfirmation} from './live-commands.js';
+import {createLiveSocketTransport} from './socket-transport.js';
 
 export {createLiveAudioSender} from './live-audio.js';
 export {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
@@ -14,12 +15,14 @@ export async function liveJson(url,options){
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
-export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false}={}){
-  let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null;
+export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false,transport='http',WebSocketImpl=globalThis.WebSocket,suppressCaptureDuringPlayback=false}={}){
+  if(!['http','wss'].includes(transport))throw new TypeError('Unknown Live browser transport');
+  let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null,attemptId=null;
+  let socketTransport=null,socketUrl=null,connectionGeneration=0,reconnectPromise=null;
   let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null,budgetPaused=false;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
-  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false;
+  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackSuppressionAt=0;
   const pendingTools=new Set();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
@@ -54,7 +57,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const Context=Audio();if(!Context)return;
     playContext??=new Context();if(playContext.state==='suspended')await playContext.resume().catch(()=>{});
     if(epoch!==generation||!sessionId)return;
-    const raw=atob(event.data),bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));
+    const bytes=event.pcm instanceof Uint8Array?event.pcm:(()=>{const raw=atob(event.data);return Uint8Array.from(raw,c=>c.charCodeAt(0));})();
     const rate=Number(/rate=(\d+)/.exec(event.mime_type??'')?.[1]??24000),samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
     const buffer=playContext.createBuffer(1,samples.length,rate),channel=buffer.getChannelData(0);for(let i=0;i<samples.length;i++)channel[i]=samples[i]/32768;
     const source=playContext.createBufferSource();source.buffer=buffer;source.connect(playContext.destination);
@@ -70,6 +73,10 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function input(message){
     if(!sessionId)return Promise.resolve();
     if(message.text){awaitingReply=true;beginWait();}
+    if(transport==='wss'){
+      if(!socketTransport?.open)return Promise.reject(Object.assign(new Error('Live WebSocket is not connected'),{code:'LIVE_SOCKET_CLOSED'}));
+      return socketTransport.send(message);
+    }
     const pcm=message.pcm instanceof Int16Array?new Uint8Array(message.pcm.buffer,message.pcm.byteOffset,message.pcm.byteLength):null;
     const audio=pcm!==null||message.audio_base64!==undefined||message.audio_stream_end===true;
     // The ordered audio sender owns the tight steady-state liveness bound:
@@ -90,31 +97,27 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function releaseStartupCapture({stopTracks=true,event='startup_capture_cancelled'}={}){
     const capture=startupCapture;startupCapture=null;
     if(!capture)return null;
-    capture.processor.onaudioprocess=null;
-    try{capture.processor.disconnect();capture.inputSource.disconnect();}catch{}
-    if(stopTracks)for(const track of capture.stream.getTracks())track.stop();
-    void capture.context.close().catch(()=>{});
-    onTiming(event,{buffered_chunks:capture.chunks.length,buffered_samples:capture.samples,sample_rate:capture.sampleRate});
-    return stopTracks?null:{stream:capture.stream,sampleRate:capture.sampleRate,chunks:capture.chunks};
+    if(stopTracks){capture.microphone.stop();onTiming(event,{buffered_chunks:capture.frames.length,buffered_samples:capture.samples,sample_rate:16000});return null;}
+    onTiming(event,{buffered_chunks:capture.frames.length,buffered_samples:capture.samples,sample_rate:16000});
+    return {capture:capture.microphone,frames:capture.frames};
   }
   async function beginStartupCapture(epoch){
     if(startupCapture||!microphoneEnabled)return startupCapture;
-    if(!navigator.mediaDevices?.getUserMedia){const error=new Error('Microphone unavailable');error.code='MICROPHONE_UNAVAILABLE';throw error;}
-    const captured=await navigator.mediaDevices.getUserMedia(microphoneConstraints);
-    if(epoch!==generation||!microphoneEnabled){for(const track of captured.getTracks())track.stop();return null;}
-    const Context=Audio();if(!Context){for(const track of captured.getTracks())track.stop();const error=new Error('AudioContext unavailable');error.code='MICROPHONE_UNAVAILABLE';throw error;}
-    const context=new Context(),inputSource=context.createMediaStreamSource(captured),processor=context.createScriptProcessor(4096,1,1);
-    const capture={epoch,stream:captured,context,inputSource,processor,chunks:[],samples:0,sampleRate:context.sampleRate,maxSamples:Math.max(1,Math.floor(context.sampleRate*20))};
-    startupCapture=capture;
-    processor.onaudioprocess=event=>{
-      if(epoch!==generation||startupCapture!==capture)return;
-      const chunk=new Float32Array(event.inputBuffer.getChannelData(0));
-      capture.chunks.push(chunk);capture.samples+=chunk.length;
-      while(capture.samples>capture.maxSamples&&capture.chunks.length>1){const removed=capture.chunks.shift();capture.samples-=removed.length;}
-    };
-    inputSource.connect(processor);processor.connect(context.destination);
-    await context.resume().catch(()=>{});
-    onTiming('startup_capture_started',{sample_rate:capture.sampleRate,max_buffer_ms:20000});
+    const capture={epoch,microphone:null,frames:[],samples:0,maxSamples:16000*20};
+    const microphone=createMicrophoneCapture({
+      onFrame:(pcm,rms,meta)=>{
+        if(epoch!==generation||startupCapture!==capture)return;
+        const copy=new Int16Array(pcm);
+        capture.frames.push({pcm:copy,rms,captured_at_ms:meta?.capture_at_ms});capture.samples+=copy.length;
+        while(capture.samples>capture.maxSamples&&capture.frames.length>1){const removed=capture.frames.shift();capture.samples-=removed.pcm.length;}
+      },
+      onTiming,
+      onError:error=>{if(epoch!==generation)return;releaseStartupCapture();onState('microphone_unavailable');onNotice('microphone_error',error);}
+    });
+    capture.microphone=microphone;startupCapture=capture;
+    const started=await microphone.start({constraints:microphoneConstraints});
+    if(!started||epoch!==generation||startupCapture!==capture){microphone.stop();if(startupCapture===capture)startupCapture=null;return null;}
+    onTiming('startup_capture_started',{sample_rate:16000,max_buffer_ms:20000,processor:'audio-worklet'});
     return capture;
   }
   function takeStartupCapture(epoch){
@@ -132,21 +135,26 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(!handoff&&!navigator.mediaDevices?.getUserMedia){onState('microphone_unavailable');return false;}
     try{
       sender=createLiveAudioSender({
-        send:message=>input(message.pcm&&!binaryAudio?{audio_base64:base64(new Uint8Array(message.pcm.buffer,message.pcm.byteOffset,message.pcm.byteLength))}:message),
+        send:message=>input(transport==='wss'?message:message.pcm&&!binaryAudio?{audio_base64:base64(new Uint8Array(message.pcm.buffer,message.pcm.byteOffset,message.pcm.byteLength))}:message),
         persist:persistAudio,
         onTiming:(event,metrics)=>{
           onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
         },
         onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);}
       });
-      const handoffFrames=[];
+      const onCapturedFrame=(pcm,rms)=>{if(epoch!==generation||!sessionId)return;const suppressPlayback=typeof suppressCaptureDuringPlayback==='function'?suppressCaptureDuringPlayback():suppressCaptureDuringPlayback;if(suppressPlayback&&playing.size){const at=Date.now();if(at-lastPlaybackSuppressionAt>1000){lastPlaybackSuppressionAt=at;onTiming('capture_suppressed_playback',{playing_buffers:playing.size});}return;}sender?.push(pcm,rms);};
+      const handoffFrames=[...(handoff?.frames??[])];
       for(const chunk of handoff?.chunks??[]){
         const samples=chunk instanceof Float32Array?chunk:new Float32Array(chunk);
         handoffFrames.push({pcm:pcm16(samples,handoff.sampleRate),rms:frameRms(samples)});
       }
       if(handoffFrames.length&&!sender.seed(handoffFrames))return false;
+      if(handoff?.capture?.running){
+        microphone=handoff.capture;microphone.setOnFrame(onCapturedFrame);
+        onTiming('microphone_handoff_reused',{processor:'audio-worklet',seed_frames:handoffFrames.length});onState('listening');return true;
+      }
       const capture=createMicrophoneCapture({
-        onFrame:(pcm,rms)=>{if(epoch===generation&&sessionId)sender?.push(pcm,rms);},
+        onFrame:onCapturedFrame,
         onTiming,
         onError:error=>{if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
       });
@@ -157,48 +165,48 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       return false;
     }catch(error){if(epoch!==generation)return false;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);return false;}
   }
+  async function handleEvent(event,epoch){
+    if(epoch!==generation)return false;
+    if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
+    if(event.type==='input_transcript'){
+      waitStage=pendingTools.size?'action':'provider';
+      if(Date.now()-transcriptAt>2000)inputTranscript='';
+      transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
+    }else if(event.type==='audio'){
+      awaitingReply=false;clearWait();if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);
+    }else if(event.type==='input_timing'){
+      // Compare events within the server clock only; browser clock may differ.
+      if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage=pendingTools.size?'action':'provider';
+    }else if(event.type==='interrupted'){clearWait();onTiming('provider_interrupted');stopPlayback('provider_interrupted');}    else if(event.type==='tool_call'){for(const call of event.calls??[])pendingTools.add(call.id);waitStage='action';}
+    else if(event.type==='tool_result'){pendingTools.delete(event.id);if(!pendingTools.size)waitStage='provider';}
+    else if(event.type==='tool_cancelled'){for(const id of event.ids??[])pendingTools.delete(id);if(!pendingTools.size)waitStage='provider';}
+    else if(event.type==='interaction_status'&&event.status==='IDLE'){awaitingReply=false;clearWait();}
+    else if(event.type==='turn_complete'){
+      if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
+    }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
+    else if(event.type==='resource_budget_wait'){
+      beginWait();waitStage='resource';
+      if(!budgetPaused){budgetPaused=true;closeMic();onState('budget_wait');onNotice('resource_budget_wait');}
+    }else if(event.type==='resource_budget_ready'){      budgetPaused=false;waitStage='provider';onState('budget_ready');
+      if(microphoneEnabled)void startMic(epoch);
+    }else if(event.type==='resumed'&&microphoneEnabled&&!budgetPaused){void startMic(epoch);}
+    if(epoch!==generation)return false;
+    onEvent(event,epoch);cursor=event.seq??cursor;
+    if(event.type==='error'){
+      // A terminal provider error may precede the server's closed flag.
+      // Release the browser microphone as soon as the error is observed.
+      stop({reason:'provider_error',preservePlayback:true});
+      return false;
+    }
+    return epoch===generation;
+  }
   async function poll(){
     if(!sessionId)return;const epoch=generation;
     try{
       const result=await request(`${root}/${encodeURIComponent(sessionId)}/events?after=${cursor}`,{signal:AbortSignal.any([abort.signal,AbortSignal.timeout(5000)])});
       if(epoch!==generation)return;
       if(result.gap)onNotice('event_gap');
-      for(const event of result.events??[]){
-        if(epoch!==generation)return;
-        if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
-        if(event.type==='input_transcript'){
-          waitStage=pendingTools.size?'action':'provider';
-          if(Date.now()-transcriptAt>2000)inputTranscript='';
-          transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
-        }else if(event.type==='audio'){
-          awaitingReply=false;clearWait();if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);
-        }else if(event.type==='input_timing'){
-          // Compare events within the server clock only; browser clock may differ.
-          if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage=pendingTools.size?'action':'provider';
-        }else if(event.type==='interrupted'){clearWait();onTiming('provider_interrupted');stopPlayback('provider_interrupted');}
-        else if(event.type==='tool_call'){for(const call of event.calls??[])pendingTools.add(call.id);waitStage='action';}
-        else if(event.type==='tool_result'){pendingTools.delete(event.id);if(!pendingTools.size)waitStage='provider';}
-        else if(event.type==='tool_cancelled'){for(const id of event.ids??[])pendingTools.delete(id);if(!pendingTools.size)waitStage='provider';}
-        else if(event.type==='interaction_status'&&event.status==='IDLE'){awaitingReply=false;clearWait();}
-        else if(event.type==='turn_complete'){
-          if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
-        }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
-        else if(event.type==='resource_budget_wait'){
-          beginWait();waitStage='resource';
-          if(!budgetPaused){budgetPaused=true;closeMic();onState('budget_wait');onNotice('resource_budget_wait');}
-        }else if(event.type==='resource_budget_ready'){
-          budgetPaused=false;waitStage='provider';onState('budget_ready');
-          if(microphoneEnabled)void startMic(epoch);
-        }else if(event.type==='resumed'&&microphoneEnabled&&!budgetPaused){void startMic(epoch);}
-        if(epoch!==generation)return;
-        onEvent(event,epoch);cursor=event.seq??cursor;
-        if(event.type==='error'){
-          // A terminal provider error may precede the server's closed flag.
-          // Release the browser microphone as soon as the error is observed.
-          stop({reason:'provider_error',preservePlayback:true});
-          return;
-        }
-      }
+      for(const event of result.events??[])if(!await handleEvent(event,epoch))return;
       cursor=result.cursor??cursor;
       if(epoch!==generation)return;
       if(result.closed){stop({reason:'provider_closed',preservePlayback:true});return;}
@@ -206,26 +214,62 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     }catch(error){if(epoch!==generation)return;onState('connection_error');onNotice('connection_error',error);}
     if(epoch===generation)pollTimer=setTimeout(()=>void poll(),160);
   }
+  async function reconnectSocket(epoch){
+    if(transport!=='wss'||epoch!==generation||!sessionId)return false;
+    if(reconnectPromise)return reconnectPromise;
+    reconnectPromise=(async()=>{
+      closeMic();onState('reconnecting');onTiming('socket_reconnect_started',{connection_generation:connectionGeneration});
+      const deadline=Date.now()+10000;
+      let attempt=0,lastError=null;
+      while(epoch===generation&&sessionId&&Date.now()<deadline&&attempt<3){
+        attempt++;
+        try{
+          const result=await request(`${root}/${encodeURIComponent(sessionId)}/socket-ticket`,{method:'POST',headers:{'content-type':'application/json'},body:'{}',signal:AbortSignal.any([abort.signal,AbortSignal.timeout(3000)])});
+          if(epoch!==generation||!sessionId)return false;
+          connectionGeneration++;
+          await socketTransport.connect({url:result.socket_url??socketUrl,ticket:result.socket_ticket,attempt_id:attemptId,cursor,connection_generation:connectionGeneration});
+          onTiming('socket_reconnect_ready',{attempt,connection_generation:connectionGeneration});
+          if(microphoneEnabled&&!budgetPaused)await startMic(epoch);
+          return true;
+        }catch(error){lastError=error;onTiming('socket_reconnect_attempt_failed',{attempt,code:error?.code??'LIVE_SOCKET_RECONNECT'});if(attempt<3)await new Promise(resolve=>setTimeout(resolve,Math.min(1000,150*2**attempt)));}
+      }
+      if(epoch===generation){stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',lastError??new Error('Live WebSocket reconnect failed'));}
+      return false;
+    })().finally(()=>{reconnectPromise=null;});
+    return reconnectPromise;
+  }
   function remoteStop(url,keepalive=false){onTiming('stop_request');void request(url,{method:'POST',headers:{'content-type':'application/json'},body:'{}',keepalive,signal:AbortSignal.timeout(2500)}).then(()=>onTiming('stop_response')).catch(()=>onTiming('stop_cleanup_timeout'));}
   function stop({keepalive=false,reason='user_stop',preservePlayback=false}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
+    socketTransport?.close({sendStop:true,reason});socketTransport=null;reconnectPromise=null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();closeMic();clearTimeout(pollTimer);pollTimer=null;
-    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;
+    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;attemptId=null;socketUrl=null;connectionGeneration=0;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
   async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true,captureDuringStart=false}){
     if(sessionId||starting)return;
-    stopPlayback('new_session');const epoch=++generation;abort=new AbortController();starting=true;root=url;microphoneEnabled=Boolean(microphone);onState('starting');
+    stopPlayback('new_session');const epoch=++generation;abort=new AbortController();starting=true;root=url;microphoneEnabled=Boolean(microphone);attemptId=`attempt_${globalThis.crypto?.randomUUID?.()?.replaceAll('-','')??Math.random().toString(36).slice(2)+Date.now().toString(36)}`;onState('starting',{attempt_id:attemptId,transport});
     try{
       await authorize();if(epoch!==generation)return;
       if(microphoneEnabled&&captureDuringStart&&typeof takeMicrophoneHandoff!=='function')await beginStartupCapture(epoch);
       if(epoch!==generation)return;
-      const started=await request(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      const started=await request(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,attempt_id:attemptId,transport})});
       if(epoch!==generation){remoteStop(`${url}/${encodeURIComponent(started.session_id)}/stop`);return;}
-      sessionId=started.session_id;model=started.model;cursor=0;onTiming('model_started',{model:started.model});onState('started',started);
+      sessionId=started.session_id;model=started.model;cursor=0;onTiming('model_started',{model:started.model,attempt_id:attemptId,transport});
+      if(transport==='wss'){
+        if(started.transport_protocol!=='wl-live-v1'||typeof started.socket_ticket!=='string'||typeof started.socket_url!=='string')throw Object.assign(new Error('Server did not provide the required WSS transport'),{code:'LIVE_SOCKET_REQUIRED'});
+        socketUrl=started.socket_url;connectionGeneration=1;
+        socketTransport=createLiveSocketTransport({WebSocketImpl,onTiming,
+          onEvent:event=>{void handleEvent(event,epoch);},
+          onError:error=>{if(epoch===generation)onNotice('connection_error',error);},
+          onClose:detail=>{if(epoch!==generation||detail.expected)return;void reconnectSocket(epoch);}
+        });
+        await socketTransport.connect({url:socketUrl,ticket:started.socket_ticket,attempt_id:attemptId,cursor,connection_generation:connectionGeneration});
+      }
+      const {socket_ticket,...startedPublic}=started;onState('started',startedPublic);
       const Context=Audio();if(Context){playContext??=new Context();await playContext.resume().catch(()=>{});}
       if(epoch!==generation)return;
-      starting=false;void poll();
+      starting=false;if(transport==='http')void poll();
       const handoff=microphoneEnabled
         ?typeof takeMicrophoneHandoff==='function'
           ?await takeMicrophoneHandoff()
@@ -234,8 +278,8 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
             :null
         :null;
       if(epoch!==generation){handoff?.stream?.getTracks?.().forEach(track=>track.stop());return;}
-      if(microphoneEnabled)await startMic(epoch,handoff);return started;
-    }catch(error){if(epoch!==generation)return;const microphoneFailure=error?.code==='MICROPHONE_UNAVAILABLE';stop();onState(microphoneFailure?'microphone_unavailable':'start_error');onNotice(microphoneFailure?'microphone_error':'start_error',error);}
+      if(microphoneEnabled)await startMic(epoch,handoff);return startedPublic;
+    }catch(error){if(epoch!==generation)return;const microphoneFailure=['MICROPHONE_UNAVAILABLE','AUDIO_WORKLET_UNAVAILABLE'].includes(error?.code);stop();onState(microphoneFailure?'microphone_unavailable':'start_error');onNotice(microphoneFailure?'microphone_error':'start_error',error);}
   }
   async function enableMicrophone({takeMicrophoneHandoff=null}={}){
     if(!sessionId)return false;
