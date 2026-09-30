@@ -44,7 +44,7 @@ export function createLiveSocketTransport({
   const sent=new Map();
   const oldestAge=()=>{
     const first=sent.values().next();
-    return first.done?0:Math.max(0,now()-first.value);
+    return first.done?0:Math.max(0,now()-first.value.at);
   };
   const metrics=()=>({socket_buffered_bytes:socket?.bufferedAmount??0,unacked_audio_frames:sent.size,oldest_unacked_age_ms:Math.round(oldestAge()),connection_generation:generation});
   const requireOpen=()=>{
@@ -58,7 +58,9 @@ export function createLiveSocketTransport({
     if(message.type==='audio_ack'){
       const ack=Number(message.seq);
       if(!Number.isSafeInteger(ack)||ack<0||ack>audioSeq)throw Object.assign(new Error('Invalid Live audio acknowledgement'),{code:'LIVE_SOCKET_PROTOCOL'});
-      for(const seq of [...sent.keys()])if(seq<=ack)sent.delete(seq);
+      for(const [seq,pending] of [...sent.entries()])if(seq<=ack){
+        clearTimeout(pending.timer);sent.delete(seq);pending.resolve({seq});
+      }
       onTiming('socket_server_received',{seq:ack,server_received_at:message.server_received_at,...metrics()});
       return;
     }
@@ -106,7 +108,9 @@ export function createLiveSocketTransport({
       ws.onclose=event=>{
         clearTimeout(helloTimer);
         if(socket===ws)socket=null;
-        const wasClosed=closed;sent.clear();
+        const wasClosed=closed;
+        const closeError=Object.assign(new Error('Live WebSocket closed'),{code:'LIVE_SOCKET_CLOSED',metrics:metrics()});
+        for(const pending of sent.values()){clearTimeout(pending.timer);pending.reject(closeError);}sent.clear();
         if(!settled)fail(Object.assign(new Error(`Live WebSocket closed during setup (${event.code})`),{code:'LIVE_SOCKET_CLOSED'}));
         if(epoch===generation)onClose({code:event.code,reason:String(event.reason??'').slice(0,120),expected:wasClosed,connection_generation:generation});
       };
@@ -116,9 +120,16 @@ export function createLiveSocketTransport({
     requireOpen();
     if(message?.pcm instanceof Int16Array){
       const seq=++audioSeq,frame=encodeLiveAudioFrame(message.pcm,{seq,age_ms:message.age_ms});
-      sent.set(seq,now());socket.send(frame);
-      onTiming('socket_audio_sent',{seq,pcm_bytes:message.pcm.byteLength,capture_age_ms:Math.round(message.age_ms??0),...metrics()});
-      return Promise.resolve({seq});
+      return new Promise((resolve,reject)=>{
+        const pending={at:now(),resolve,reject,timer:null};sent.set(seq,pending);
+        try{socket.send(frame);}catch(error){sent.delete(seq);reject(error);return;}
+        pending.timer=setTimeout(()=>{
+          if(!sent.has(seq))return;
+          const m=metrics();sent.delete(seq);
+          reject(Object.assign(new Error('Live WebSocket acknowledgement timeout'),{code:'LIVE_SOCKET_BACKPRESSURE',metrics:m}));
+        },maxUnackedAgeMs);
+        onTiming('socket_audio_sent',{seq,pcm_bytes:message.pcm.byteLength,capture_age_ms:Math.round(message.age_ms??0),...metrics()});
+      });
     }
     const safe=message?.audio_stream_end?{type:'input',message:{audio_stream_end:true,captured_at_ms:message.captured_at_ms,age_ms:message.age_ms}}
       :message?.text!==undefined?{type:'input',message:{text:message.text}}
@@ -128,7 +139,9 @@ export function createLiveSocketTransport({
     return Promise.resolve({});
   }
   function close({sendStop=false,code=1000,reason='client_stop'}={}){
-    closed=true;const ws=socket;socket=null;sent.clear();
+    closed=true;const ws=socket;socket=null;
+    const closeError=Object.assign(new Error('Live WebSocket closed'),{code:'LIVE_SOCKET_CLOSED',metrics:metrics()});
+    for(const pending of sent.values()){clearTimeout(pending.timer);pending.reject(closeError);}sent.clear();
     if(!ws)return;
     try{if(sendStop&&ws.readyState===WebSocketImpl.OPEN)ws.send(JSON.stringify({type:'stop',reason:String(reason).slice(0,80)}));}catch{}
     try{ws.close(code,String(reason).slice(0,80));}catch{}
