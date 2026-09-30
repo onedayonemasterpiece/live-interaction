@@ -42,6 +42,37 @@ test('bounded handoff catch-up drains a startup backlog then restores the steady
  assert.match(error?.message??'',/Сеть/);
  releaseSteady?.();await tick();
 });
+test('handoff catch-up accepts thousands of tiny AudioWorklet frames within the byte bound',async()=>{
+ let releaseFirst,error;const sent=[];
+ const sender=createLiveAudioSender({
+  send:message=>{
+   sent.push(message);
+   if(sent.length===1)return new Promise(resolve=>releaseFirst=resolve);
+   return Promise.resolve();
+  },
+  onError:value=>{error=value;}
+ });
+ // 4096 x 43 PCM16 samples is ~11 seconds at 16 kHz / 352 KiB, but represents
+ // far more worklet callbacks than the old fixed 512-item catch-up fuse.
+ const frames=Array.from({length:4096},()=>({pcm:new Int16Array(43).fill(1000),rms:.05}));
+ assert.equal(sender.seed(frames),true);
+ assert.equal(error,undefined);
+ assert.equal(sender.stats().catchup,true);
+ assert.ok(sender.stats().queued_chunks>512);
+ releaseFirst();
+ for(let i=0;i<200&&sender.stats().catchup;i++)await tick();
+ assert.equal(error,undefined);
+ assert.equal(sender.stats().catchup,false);
+ sender.stop();
+});
+test('handoff catch-up still rejects startup PCM beyond the 20 second byte budget',()=>{
+ let error;
+ const sender=createLiveAudioSender({send:async()=>{},onError:value=>{error=value;}});
+ const frames=Array.from({length:161},()=>({pcm:new Int16Array(2000).fill(1000),rms:.05}));
+ assert.equal(sender.seed(frames),false);
+ assert.match(error?.message??'',/Стартовый буфер речи превышает/);
+ assert.equal(sender.stats().queued_pcm_bytes,0);
+});
 test('handoff catch-up retains headroom while a queued HTTP batch is in flight',async()=>{
  let error;const releases=[];
  const sender=createLiveAudioSender({

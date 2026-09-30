@@ -76,6 +76,12 @@ acknowledgement. Provider events are pushed immediately; output PCM is binary. A
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
+Release 0.3.2 preserves the 20-second startup PCM byte bound but raises the
+independent catch-up fragment-count fuse so a provider setup lasting several
+seconds cannot fail merely because AudioWorklet delivered many small quanta.
+Steady-state queue/age guards are unchanged, and startup PCM beyond the byte
+budget still fails closed.
+
 Release 0.3.1 treats the versioned `hello_ack`, not merely TCP/WebSocket `open`, as
 transport readiness. Browser-origin upgrades are same-origin by default, server
 output buffering is bounded, and a reconnect backlog is de-duplicated against live
@@ -230,7 +236,7 @@ must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
 normal domain reconciliation.
 
-Current 0.3.0 defaults: 80ms browser batch; <=11000 PCM bytes per browser-to-server
+Current 0.3.2 defaults: 80ms browser batch; <=11000 PCM bytes per browser-to-server
 request (binary only when the consumer opts in with `binaryAudio: true` and
 supports `application/octet-stream`); then <=16000 base64 characters on the server-to-provider JSON wire;
 1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;

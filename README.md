@@ -16,7 +16,10 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current source release `0.3.1`). Release 0.3.1 hardens the
+Use versioned releases (current source release `0.3.2`). Release 0.3.2 keeps the
+20-second startup handoff byte-bounded while allowing the thousands of small
+AudioWorklet quanta a real browser can accumulate during provider setup; the
+fragment-count fuse remains bounded but no longer falsely reports network lag. Release 0.3.1 hardens the
 new socket path: the browser waits for a matching versioned hello acknowledgement,
 the server checks same-origin upgrades, supports bounded fragmented browser frames,
 deduplicates backlog against simultaneous push events, bounds server egress buffering,

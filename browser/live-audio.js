@@ -2,7 +2,7 @@
 // PCM16/16kHz is the Gemini Live wire format. Keep each batch below 16000 base64 bytes.
 // A microphone handoff may intentionally contain up to 20 seconds captured while Live starts.
 // That seed gets a separate bounded catch-up window; once drained below half the
-// normal queue watermark, the strict steady-state queue/age guards resume.
+// normal byte and fragment watermarks, the strict steady-state guards resume.
 export function createLiveAudioSender({
   send,
   onTiming=()=>{},
@@ -20,7 +20,13 @@ export function createLiveAudioSender({
   const bytesPerSecond=32000;
   const steadyByteLimit=bytesPerSecond*maxQueueMs/1000;
   const catchupByteLimit=bytesPerSecond*(maxBootstrapMs+maxQueueMs)/1000;
-  const maxCatchupItems=512;
+  // Startup handoff can contain thousands of tiny AudioWorklet quanta even when
+  // the bounded PCM duration/byte budget is healthy. Keep a separate generous
+  // object-count fuse for pathological fragmentation, but let the byte ceiling
+  // remain the primary catch-up bound.
+  const steadyItemLimit=80;
+  const maxCatchupItems=32768;
+  const catchupExitItemLimit=Math.floor(steadyItemLimit/2);
 
   const stats=()=>({
     captured_chunks:captured,
@@ -43,7 +49,7 @@ export function createLiveAudioSender({
   };
   const maybeFinishCatchup=()=>{
     // Leave room for PCM captured while the next HTTP batch is in flight.
-    if(!catchup||!catchupSealed||bytes>steadyByteLimit/2)return false;
+    if(!catchup||!catchupSealed||bytes>steadyByteLimit/2||queue.length>catchupExitItemLimit)return false;
     catchup=false;catchupSealed=false;rebaseQueuedAge();
     report('catchup_end',{seed_pcm_bytes:catchupSeedBytes});
     return true;
@@ -93,7 +99,7 @@ export function createLiveAudioSender({
     const size=item.pcm?.byteLength??0,copy=item.pcm?{...item,pcm:new Int16Array(item.pcm)}:{...item};
     durableBytes+=size;durableItems++;
     const byteLimit=catchup?catchupByteLimit:steadyByteLimit;
-    const itemLimit=catchup?maxCatchupItems:80;
+    const itemLimit=catchup?maxCatchupItems:steadyItemLimit;
     if(bytes+durableBytes>byteLimit||queue.length+durableItems>itemLimit){
       durableRelease(size);
       fail(new Error('Локальное сохранение речи не успевает за микрофоном.'));
@@ -126,7 +132,7 @@ export function createLiveAudioSender({
     if(closed)return;
     maybeFinishCatchup();
     const byteLimit=catchup?catchupByteLimit:steadyByteLimit;
-    const itemLimit=catchup?maxCatchupItems:80;
+    const itemLimit=catchup?maxCatchupItems:steadyItemLimit;
     if(bytes>byteLimit||queue.length>itemLimit){
       fail(new Error('Сеть не успевает передавать речь. Запустите Live снова.'));
       return;
@@ -174,7 +180,7 @@ export function createLiveAudioSender({
       return false;
     }
     catchup=true;catchupSealed=false;catchupSeedBytes=seedBytes;
-    report('catchup_start',{seed_pcm_bytes:seedBytes,max_bootstrap_ms:maxBootstrapMs});
+    report('catchup_start',{seed_pcm_bytes:seedBytes,max_bootstrap_ms:maxBootstrapMs,max_catchup_items:maxCatchupItems});
     for(const frame of frames){
       if(closed)return false;
       if(!(frame?.pcm instanceof Int16Array)||!Number.isFinite(frame?.rms)){
