@@ -17,6 +17,17 @@ test('trusted event observer receives worker failures without browser polling',a
  assert.ok(observed.some(event=>event.type==='error'&&event.code==='PROVIDER_TEST'));
  await host.stop({resourceId:'observed',sessionId:started.session_id,actor});
 });
+test('Stop is idempotent when socket Stop already removed the session',async()=>{
+ const c=worker();
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[]}}),
+  executeTool:async()=>({})
+ })});
+ const actor={subject:'a',tenant_id:'t'},started=await host.start({resourceId:'idempotent-stop',actor});
+ const base={resourceId:'idempotent-stop',sessionId:started.session_id,actor};
+ assert.deepEqual(await host.stop(base),{ok:true,session_id:started.session_id});
+ assert.deepEqual(await host.stop(base),{ok:true,session_id:started.session_id,already_closed:true});
+});
 test('independent product adapters preserve ordered tools, deduplication, owner isolation and cancel-before-start',async()=>{
  const c=worker(),called=[];const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({initialize:({resourceId})=>({state:{},context:{resourceId},configuration:{functions:[{name:'story.read'}]}}),executeTool:async(_,call)=>{called.push(call.id);return {value:'story'};}})});
  const start=await host.start({resourceId:'story1',actor:{subject:'a',tenant_id:'t'}}),base={resourceId:'story1',sessionId:start.session_id,actor:{subject:'a',tenant_id:'t'}};

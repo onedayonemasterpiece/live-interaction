@@ -352,6 +352,10 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
     return {session_id:session.id,events:items,cursor,has_more:hasMore,gap:Boolean(session.events.length&&after<session.events[0].seq-1),closed:session.closed&&!hasMore};
   };
   const stop=async({sessionId,resourceId,actor}={})=>{
+    // WSS Stop can remove the session on the socket before the browser's
+    // best-effort HTTP cleanup arrives. That cleanup is intentionally
+    // idempotent; an unknown already-closed id exposes no resource data.
+    if(!sessions.has(sessionId))return {ok:true,session_id:sessionId,already_closed:true};
     const session=getSession(sessionId,resourceId,actor);
     if(!session.closed){try{write(session,{type:'stop'});}catch{}setTimeout(()=>{try{session.child.kill('SIGTERM');}catch{}},1200).unref?.();}
     session.pendingTransition?.reject?.(new DomainError('LIVE_SESSION_CLOSED','Live session stopped during capability transition'));
