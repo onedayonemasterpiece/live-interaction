@@ -16,7 +16,13 @@ domain agents, permissions and product tools remain in consumer adapters.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current source release `0.3.0`). Release 0.3.0 adds an explicit
+Use versioned releases (current source release `0.3.1`). Release 0.3.1 hardens the
+new socket path: the browser waits for a matching versioned hello acknowledgement,
+the server checks same-origin upgrades, supports bounded fragmented browser frames,
+deduplicates backlog against simultaneous push events, bounds server egress buffering,
+and the stateful 16 kHz resampler is verified against long-run duration drift.
+
+Release 0.3.0 adds an explicit
 browser-to-product WSS transport with one-use 15s socket tickets, small binary PCM
 frames, pushed provider events/audio, bounded socket/unacknowledged age, connection
 generations, and a damaged-turn fence that blocks tools after transport loss until

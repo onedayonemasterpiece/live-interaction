@@ -1,14 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createMicrophoneCapture,createDurableMicrophoneCapture} from '../browser/capture.js';
+import {createMicrophoneCapture,createDurableMicrophoneCapture,createPcm16Resampler} from '../browser/capture.js';
 const originalAudioWorkletNode=globalThis.AudioWorkletNode;
 globalThis.AudioWorkletNode=class TestAudioWorkletNode {
   constructor(){this.port={onmessage:null};globalThis.__liveTestWorklets?.push?.(this);}
   connect(){return this;}disconnect(){}
 };
 
-
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
+
+test('stateful resampling keeps exact long-run duration across AudioWorklet chunk boundaries',()=>{
+  const source=new Float32Array(44100);
+  for(let i=0;i<source.length;i++)source[i]=Math.sin(i/37)*.5;
+  const whole=createPcm16Resampler(44100).push(source);
+  const split=createPcm16Resampler(44100),parts=[];
+  for(let offset=0;offset<source.length;offset+=127)parts.push(split.push(source.subarray(offset,Math.min(source.length,offset+127))));
+  const joined=new Int16Array(parts.reduce((n,p)=>n+p.length,0));let cursor=0;
+  for(const part of parts){joined.set(part,cursor);cursor+=part.length;}
+  assert.equal(joined.length,16000);assert.equal(whole.length,16000);
+  assert.deepEqual(joined,whole);
+});
 
 test('Stop closes a microphone granted after the permission request was cancelled',async()=>{
   const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;

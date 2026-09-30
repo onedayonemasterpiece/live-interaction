@@ -36,6 +36,7 @@ export function createLiveSocketTransport({
   onError=()=>{},
   maxBufferedBytes=96*1024,
   maxUnackedAgeMs=2500,
+  helloTimeoutMs=2000,
   now=()=>globalThis.performance?.now?.()??Date.now(),
 }={}){
   if(typeof WebSocketImpl!=='function')throw new TypeError('WebSocket is unavailable');
@@ -51,17 +52,22 @@ export function createLiveSocketTransport({
     const m=metrics();
     if(m.socket_buffered_bytes>maxBufferedBytes||m.oldest_unacked_age_ms>maxUnackedAgeMs)throw Object.assign(new Error('Live WebSocket queue is stale'),{code:'LIVE_SOCKET_BACKPRESSURE',metrics:m});
   };
-  function handleText(text){
+  function handleText(text,onHelloAck){
     let message;
     try{message=JSON.parse(text);}catch{return;}
     if(message.type==='audio_ack'){
       const ack=Number(message.seq);
+      if(!Number.isSafeInteger(ack)||ack<0||ack>audioSeq)throw Object.assign(new Error('Invalid Live audio acknowledgement'),{code:'LIVE_SOCKET_PROTOCOL'});
       for(const seq of [...sent.keys()])if(seq<=ack)sent.delete(seq);
       onTiming('socket_server_received',{seq:ack,server_received_at:message.server_received_at,...metrics()});
       return;
     }
     if(message.type==='event'&&message.event){onEvent(message.event);return;}
-    if(message.type==='hello_ack'){onTiming('socket_hello_ack',{protocol:message.protocol,connection_generation:message.connection_generation});return;}
+    if(message.type==='hello_ack'){
+      if(message.protocol!==LIVE_SOCKET_PROTOCOL||Number(message.connection_generation)!==generation)throw Object.assign(new Error('Live WebSocket protocol mismatch'),{code:'LIVE_SOCKET_PROTOCOL'});
+      onTiming('socket_hello_ack',{protocol:message.protocol,connection_generation:message.connection_generation});
+      onHelloAck?.(message);return;
+    }
     if(message.type==='transport_notice'){onTiming('socket_transport_notice',message);return;}
   }
   function connect({url,ticket,attempt_id,cursor=0,connection_generation}={}){
@@ -70,25 +76,35 @@ export function createLiveSocketTransport({
     closed=false;generation=Number.isInteger(connection_generation)?connection_generation:generation+1;
     const epoch=generation;
     return new Promise((resolve,reject)=>{
-      let settled=false;
+      let settled=false,helloTimer=null;
       const ws=new WebSocketImpl(socketUrl(url),[LIVE_SOCKET_PROTOCOL,`wl-ticket.${ticket}`]);socket=ws;ws.binaryType='arraybuffer';
-      const fail=error=>{if(!settled){settled=true;reject(error);}onError(error);};
+      const fail=error=>{clearTimeout(helloTimer);if(!settled){settled=true;reject(error);}onError(error);};
+      const protocolFail=error=>{fail(error);try{ws.close(1002,String(error.code??'protocol').slice(0,80));}catch{}};
       ws.onopen=()=>{
         if(epoch!==generation){try{ws.close(1000,'stale');}catch{}return;}
         ws.send(JSON.stringify({type:'hello',protocol:LIVE_SOCKET_PROTOCOL,attempt_id:String(attempt_id??'').slice(0,96),cursor:Number.isSafeInteger(cursor)?cursor:0,connection_generation:generation}));
-        settled=true;onOpen({connection_generation:generation});onTiming('socket_open',{connection_generation:generation});resolve({connection_generation:generation});
+        onTiming('socket_open',{connection_generation:generation});
+        helloTimer=setTimeout(()=>protocolFail(Object.assign(new Error('Live WebSocket hello acknowledgement timeout'),{code:'LIVE_SOCKET_HELLO_TIMEOUT'})),helloTimeoutMs);
       };
       ws.onmessage=event=>{
         if(epoch!==generation)return;
-        if(typeof event.data==='string'){handleText(event.data);return;}
         try{
+          if(typeof event.data==='string'){
+            handleText(event.data,()=>{
+              if(settled)return;
+              clearTimeout(helloTimer);settled=true;onOpen({connection_generation:generation});resolve({connection_generation:generation});
+            });
+            return;
+          }
+          if(!settled)throw Object.assign(new Error('Binary Live output arrived before hello acknowledgement'),{code:'LIVE_SOCKET_PROTOCOL'});
           const frame=decodeLiveOutputFrame(event.data);
           onTiming('socket_audio_received',{seq:frame.seq,pcm_bytes:frame.pcm.byteLength,rate:frame.rate,...metrics()});
           onEvent({type:'audio',seq:frame.seq,pcm:frame.pcm,mime_type:`audio/pcm;rate=${frame.rate}`,transport:'wss'});
-        }catch(error){onError(error);}
+        }catch(error){protocolFail(error);}
       };
       ws.onerror=()=>fail(Object.assign(new Error('Live WebSocket transport failed'),{code:'LIVE_SOCKET_ERROR'}));
       ws.onclose=event=>{
+        clearTimeout(helloTimer);
         if(socket===ws)socket=null;
         const wasClosed=closed;sent.clear();
         if(!settled)fail(Object.assign(new Error(`Live WebSocket closed during setup (${event.code})`),{code:'LIVE_SOCKET_CLOSED'}));

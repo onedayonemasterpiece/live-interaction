@@ -347,10 +347,12 @@ Debugging a screenshot without correlated runtime evidence is not acceptable.
 ### Required correlation fields
 
 - `session_id`
+- pre-session `attempt_id`
 - product/resource ID
 - consumer
 - provider/model
 - mode
+- browser/server/provider connection generation or epoch where applicable
 - active capability
 - configuration digest/version
 - capability transition ID when applicable
@@ -359,6 +361,8 @@ Debugging a screenshot without correlated runtime evidence is not acceptable.
 
 - session start requested / ready / failed / stopped;
 - provider ready / resumed / GoAway / closed;
+- WSS hello/version, reconnect/gap, socket buffer and original capture-age watermarks;
+- AudioContext state and effective microphone settings, where the browser exposes them;
 - session-resumption handle availability as a boolean (never the handle);
 - capability requested / transition started / ready / failed / released;
 - tool call start / ok / error with tool name and error code;

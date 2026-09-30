@@ -58,7 +58,7 @@ remain complete for the trusted adapter `on_event` observer; only the polling/UI
 transcript text to a bounded 2000-character preview. A durable observer must persist or
 durably enqueue the trusted event before returning.
 
-## WSS transport in 0.3.0
+## WSS transport in 0.3.x
 
 A migrated consumer constructs `createLiveClient({transport:'wss', ...})`. The
 session POST is still authenticated with the product's normal HTTP authorization and
@@ -76,6 +76,14 @@ acknowledgement. Provider events are pushed immediately; output PCM is binary. A
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
+Release 0.3.1 treats the versioned `hello_ack`, not merely TCP/WebSocket `open`, as
+transport readiness. Browser-origin upgrades are same-origin by default, server
+output buffering is bounded, and a reconnect backlog is de-duplicated against live
+push by event sequence. The server accepts bounded RFC WebSocket fragmentation while
+preserving message ordering. Consumers behind a reverse proxy must keep the public
+Host/Origin relationship intact and explicitly validate their proxy's Upgrade and
+idle-timeout behaviour.
+
 Reconnect obtains a fresh one-use ticket through the authenticated HTTP session
 resource. The browser discards its pending sender queue and restarts capture rather
 than replaying stale speech. If a socket disappears while an audio turn is open, the
@@ -83,10 +91,10 @@ host closes that provider audio boundary, marks the accepted fragment damaged an
 rejects provider tool calls with `LIVE_INPUT_DAMAGED` until a later clean turn reaches
 the provider boundary. This prevents a truncated command from becoming a mutation.
 
-Shared capture is AudioWorklet-only for 0.3.0. One MediaStream/AudioContext is handed
+Shared capture is AudioWorklet-only for 0.3.x. One MediaStream/AudioContext is handed
 from startup or wake capture into active Live by replacing the frame callback; it is
-not reacquired. The resampler carries fractional source position across worklet
-blocks, so 44.1/48 kHz input does not accumulate duration drift. Consumers should
+not reacquired. The resampler carries state across worklet blocks; 0.3.1 adds an exact long-run
+duration regression at 44.1 kHz so block boundaries cannot accumulate drift. Consumers should
 surface unsupported AudioWorklet as a microphone capability failure rather than
 secretly selecting the deprecated ScriptProcessor path.
 

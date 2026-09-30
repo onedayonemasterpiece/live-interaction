@@ -21,6 +21,12 @@ missing transport capability in the shared repository, then update the consumer'
 versioned release dependency and lockfile. Do not fork/copy an independent audio queue,
 provider websocket, playback or Stop implementation into a product.
 
+For 0.3.x migrations prefer the versioned WSS contract: authenticated HTTP session
+bootstrap, one-use socket ticket in the WebSocket subprotocol, matching
+`wl-live-v1` hello acknowledgement, binary PCM, pushed provider events/audio and no
+silent fallback to the legacy HTTP audio/polling path. Keep browser/server/provider
+connection generations separate and reject damaged-turn mutations after reconnect.
+
 Build browser modules from the installed package; generated copies are ignored
 and covered by the consumer's asset hash/cache manifest. Enforce semantic release versioning, release archive digest,
 lockfile provenance and generated-asset equality in the consumer's CI/build.
