@@ -37,10 +37,14 @@ export function createLiveSocketTransport({
   maxBufferedBytes=96*1024,
   maxUnackedAgeMs=2500,
   helloTimeoutMs=2000,
+  heartbeatIntervalMs=15000,
+  heartbeatTimeoutMs=45000,
   now=()=>globalThis.performance?.now?.()??Date.now(),
 }={}){
   if(typeof WebSocketImpl!=='function')throw new TypeError('WebSocket is unavailable');
   let socket=null,audioSeq=0,closed=true,generation=0;
+  let heartbeatTimer=null,lastPong=0;
+  const clearHeartbeat=()=>{if(heartbeatTimer!==null)clearInterval(heartbeatTimer);heartbeatTimer=null;};
   const sent=new Map();
   const oldestAge=()=>{
     const first=sent.values().next();
@@ -55,6 +59,7 @@ export function createLiveSocketTransport({
   function handleText(text,onHelloAck){
     let message;
     try{message=JSON.parse(text);}catch{return;}
+    if(message.type==='pong'){lastPong=now();return;}
     if(message.type==='audio_ack'){
       const ack=Number(message.seq);
       if(!Number.isSafeInteger(ack)||ack<0||ack>audioSeq)throw Object.assign(new Error('Invalid Live audio acknowledgement'),{code:'LIVE_SOCKET_PROTOCOL'});
@@ -94,7 +99,18 @@ export function createLiveSocketTransport({
           if(typeof event.data==='string'){
             handleText(event.data,()=>{
               if(settled)return;
-              clearTimeout(helloTimer);settled=true;onOpen({connection_generation:generation});resolve({connection_generation:generation});
+              clearTimeout(helloTimer);settled=true;lastPong=now();
+              clearHeartbeat();
+              heartbeatTimer=setInterval(()=>{
+                if(epoch!==generation||closed)return;
+                if(now()-lastPong>heartbeatTimeoutMs){
+                  protocolFail(Object.assign(new Error('Live heartbeat timeout'),{code:'LIVE_SOCKET_HEARTBEAT_TIMEOUT'}));return;
+                }
+                try{requireOpen();ws.send(JSON.stringify({type:'ping'}));}
+                catch(error){protocolFail(error);}
+              },heartbeatIntervalMs);
+              heartbeatTimer.unref?.();
+              onOpen({connection_generation:generation});resolve({connection_generation:generation});
             });
             return;
           }
@@ -107,7 +123,7 @@ export function createLiveSocketTransport({
       ws.onerror=()=>fail(Object.assign(new Error('Live WebSocket transport failed'),{code:'LIVE_SOCKET_ERROR'}));
       ws.onclose=event=>{
         clearTimeout(helloTimer);
-        if(socket===ws)socket=null;
+        if(socket===ws){socket=null;clearHeartbeat();}
         const wasClosed=closed;
         const closeError=Object.assign(new Error('Live WebSocket closed'),{code:'LIVE_SOCKET_CLOSED',metrics:metrics()});
         for(const pending of sent.values()){clearTimeout(pending.timer);pending.reject(closeError);}sent.clear();
@@ -139,6 +155,7 @@ export function createLiveSocketTransport({
     return Promise.resolve({});
   }
   function close({sendStop=false,code=1000,reason='client_stop'}={}){
+    clearHeartbeat();
     closed=true;const ws=socket;socket=null;
     const closeError=Object.assign(new Error('Live WebSocket closed'),{code:'LIVE_SOCKET_CLOSED',metrics:metrics()});
     for(const pending of sent.values()){clearTimeout(pending.timer);pending.reject(closeError);}sent.clear();

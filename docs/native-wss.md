@@ -1,6 +1,8 @@
 # Native WSS integration and runtime decision
 
-Status: 0.3.6-rc.1 integration candidate, not a stable production acceptance receipt.
+Status: 0.3.7-rc.1 integration candidate, not a stable production acceptance receipt.
+Includes accepted 0.3.6 provider media-resolution serialization and explicit
+browser/native ping-pong liveness without restarting the HTTP events poller.
 Decision date: 2026-09-30. Replaces the provisional Node-sidecar plan.
 
 ## Decision

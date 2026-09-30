@@ -23,7 +23,7 @@ import okio.ByteString;
 /** Native wl-live-v1 binding. No Android, product, credential or provider logic. */
 public final class LiveSocketTransport implements AutoCloseable {
     public static final String PROTOCOL = "wl-live-v1";
-    public static final String VERSION = "0.3.6-rc.1";
+    public static final String VERSION = "0.3.7-rc.1";
     public static final int BATCH_BYTES = 3200;
     public static final int MAX_PENDING_PCM_BYTES = 48000;
     public static final long MAX_AGE_MS = 2500;
