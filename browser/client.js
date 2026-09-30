@@ -59,7 +59,17 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(epoch!==generation||!sessionId)return;
     const bytes=event.pcm instanceof Uint8Array?event.pcm:(()=>{const raw=atob(event.data);return Uint8Array.from(raw,c=>c.charCodeAt(0));})();
     const rate=Number(/rate=(\d+)/.exec(event.mime_type??'')?.[1]??24000),samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
-    const buffer=playContext.createBuffer(1,samples.length,rate),channel=buffer.getChannelData(0);for(let i=0;i<samples.length;i++)channel[i]=samples[i]/32768;
+    let peak=0,sumSquares=0;
+    const buffer=playContext.createBuffer(1,samples.length,rate),channel=buffer.getChannelData(0);
+    for(let i=0;i<samples.length;i++){const value=samples[i]/32768;channel[i]=value;const magnitude=Math.abs(value);if(magnitude>peak)peak=magnitude;sumSquares+=value*value;}
+    const playbackFacts={
+      seq:event.seq,pcm_bytes:bytes.byteLength,duration_ms:buffer.duration*1000,sample_rate:rate,
+      pcm_peak:peak,pcm_rms:samples.length?Math.sqrt(sumSquares/samples.length):0,
+      audio_context_running:playContext.state==='running',
+      audio_context_sample_rate:Number(playContext.sampleRate)||0,
+      audio_base_latency_ms:Number(playContext.baseLatency)*1000||0,
+      audio_output_latency_ms:Number(playContext.outputLatency)*1000||0
+    };
     const source=playContext.createBufferSource();source.buffer=buffer;source.connect(playContext.destination);
     // Gemini can emit a very short first chunk (for example 50 ms) hundreds of
     // milliseconds before the next one. Hold the start of each playback run so
@@ -67,8 +77,8 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const runStart=nextPlayAt<=playContext.currentTime;
     const at=Math.max(playContext.currentTime+(runStart?.4:.02),nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
     if(runStart)onTiming('playback_buffering',{buffer_ms:400,first_chunk_ms:buffer.duration*1000});
-    onTiming('audio_scheduled',{seq:event.seq,pcm_bytes:bytes.byteLength,duration_ms:buffer.duration*1000,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
-    source.onended=()=>{playing.delete(source);source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',{seq:event.seq,duration_ms:buffer.duration*1000});};source.start(at);
+    onTiming('audio_scheduled',{...playbackFacts,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
+    source.onended=()=>{playing.delete(source);source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);};source.start(at);
   }
   function input(message){
     if(!sessionId)return Promise.resolve();

@@ -127,18 +127,18 @@ test('short first provider audio chunk is buffered until following audio can pla
  const originalAudio=globalThis.AudioContext,starts=[],created=performance.now();
  let releasePoll,polls=0;
  class FakeAudioContext{
-  state='running';destination={};audioWorklet={addModule:async()=>{}};
+  state='running';sampleRate=48000;baseLatency=.01;outputLatency=.02;destination={};audioWorklet={addModule:async()=>{}};
   get currentTime(){return (performance.now()-created)/1000;}
   createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
   createBufferSource(){const context=this;return {buffer:null,onended:null,connect(){},disconnect(){},start(at){starts.push({at,receivedAt:context.currentTime,duration:this.buffer.duration});},stop(){}};}
   async resume(){}
  }
  globalThis.AudioContext=FakeAudioContext;
- const client=createLiveClient({request:url=>{
+ const timings=[];const client=createLiveClient({request:url=>{
   if(url==='/live')return Promise.resolve({session_id:'one',model:'gemini-3.8-live-extended-thinking'});
   if(url.includes('/events')){polls++;return new Promise(resolve=>{releasePoll=resolve;});}
   return Promise.resolve({ok:true});
- }});
+ },onTiming:(event,metrics)=>timings.push({event,...metrics})});
  const audio=(seq,length)=>({seq,type:'audio',data:Buffer.alloc(length*2).toString('base64'),mime_type:'audio/pcm;rate=24000'});
  try{
   await client.start({url:'/live',microphone:false});
@@ -152,6 +152,10 @@ test('short first provider audio chunk is buffered until following audio can pla
   for(let i=0;i<30&&starts.length<2;i++)await tick();
   assert.equal(starts.length,2);
   assert.ok(Math.abs(starts[1].at-(starts[0].at+starts[0].duration))<.005,'following chunk starts exactly at the first chunk end');
+  const scheduled=timings.find(item=>item.event==='audio_scheduled');
+  assert.equal(scheduled.sample_rate,24000);assert.equal(scheduled.audio_context_running,true);
+  assert.equal(scheduled.audio_context_sample_rate,48000);assert.equal(scheduled.audio_base_latency_ms,10);assert.equal(scheduled.audio_output_latency_ms,20);
+  assert.equal(scheduled.pcm_peak,0);assert.equal(scheduled.pcm_rms,0);
  }finally{client.stop();if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;}
 });
 test('Stop during setup is local; late setup is cleaned without starting a microphone',async()=>{

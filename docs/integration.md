@@ -76,6 +76,8 @@ acknowledgement. Provider events are pushed immediately; output PCM is binary. A
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
+Release 0.3.3 keeps steady-state PCM byte/age bounds authoritative over AudioWorklet render-quantum object count, retains a large pathological-fragmentation fuse, assigns stable sender failure codes, and emits safe playback telemetry (PCM peak/RMS, sample rates, AudioContext running state and output/base latency). No transcript or credential data is included in these metrics.
+
 Release 0.3.2 preserves the 20-second startup PCM byte bound but raises the
 independent catch-up fragment-count fuse so a provider setup lasting several
 seconds cannot fail merely because AudioWorklet delivered many small quanta.
