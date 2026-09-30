@@ -24,7 +24,10 @@ export function createLiveAudioSender({
   // the bounded PCM duration/byte budget is healthy. Keep a separate generous
   // object-count fuse for pathological fragmentation, but let the byte ceiling
   // remain the primary catch-up bound.
-  const steadyItemLimit=80;
+  // Render-quantum count is not a duration signal: Chrome can emit hundreds of tiny
+  // 16 kHz fragments per second after a 48 kHz AudioWorklet resample. Bytes and
+  // age are the authoritative liveness guards; keep only a large fragmentation fuse.
+  const steadyItemLimit=4096;
   const maxCatchupItems=32768;
   const catchupExitItemLimit=Math.floor(steadyItemLimit/2);
 
@@ -58,7 +61,7 @@ export function createLiveAudioSender({
     closed=true;clearTimeout(timer);timer=null;
     queue=[];preRoll=[];bytes=0;catchup=false;catchupSealed=false;
   };
-  const fail=error=>{report('transport_error');stop();onError(error);};
+  const fail=error=>{report('transport_error',{error_code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)});stop();onError(error);};
 
   async function pump(){
     if(closed||busy||!queue.length)return;
@@ -68,7 +71,7 @@ export function createLiveAudioSender({
     if(first.end)queue.shift();
     else{
       if(first.pcm&&!catchup&&now()-first.at>maxAgeMs){
-        fail(new Error('Сеть не успевает передавать речь. Запустите Live снова.'));
+        fail(Object.assign(new Error('Сеть не успевает передавать речь. Запустите Live снова.'),{code:'LIVE_AUDIO_QUEUE_AGE'}));
         return;
       }
       while(queue.length&&queue[0].pcm&&size+queue[0].pcm.byteLength<=11000){
@@ -100,9 +103,10 @@ export function createLiveAudioSender({
     durableBytes+=size;durableItems++;
     const byteLimit=catchup?catchupByteLimit:steadyByteLimit;
     const itemLimit=catchup?maxCatchupItems:steadyItemLimit;
-    if(bytes+durableBytes>byteLimit||queue.length+durableItems>itemLimit){
+    const durableBytesExceeded=bytes+durableBytes>byteLimit,durableItemsExceeded=queue.length+durableItems>itemLimit;
+    if(durableBytesExceeded||durableItemsExceeded){
       durableRelease(size);
-      fail(new Error('Локальное сохранение речи не успевает за микрофоном.'));
+      fail(Object.assign(new Error('Локальное сохранение речи не успевает за микрофоном.'),{code:durableBytesExceeded?'LIVE_AUDIO_DURABLE_BYTES':'LIVE_AUDIO_DURABLE_FRAGMENTS'}));
       return false;
     }
     durableChain=durableChain.then(async()=>{
@@ -133,8 +137,9 @@ export function createLiveAudioSender({
     maybeFinishCatchup();
     const byteLimit=catchup?catchupByteLimit:steadyByteLimit;
     const itemLimit=catchup?maxCatchupItems:steadyItemLimit;
-    if(bytes>byteLimit||queue.length>itemLimit){
-      fail(new Error('Сеть не успевает передавать речь. Запустите Live снова.'));
+    const queueBytesExceeded=bytes>byteLimit,queueItemsExceeded=queue.length>itemLimit;
+    if(queueBytesExceeded||queueItemsExceeded){
+      fail(Object.assign(new Error('Сеть не успевает передавать речь. Запустите Live снова.'),{code:queueBytesExceeded?'LIVE_AUDIO_QUEUE_BYTES':'LIVE_AUDIO_QUEUE_FRAGMENTS'}));
       return;
     }
     if(busy)return;
@@ -176,7 +181,7 @@ export function createLiveAudioSender({
     if(!Array.isArray(frames))return false;
     const seedBytes=frames.reduce((total,frame)=>total+(frame?.pcm?.byteLength??0),0);
     if(seedBytes>bytesPerSecond*maxBootstrapMs/1000){
-      fail(new Error('Стартовый буфер речи превышает допустимый предел.'));
+      fail(Object.assign(new Error('Стартовый буфер речи превышает допустимый предел.'),{code:'LIVE_AUDIO_BOOTSTRAP_BYTES'}));
       return false;
     }
     catchup=true;catchupSealed=false;catchupSeedBytes=seedBytes;
@@ -184,7 +189,7 @@ export function createLiveAudioSender({
     for(const frame of frames){
       if(closed)return false;
       if(!(frame?.pcm instanceof Int16Array)||!Number.isFinite(frame?.rms)){
-        fail(new Error('Стартовый буфер речи повреждён.'));
+        fail(Object.assign(new Error('Стартовый буфер речи повреждён.'),{code:'LIVE_AUDIO_BOOTSTRAP_INVALID'}));
         return false;
       }
       push(frame.pcm,frame.rms);

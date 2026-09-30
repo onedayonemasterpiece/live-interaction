@@ -100,6 +100,28 @@ test('handoff catch-up retains headroom while a queued HTTP batch is in flight',
  for(const release of releases)release();
 });
 
+test('tiny steady-state AudioWorklet fragments stay bounded by bytes/age rather than object count',async()=>{
+ let release,error,count=0;
+ const sender=createLiveAudioSender({send:()=>{count++;return count===1?new Promise(resolve=>release=resolve):Promise.resolve();},onError:value=>{error=value;}});
+ for(let i=0;i<300;i++)sender.push(new Int16Array(43).fill(1000),.05);
+ assert.equal(error,undefined);
+ assert.ok(sender.stats().queued_chunks>80);
+ assert.ok(sender.stats().queued_pcm_bytes<48000);
+ release();
+ for(let i=0;i<100&&sender.stats().queued_pcm_bytes;i++)await tick();
+ assert.equal(error,undefined);
+ sender.stop();
+});
+
+test('steady-state byte overflow reports a stable diagnostic code',()=>{
+ let error,timing;
+ const sender=createLiveAudioSender({send:()=>new Promise(()=>{}),onError:value=>{error=value;},onTiming:(event,metrics)=>{if(event==='transport_error')timing=metrics;}});
+ for(let i=0;i<30&&!error;i++)sender.push(new Int16Array(1486).fill(1000),.05);
+ assert.equal(error?.code,'LIVE_AUDIO_QUEUE_BYTES');
+ assert.equal(timing?.error_code,'LIVE_AUDIO_QUEUE_BYTES');
+ sender.stop();
+});
+
 test('slow transport is bounded; stop discards pending audio and never waits for network',async()=>{
  let release,count=0,error;const sender=createLiveAudioSender({send:()=>{count++;return new Promise(r=>release=r);},onError:e=>error=e});
  for(let i=0;i<45;i++)sender.push(new Int16Array(1365),.1);
