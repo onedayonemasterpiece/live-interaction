@@ -69,6 +69,16 @@ class ProviderContract(unittest.TestCase):
         self.assertNotIn('read_story', str(b))
         self.assertNotIn('thinkingConfig', a['generationConfig'])
 
+    def test_media_resolution_is_explicit_per_live_configuration(self):
+        low=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_LOW'})['setup']
+        high=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_HIGH'})['setup']
+        default=setup_config('gemini-3.8-live',{},configuration={})['setup']
+        self.assertEqual(low['generationConfig']['mediaResolution'],{'level':'MEDIA_RESOLUTION_LOW'})
+        self.assertEqual(high['generationConfig']['mediaResolution'],{'level':'MEDIA_RESOLUTION_HIGH'})
+        self.assertNotIn('mediaResolution',default['generationConfig'])
+        with self.assertRaisesRegex(ValueError,'Unsupported media_resolution'):
+            setup_config('gemini-3.8-live',{},configuration={'media_resolution':'LOWISH'})
+
     def test_application_search_function_remains_available_without_native_search(self):
         setup = setup_config(
             'gemini-3.8-live',
