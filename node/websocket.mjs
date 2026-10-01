@@ -168,6 +168,7 @@ export function createLiveWebSocketUpgrade({
             flushing=true;flushBacklog(Number.isSafeInteger(message.cursor)&&message.cursor>=0?message.cursor:0);flushing=false;
             return;
           }
+          if(message.type==='ping'){sendText(socket,{type:'pong'},maxServerBufferedBytes);return;}
           if(message.type==='stop'){stopped=true;await binding.stop();sendClose(socket,1000,'stopped',maxServerBufferedBytes);socket.end();return;}
           if(message.type!=='input'||!message.message||typeof message.message!=='object')throw Object.assign(new Error('Invalid Live socket input'),{code:'LIVE_SOCKET_MESSAGE'});
           binding.input(message.message,{connection_generation:connectionGeneration});
