@@ -275,6 +275,42 @@ test('microphone handoff reuses the existing stream and sends buffered PCM befor
   }
 });
 
+test('opt-in Stop returns the handed microphone stream without ending its track',async()=>{
+  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
+  let stopCalls=0;
+  const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
+  const handedStream={getTracks:()=>[track]};
+  class FakeNode{connect(){return this;}disconnect(){}}
+  class FakeContext{
+    sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};
+    createMediaStreamSource(stream){assert.equal(stream,handedStream);return new FakeNode();}
+    async resume(){}
+    async close(){this.state='closed';}
+  }
+  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>{throw new Error('must reuse handed stream');}}},configurable:true});
+  globalThis.AudioContext=FakeContext;
+  const client=createLiveClient({request:async url=>{
+    if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+    if(url.startsWith('/live/one/events'))return {events:[],cursor:0,closed:false};
+    if(url==='/live/one/stop')return {ok:true};
+    return {ok:true};
+  }});
+  try{
+    await client.start({url:'/live',takeMicrophoneHandoff:async()=>({stream:handedStream,sampleRate:48000,chunks:[]})});
+    const handoff=client.stop({reason:'return_to_local',returnMicrophoneHandoff:true});
+    assert.equal(handoff?.stream,handedStream);
+    assert.equal(track.readyState,'live');
+    assert.equal(stopCalls,0);
+    handoff.stream.getTracks().forEach(item=>item.stop());
+    assert.equal(track.readyState,'ended');
+    assert.equal(stopCalls,1);
+  }finally{
+    client.stop();
+    if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
+    if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+  }
+});
+
 test('audio input has a catch-up-safe HTTP ceiling while text stays fast-bounded',async()=>{
   const descriptor=Object.getOwnPropertyDescriptor(AbortSignal,'timeout');
   const observed=[];

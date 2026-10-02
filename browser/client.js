@@ -142,9 +142,10 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return releaseStartupCapture({stopTracks:false,event:'startup_capture_handoff'});
   }
 
-  function closeMic(){
+  function closeMic({stopTracks=true}={}){
     sender?.stop();sender=null;
-    microphone?.stop();microphone=null;
+    const retained=microphone?.stop({stopTracks})??null;microphone=null;
+    return retained;
   }
   async function startMic(epoch,handoff=null){
     if(!microphoneEnabled||budgetPaused)return false;
@@ -177,8 +178,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         onTiming('microphone_handoff_reused',{processor:'audio-worklet',seed_frames:handoffFrames.length});onState('listening');return true;
       }
       const capture=createMicrophoneCapture({
-        onFrame:onCapturedFrame,
-        onTiming,
+        onFrame:onCapturedFrame,        onTiming,
         onError:error=>{if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
       });
       microphone=capture;
@@ -267,12 +267,16 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return reconnectPromise;
   }
   function remoteStop(url,keepalive=false){onTiming('stop_request');void request(url,{method:'POST',headers:{'content-type':'application/json'},body:'{}',keepalive,signal:AbortSignal.timeout(2500)}).then(()=>onTiming('stop_response')).catch(()=>onTiming('stop_cleanup_timeout'));}
-  function stop({keepalive=false,reason='user_stop',preservePlayback=false}={}){
+  function stop({keepalive=false,reason='user_stop',preservePlayback=false,returnMicrophoneHandoff=false}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     socketTransport?.close({sendStop:true,reason});socketTransport=null;reconnectPromise=null;
-    ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();closeMic();clearTimeout(pollTimer);pollTimer=null;
+    ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();
+    const returnedStream=returnMicrophoneHandoff?closeMic({stopTracks:false}):(closeMic(),null);
+    clearTimeout(pollTimer);pollTimer=null;
     if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;suppressResponseReason=null;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;attemptId=null;socketUrl=null;connectionGeneration=0;
-    onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
+    const microphone_handoff=returnedStream?{stream:returnedStream}:null;
+    onState('off',{reason,microphone_handoff});onTiming('local_ui_off',{microphone_handoff:Boolean(microphone_handoff)});if(url)remoteStop(url,keepalive);
+    return microphone_handoff;
   }
   async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true,captureDuringStart=false}){
     if(sessionId||starting)return;
