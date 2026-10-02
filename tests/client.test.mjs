@@ -425,3 +425,31 @@ test('captureTap observes Live microphone frames without owning capture or block
     assert.equal(stopCalls,1);
   }
 });
+
+test('local control can suppress one provider response without ending the Live session',async()=>{
+  let releaseEvents,polls=0;const seen=[],timings=[];
+  const client=createLiveClient({request:url=>{
+    if(url==='/live')return Promise.resolve({session_id:'one',model:'gemini-3.8-live'});
+    if(url.includes('/events')){polls++;return new Promise(resolve=>{releaseEvents=resolve;});}
+    return Promise.resolve({ok:true});
+  },onEvent:event=>seen.push(event),onTiming:(event,metrics)=>timings.push({event,...metrics})});
+  try{
+    await client.start({url:'/live',microphone:false});
+    for(let i=0;i<30&&!releaseEvents;i++)await tick();
+    assert.equal(client.suppressCurrentResponse('local_navigation'),true);
+    assert.equal(client.responseSuppressed,true);
+    releaseEvents({events:[
+      {seq:1,type:'output_transcript',text:'молчу'},
+      {seq:2,type:'audio',data:Buffer.alloc(960).toString('base64'),mime_type:'audio/pcm;rate=24000'},
+      {seq:3,type:'turn_complete'}
+    ],cursor:3});
+    for(let i=0;i<30&&polls<2;i++)await tick();
+    assert.equal(client.sessionId,'one');
+    assert.equal(client.responseSuppressed,false);
+    assert.equal(seen.some(event=>event.type==='output_transcript'),false);
+    assert.equal(seen.some(event=>event.type==='audio'),false);
+    assert.equal(seen.some(event=>event.type==='turn_complete'),true);
+    assert.equal(timings.some(item=>item.event==='audio_scheduled'),false);
+    assert.equal(timings.filter(item=>item.event==='response_output_suppressed').length,2);
+  }finally{client.stop();releaseEvents?.({events:[],cursor:3,closed:true});}
+});

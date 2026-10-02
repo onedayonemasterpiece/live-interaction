@@ -22,7 +22,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null,budgetPaused=false;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
-  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackSuppressionAt=0;
+  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackSuppressionAt=0,suppressResponseReason=null;
   const pendingTools=new Set();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
@@ -47,6 +47,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(!voiceControl.isStop(inputTranscript))return;
     stopPending=true;inputTranscript='';onTiming('voice_stop_confirmation_requested');onNotice('voice_stop_confirmation_requested');
     stopExpiry=setTimeout(()=>{clearConfirmation();onTiming('voice_stop_expired');onNotice('voice_stop_expired');},30000);
+  }
+  function suppressCurrentResponse(reason='local_control'){
+    if(!sessionId)return false;
+    suppressResponseReason=String(reason||'local_control').slice(0,80);
+    stopPlayback('response_suppressed');
+    onTiming('response_suppression_started',{reason:suppressResponseReason});
+    return true;
   }
   function stopPlayback(reason='user_stop'){
     if(playing.size)onTiming('playback_cancelled',{reason,queued_buffers:playing.size,remaining_ms:Math.max(0,(nextPlayAt-playContext.currentTime)*1000)});
@@ -184,12 +191,15 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   async function handleEvent(event,epoch){
     if(epoch!==generation)return false;
     if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
+    const suppressOutput=Boolean(suppressResponseReason&&['audio','output_transcript'].includes(event.type));
     if(event.type==='input_transcript'){
       waitStage=pendingTools.size?'action':'provider';
       if(Date.now()-transcriptAt>2000)inputTranscript='';
       transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
     }else if(event.type==='audio'){
-      awaitingReply=false;clearWait();if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);
+      awaitingReply=false;clearWait();
+      if(suppressOutput)onTiming('response_output_suppressed',{reason:suppressResponseReason,event_type:'audio',pcm_bytes:Number(event?.pcm?.byteLength??0)||undefined});
+      else{if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);}
     }else if(event.type==='input_timing'){
       // Compare events within the server clock only; browser clock may differ.
       if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage=pendingTools.size?'action':'provider';
@@ -199,6 +209,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     else if(event.type==='interaction_status'&&event.status==='IDLE'){awaitingReply=false;clearWait();}
     else if(event.type==='turn_complete'){
       if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
+      if(suppressResponseReason){onTiming('response_suppression_ended',{reason:suppressResponseReason});suppressResponseReason=null;}
     }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
     else if(event.type==='resource_budget_wait'){
       beginWait();waitStage='resource';
@@ -207,6 +218,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       if(microphoneEnabled)void startMic(epoch);
     }else if(event.type==='resumed'&&microphoneEnabled&&!budgetPaused){void startMic(epoch);}
     if(epoch!==generation)return false;
+    if(suppressOutput){if(event.type==='output_transcript')onTiming('response_output_suppressed',{reason:suppressResponseReason,event_type:'output_transcript'});cursor=event.seq??cursor;return true;}
     onEvent(event,epoch);cursor=event.seq??cursor;
     if(event.type==='error'){
       // A terminal provider error may precede the server's closed flag.
@@ -259,7 +271,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     socketTransport?.close({sendStop:true,reason});socketTransport=null;reconnectPromise=null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();closeMic();clearTimeout(pollTimer);pollTimer=null;
-    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;attemptId=null;socketUrl=null;connectionGeneration=0;
+    if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;suppressResponseReason=null;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;attemptId=null;socketUrl=null;connectionGeneration=0;
     onState('off',{reason});onTiming('local_ui_off');if(url)remoteStop(url,keepalive);
   }
   async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true,captureDuringStart=false}){
@@ -307,5 +319,5 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return startMic(epoch,handoff);
   }
   function disableMicrophone(){microphoneEnabled=false;closeMic();}
-  return {start,stop,input,enableMicrophone,disableMicrophone,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;},get microphoneEnabled(){return microphoneEnabled;}};
+  return {start,stop,input,enableMicrophone,disableMicrophone,suppressCurrentResponse,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;},get microphoneEnabled(){return microphoneEnabled;},get responseSuppressed(){return Boolean(suppressResponseReason);}};
 }
