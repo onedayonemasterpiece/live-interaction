@@ -43,6 +43,8 @@ provider calls outside the shared resource controller. The model/key binding is
 sticky after ready; quota failures are not an excuse for key/provider hopping.
 Missing credentials and authority failures remain visible and fail closed.
 
+When a browser product needs a local control-plane recognizer while Live owns the microphone, use the shared browser client's optional `captureTap(pcm,rms)` after playback suppression. Keep that tap synchronous, bounded and local-only; do not open a second `getUserMedia`, create a competing audio transport, or delay provider delivery. Copy frames before retaining/transferring them and keep product command semantics in the consumer adapter.
+
 Preserve one bounded ordered sender, preroll/tail, immediate local Stop, no stale
 speech replay, complete already-received playback, separate confirmed spoken Stop,
 serialized authorized tools and mutation deduplication/readback. A button Stop
