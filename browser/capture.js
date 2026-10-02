@@ -120,8 +120,10 @@ export function createMicrophoneCapture({
 
   function stop({stopTracks=true}={}){
     ++generation;
-    if(!running&&!stream)return;
-    running=false;closeHardware(stopTracks);onTiming('microphone_capture_stopped',{pending_frames:pending});
+    if(!running&&!stream)return null;
+    const retained=stopTracks?null:stream;
+    running=false;closeHardware(stopTracks);onTiming('microphone_capture_stopped',{pending_frames:pending,tracks_retained:Boolean(retained)});
+    return retained;
   }
 
   async function drain(){await chain;}
