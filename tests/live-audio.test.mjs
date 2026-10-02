@@ -81,12 +81,12 @@ test('handoff catch-up retains headroom while a queued HTTP batch is in flight',
  });
  const frame=()=>({pcm:new Int16Array(1486).fill(1000),rms:.05});
  assert.equal(sender.seed(Array.from({length:64},frame)),true);
- for(let i=0;i<40&&sender.stats().queued_pcm_bytes>43000;i++){
+ for(let i=0;i<40&&sender.stats().queued_pcm_bytes>70000;i++){
   assert.ok(releases.length);
   releases.shift()();await tick();
  }
- assert.ok(sender.stats().queued_pcm_bytes<=48000);
- assert.ok(sender.stats().queued_pcm_bytes>24000);
+ assert.ok(sender.stats().queued_pcm_bytes<=70000);
+ assert.ok(sender.stats().queued_pcm_bytes>40000);
  assert.equal(sender.stats().catchup,true);
  for(let i=0;i<5;i++)sender.push(frame().pcm,.05);
  assert.equal(error,undefined);
@@ -113,6 +113,20 @@ test('tiny steady-state AudioWorklet fragments stay bounded by bytes/age rather 
  sender.stop();
 });
 
+test('the former 48 kB / 1.5 s byte watermark does not stop a healthy in-flight turn',()=>{
+ let error,count=0;
+ const sender=createLiveAudioSender({send:()=>{count++;return new Promise(()=>{});},onError:value=>{error=value;}});
+ // First push enters the in-flight batch. The remaining 17 x 1486-sample PCM16
+ // frames are 50,524 bytes (~1.58 s at 32,000 bytes/s): above the old 48 kB
+ // guard but safely below the existing 2.5 s age/ACK budget.
+ for(let i=0;i<18;i++)sender.push(new Int16Array(1486).fill(1000),.05);
+ assert.equal(count,1);
+ assert.ok(sender.stats().queued_pcm_bytes>48000);
+ assert.ok(sender.stats().queued_pcm_bytes<80000);
+ assert.equal(error,undefined);
+ sender.stop();
+});
+
 test('steady-state byte overflow reports a stable diagnostic code',()=>{
  let error,timing;
  const sender=createLiveAudioSender({send:()=>new Promise(()=>{}),onError:value=>{error=value;},onTiming:(event,metrics)=>{if(event==='transport_error')timing=metrics;}});
@@ -128,12 +142,12 @@ test('slow transport is bounded; stop discards pending audio and never waits for
  assert.equal(count,1);assert.match(error.message,/Сеть/);assert.equal(sender.stats().queued_pcm_bytes,0);
  sender.stop();release();await tick();assert.equal(count,1);
 });
-test('a short in-flight stall stays bounded below the 1.5 second steady-state queue',async()=>{
+test('a short in-flight stall stays bounded below the 2.5 second steady-state queue',async()=>{
  let release,error,count=0;
  const sender=createLiveAudioSender({send:()=>{count++;return count===1?new Promise(resolve=>{release=resolve;}):Promise.resolve();},onError:value=>{error=value;}});
  for(let i=0;i<14;i++)sender.push(new Int16Array(1365).fill(1000),.1);
  assert.ok(sender.stats().queued_pcm_bytes>=30000);
- assert.ok(sender.stats().queued_pcm_bytes<=48000);
+ assert.ok(sender.stats().queued_pcm_bytes<=80000);
  assert.equal(error,undefined);
  const finishing=sender.finish();
  release();

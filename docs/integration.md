@@ -60,6 +60,8 @@ durably enqueue the trusted event before returning.
 
 ## WSS transport in 0.3.x
 
+Release 0.3.11 makes the steady-state PCM byte budget use the same 2.5-second bound as the queue-age and WSS acknowledgement guards. A temporary backlog around the former 48 kB / 1.5-second watermark is retained and drained instead of terminating an otherwise healthy Live session; the sender still fails closed once queued PCM exceeds 2.5 seconds or the oldest frame / WSS ACK reaches its existing timeout.
+
 A migrated consumer constructs `createLiveClient({transport:'wss', ...})`. The
 session POST is still authenticated with the product's normal HTTP authorization and
 must return `{session_id, transport_protocol:'wl-live-v1', socket_ticket, socket_url}`.
@@ -244,14 +246,14 @@ must be current and bounded before transport. Do not replay captured audio on
 recovery. Tools are cancelled only before starting; accepted writes require
 normal domain reconciliation.
 
-Current 0.3.2 defaults: 80ms browser batch; <=11000 PCM bytes per browser-to-server
+Current 0.3.11 browser defaults: 80ms browser batch; <=11000 PCM bytes per browser-to-server
 request (binary only when the consumer opts in with `binaryAudio: true` and
 supports `application/octet-stream`); then <=16000 base64 characters on the server-to-provider JSON wire;
-1.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
+2.5s buffered PCM and 2.5s item-age steady-state guards; 2.5s non-audio input request bound; 10s absolute audio/audio_stream_end HTTP ceiling; one in-flight sender;
 250ms preroll; conservative 0.008 RMS onset and 0.003 RMS continuation gates;
 2s quiet tail. An intentional startup
 microphone handoff may seed at most 20s of PCM and temporarily uses a separate
-bounded catch-up ceiling (seed + the ordinary 1.5s queue). Once the backlog isA new adapter/release requires real browser voice acceptance: 10 turns, authorized
+bounded catch-up ceiling (seed + the ordinary 2.5s queue). Once the backlog is drained, the strict steady-state guards resume. A new adapter/release requires real browser voice acceptance: 10 turns, authorized
 product actions, navigation/context changes, immediate Stop/no later audio POST,
 restart, full playback and voice confirmation. For connection/recovery changes,
 include long session and genuine provider resumption receipts. Keep provider
