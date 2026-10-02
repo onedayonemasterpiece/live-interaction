@@ -387,3 +387,41 @@ test('createLiveClient persists accepted microphone PCM before HTTP transport',a
     if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
   }
 });
+
+test('captureTap observes Live microphone frames without owning capture or blocking transport',async()=>{
+  let onFrame=null,stopCalls=0,releaseEvents;const taps=[],inputs=[],timings=[];
+  const capture={
+    running:true,
+    setOnFrame(fn){onFrame=fn;},
+    stop(){stopCalls++;this.running=false;}
+  };
+  const client=createLiveClient({
+    binaryAudio:true,
+    captureTap:(pcm,rms)=>{taps.push({pcm:[...pcm],rms});throw Object.assign(new Error('tap failed'),{code:'TEST_TAP'});},
+    onTiming:(event,metrics)=>timings.push({event,...metrics}),
+    request:async(url,options={})=>{
+      if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+      if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+      if(url==='/live/one/input'){inputs.push(decodedInput(options));return {ok:true};}
+      if(url==='/live/one/stop')return {ok:true};
+      throw new Error('unexpected '+url);
+    }
+  });
+  try{
+    await client.start({url:'/live',takeMicrophoneHandoff:async()=>({capture,frames:[]})});
+    assert.equal(typeof onFrame,'function');
+    const pcm=new Int16Array(1600).fill(1200);
+    onFrame(pcm,.02);
+    assert.equal(taps.length,1);
+    assert.deepEqual(taps[0].pcm,[...pcm]);
+    assert.equal(taps[0].rms,.02);
+    for(let i=0;i<30&&!inputs.some(item=>item.pcm);i++)await new Promise(r=>setTimeout(r,20));
+    assert.ok(inputs.some(item=>item.pcm?.byteLength>100),'tap failure must not block the ordered Live sender');
+    assert.equal(timings.some(item=>item.event==='capture_tap_error'&&item.error_code==='TEST_TAP'),true);
+    assert.equal(client.sessionId,'one');
+  }finally{
+    client.stop();
+    releaseEvents?.({events:[],cursor:0,closed:true});
+    assert.equal(stopCalls,1);
+  }
+});

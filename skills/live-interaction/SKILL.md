@@ -39,6 +39,8 @@ products may use different keys. Resolve once per session, keep the same binding
 on resume, whitelist child environment, and never rotate keys to mask quota failure.
 Do not ask the user to paste credentials or put them in browser config/receipts.
 
+When a product needs a local control-plane recognizer while Live owns the microphone, use the shared browser client's optional `captureTap(pcm,rms)` after playback suppression. Keep that tap synchronous, bounded and local-only; do not open a second `getUserMedia`, create a competing audio transport, or delay provider delivery. Copy frames before retaining/transferring them and keep product command semantics outside the shared runtime.
+
 Preserve one ordered bounded sender, silence preroll/tail, immediate local Stop,
 no stale speech replay, full received output playback, separate spoken Stop
 confirmation, owner/resource checks and serialized authorized tools. An intentional

@@ -76,7 +76,7 @@ acknowledgement. Provider events are pushed immediately; output PCM is binary. A
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
-Release 0.3.6 serializes capability-level `media_resolution` as the scalar Gemini Live `generationConfig.mediaResolution` enum. Release 0.3.5 introduced the consumer setting, but object-wrapping the scalar is rejected by the Live setup schema. Consumers can therefore use low-resolution vision for routine verification and high resolution for dedicated image inspection without changing transport semantics.
+Release 0.3.7 adds optional `captureTap(pcm,rms)` on the browser client. The tap runs synchronously on each accepted microphone frame after `suppressCaptureDuringPlayback` has rejected frames while model audio is playing and before the ordered provider sender receives the frame. It is intended for bounded local-only control processing (for example a wake/navigation recognizer) that reuses the already-owned PCM16/16 kHz capture. The callback must not perform network I/O, acquire another microphone, block, mutate provider state or throw through the Live client; callback failures are isolated and reported only as bounded `capture_tap_error` timing telemetry. Release 0.3.6 serializes capability-level `media_resolution` as the scalar Gemini Live `generationConfig.mediaResolution` enum. Release 0.3.5 introduced the consumer setting, but object-wrapping the scalar is rejected by the Live setup schema. Consumers can therefore use low-resolution vision for routine verification and high resolution for dedicated image inspection without changing transport semantics.
 
 Release 0.3.4 makes each browser WSS audio send complete only after the relay ACK for that frame. The ordered audio sender therefore naturally paces startup/catch-up audio instead of dumping a valid multi-second handoff into WebSocket.bufferedAmount. ACK timeout remains fail-closed with bounded socket metrics.
 
@@ -113,7 +113,7 @@ secretly selecting the deprecated ScriptProcessor path.
 ## Browser API
 
 `createLiveClient({request?, onEvent, onState, onNotice, onTiming, onWait,
-voiceControl?})` returns `start`, `stop`, `input` and read-only `sessionId`,
+voiceControl?, captureTap?})` returns `start`, `stop`, `input` and read-only `sessionId`,
 `starting`, `generation`, `playingCount`.
 
 `start({url,body,authorize,takeMicrophoneHandoff?,microphone?,captureDuringStart?})`: same-origin authenticated collection URL, application
@@ -135,6 +135,8 @@ invalidates the epoch, clears pending speech, aborts requests and calls
 `onState('off')`. Remote cleanup has its own 2.5s bound. Preserve received playback
 only on provider closure/transport failure, never for a user's explicit Stop.
 `input({text})` starts a turn; `input({...product context})` is adapter-specific.
+
+`captureTap(pcm,rms)` is optional and receives the same PCM16/16 kHz microphone frame after playback suppression and before transport enqueue. Keep it synchronous, bounded and local-only; copy the frame before transferring or retaining it. Throwing from the tap is isolated from Live transport and reported as `capture_tap_error`. This hook is for local control-plane sidecars, not a second conversational pipeline.
 
 `onEvent(event,generation)` must not block playback with a long domain refresh.
 Before applying asynchronous UI results, compare the generation to the current
