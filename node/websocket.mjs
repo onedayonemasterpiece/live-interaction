@@ -4,6 +4,7 @@ export const LIVE_SOCKET_PROTOCOL='wl-live-v1';
 const GUID='258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const INPUT_MAGIC=0x574c4131;
 const OUTPUT_MAGIC=0x574c4f31;
+const STARTUP_CATCHUP_FLAG=0x80000000;
 const MAX_CLIENT_PAYLOAD=64*1024;
 const DEFAULT_MAX_SERVER_BUFFER=256*1024;
 
@@ -49,9 +50,9 @@ function outputAudio(event){
 function inputAudio(payload){
   if(payload.length<12||payload.length>11012)throw Object.assign(new Error('Invalid Live audio frame'),{code:'LIVE_SOCKET_FRAME'});
   if(payload.readUInt32BE(0)!==INPUT_MAGIC)throw Object.assign(new Error('Live audio frame magic mismatch'),{code:'LIVE_SOCKET_FRAME'});
-  const seq=payload.readUInt32BE(4),ageMs=payload.readUInt32BE(8),pcm=payload.subarray(12);
+  const seq=payload.readUInt32BE(4),encodedAge=payload.readUInt32BE(8),pcm=payload.subarray(12);
   if(!pcm.length||pcm.length%2)throw Object.assign(new Error('Live PCM payload is invalid'),{code:'LIVE_SOCKET_FRAME'});
-  return {seq,age_ms:ageMs,pcm};
+  return {seq,age_ms:encodedAge&0x7fffffff,startup_catchup:Boolean(encodedAge&STARTUP_CATCHUP_FLAG),pcm};
 }
 function parser(onFrame,onProtocolError){
   let buffer=Buffer.alloc(0),fragmentedOpcode=null,fragments=[],fragmentBytes=0,failed=false;
@@ -177,7 +178,7 @@ export function createLiveWebSocketUpgrade({
         if(opcode===2){
           if(!hello)throw Object.assign(new Error('Live socket hello required'),{code:'LIVE_SOCKET_HELLO'});
           const receivedAt=Date.now(),audio=inputAudio(payload);
-          binding.input({audio_base64:audio.pcm.toString('base64')},{receivedAt,frame_seq:audio.seq,capture_age_ms:audio.age_ms,connection_generation:connectionGeneration});
+          binding.input({audio_base64:audio.pcm.toString('base64')},{receivedAt,frame_seq:audio.seq,capture_age_ms:audio.age_ms,startup_catchup:audio.startup_catchup,connection_generation:connectionGeneration});
           sendText(socket,{type:'audio_ack',seq:audio.seq,server_received_at:receivedAt},maxServerBufferedBytes);
           return;
         }
