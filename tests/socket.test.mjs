@@ -40,6 +40,12 @@ test('binary browser frame carries sequence, age and raw PCM without base64 expa
   assert.equal(frame.byteLength,20);assert.equal(view.getUint32(4,false),17);assert.equal(view.getUint32(8,false),83);
   assert.deepEqual([...frame.slice(12)],[1,0,254,255,255,127,0,128]);
 });
+test('startup catchup bit shares the age field without changing frame size',()=>{
+  const pcm=new Int16Array([7,8]),frame=encodeLiveAudioFrame(pcm,{seq:3,age_ms:9000,startup_catchup:true}),view=new DataView(frame.buffer,frame.byteOffset,frame.byteLength);
+  assert.equal(frame.byteLength,16);
+  assert.equal(view.getUint32(4,false),3);
+  assert.equal(view.getUint32(8,false),0x80000000+9000);
+});
 test('socket ticket is single-use, pushes events and blocks tools from a transport-damaged turn',async()=>{
   const writes=[],calls=[],c=worker(writes);
   const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({
