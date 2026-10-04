@@ -237,3 +237,13 @@ test('finish seals a durable source without replaying provider transport require
   assert.equal(durable.at(-1).audio_stream_end,true);
   sender.stop();
 });
+test('honors a longer configured speech-end silence window',async()=>{
+ const sent=[];let at=0;
+ const sender=createLiveAudioSender({send:async message=>sent.push(message),now:()=>at,speechEndMs:4000});
+ sender.push(new Int16Array(1600).fill(1000),.05);await tick();
+ for(let i=0;i<39;i++){at+=100;sender.push(new Int16Array(1600),0);await tick();}
+ assert.equal(sent.filter(message=>message.audio_stream_end).length,0);
+ at+=100;sender.push(new Int16Array(1600),0);await tick();
+ assert.equal(sent.filter(message=>message.audio_stream_end).length,1);
+ sender.stop();
+});
