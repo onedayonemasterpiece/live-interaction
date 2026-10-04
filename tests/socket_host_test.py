@@ -107,6 +107,50 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         kinds = [json.loads(line)["type"] for line in self.provider.inputs]
         self.assertEqual(kinds[-4:], ["activity_start", "audio", "audio", "activity_end"])
 
+    async def test_startup_catchup_has_separate_bounded_age_window(self):
+        binding = self.open()
+        binding.connect(1)
+        await binding.input({"activity_start": True})
+        await binding.input(
+            {"audio_base64": "AAAA"},
+            frame_seq=1,
+            capture_age_ms=10_000,
+            pcm_bytes=2,
+            startup_catchup=True,
+        )
+        await binding.input(
+            {"audio_base64": "AAAA"},
+            frame_seq=2,
+            capture_age_ms=20_000,
+            pcm_bytes=2,
+            startup_catchup=True,
+        )
+        await binding.input(
+            {"audio_base64": "AAAA"},
+            frame_seq=3,
+            capture_age_ms=10,
+            pcm_bytes=2,
+        )
+        with self.assertRaises(LiveError) as after_steady:
+            await binding.input(
+                {"audio_base64": "AAAA"},
+                frame_seq=4,
+                capture_age_ms=10,
+                pcm_bytes=2,
+                startup_catchup=True,
+            )
+        self.assertEqual(after_steady.exception.code, "LIVE_SOCKET_STALE_AUDIO")
+        with self.assertRaises(LiveError) as too_old:
+            await binding.input(
+                {"audio_base64": "AAAA"},
+                frame_seq=4,
+                capture_age_ms=20_001,
+                pcm_bytes=2,
+                startup_catchup=True,
+            )
+        self.assertEqual(too_old.exception.code, "LIVE_SOCKET_STALE_AUDIO")
+        await binding.input({"activity_end": True})
+
     async def test_disconnect_damages_turn_until_clean_end_reaches_provider(self):
         binding = self.open()
         binding.connect(1)
@@ -217,11 +261,15 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
 class SocketWireContract(unittest.TestCase):
     def test_wire_is_big_endian_header_little_endian_pcm(self):
         data = bytes.fromhex("574c41310000002a0000007d0100feffff7f0080")
-        seq, age, pcm = decode_audio(data)
-        self.assertEqual((seq, age), (42, 125))
+        seq, age, startup_catchup, pcm = decode_audio(data)
+        self.assertEqual((seq, age, startup_catchup), (42, 125, False))
         self.assertEqual(struct.unpack("<hhhh", pcm), (1, -2, 32767, -32768))
         encoded = encode_output({"type": "audio", "seq": 42, "mime_type": "audio/pcm;rate=24000", "data": base64.b64encode(pcm).decode()})
         self.assertEqual(encoded.hex(), "574c4f310000002a00005dc00100feffff7f0080")
+        catchup = struct.pack("!III", 0x574C4131, 43, 0x80000000 | 9000) + pcm
+        cseq, cage, cflag, cpcm = decode_audio(catchup)
+        self.assertEqual((cseq, cage, cflag), (43, 9000, True))
+        self.assertEqual(cpcm, pcm)
 
     def test_bad_frames_are_bounded(self):
         for value in (b"", b"0" * 13, b"0" * 11014, b"0" * 14):
