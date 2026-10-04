@@ -58,6 +58,24 @@ remain complete for the trusted adapter `on_event` observer; only the polling/UI
 transcript text to a bounded 2000-character preview. A durable observer must persist or
 durably enqueue the trusted event before returning.
 
+## Multimodal tool results (Python candidate 0.3.11-rc.1)
+
+Python adapters return `with_live_tool_parts(result, parts)` from `execute_tool`.
+It mirrors Node's `withLiveToolParts`: one or two JPEG/PNG/WebP `inlineData`
+parts, each at most 512 KiB decoded, with a bounded `displayName`. Reference the
+image in the JSON result as `{"image":{"$ref":"comparison.jpg"}}`. Image bytes
+belong in `FunctionResponse.parts`, never in a JSON text field. Preserve the
+wrapped result through product response projection; `dict(result)` discards the
+attachment. Both first execution and cached call-ID replay carry the same parts;
+browser events contain no image bytes. Standalone realtime video snapshots do
+not guarantee that a tool verdict uses that frame.
+
+An immutable Python/native candidate may be distributed as a consumer-owned
+versioned Git source archive. Verify its SHA-256 and package/Python versions
+before installing it and generating native assets. Include `pyproject.toml` in
+that distribution. Local candidate acceptance does not publish or promote the
+framework release, and does not change other consumers' pins.
+
 ## WSS transport in 0.3.x
 
 A migrated consumer constructs `createLiveClient({transport:'wss', ...})`. The

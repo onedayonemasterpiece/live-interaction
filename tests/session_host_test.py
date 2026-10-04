@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from live_interaction.session_host import LiveError, LiveSessionHost
+from live_interaction import with_live_tool_parts
 
 
 class Adapter:
@@ -46,6 +47,37 @@ class Provider:
 
 
 class SessionHostContract(unittest.IsolatedAsyncioTestCase):
+    async def test_image_parts_survive_first_call_and_cached_replay_without_text_or_event_leak(self):
+        import base64
+        import json
+        image = base64.b64encode(b'image-fixture').decode()
+        calls = []
+        async def inspect(_session, call):
+            calls.append(call['id'])
+            return with_live_tool_parts({'image': {'$ref': 'ref.jpg'}}, [
+                {'inlineData': {'mimeType': 'image/jpeg', 'displayName': 'ref.jpg', 'data': image}}])
+        self.adapter.execute_tool = inspect
+        call = {'name': 'story.read', 'id': 'image', 'args': {}}
+        session = self.host.sessions[self.started['session_id']]
+        for _ in range(2):
+            await self.host._handle_tool_calls(session, [call])
+            await asyncio.sleep(0)
+        responses = [json.loads(line)['responses'][0] for line in self.provider.inputs
+                     if json.loads(line).get('type') == 'tool_response']
+        self.assertEqual(calls, ['image'])
+        self.assertEqual(len(responses), 2)
+        for response in responses:
+            self.assertEqual(response['parts'][0]['inlineData']['data'], image)
+            self.assertEqual(response['response']['image'], {'$ref': 'ref.jpg'})
+            self.assertNotIn(image, json.dumps(response['response']))
+        self.assertNotIn(image, json.dumps(list(session.events)))
+
+    def test_invalid_or_oversized_image_parts_are_rejected(self):
+        for data in ('?', 'A' * 700004):
+            with self.assertRaises(ValueError):
+                with_live_tool_parts({}, [{'inlineData': {'mimeType': 'image/jpeg',
+                    'displayName': 'ref.jpg', 'data': data}}])
+
     async def asyncSetUp(self):
         self.adapter = Adapter()
         self.provider = Provider()

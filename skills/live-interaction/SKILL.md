@@ -22,6 +22,13 @@ sidecar merely because the first WSS consumer was Node. Node products keep the
 existing Node binding and shared Python provider. Common protocol/conformance
 checks cover both; backend language choice is not a performance guarantee.
 
+For image inspection tools, use the shared multimodal wrapper: Node
+`withLiveToolParts`, Python `with_live_tool_parts` (candidate 0.3.11-rc.1).
+Return bounded `inlineData` parts and a `$ref` from the tool; preserve that wrapper
+through product reply compaction. Do not rely on a separate realtime video frame
+for a tool's image verdict. Verify an unrelated negative image followed by a
+matching later gallery image with the actual managed Live provider.
+
 Android products consume the native Java socket binding from the same immutable
 archive as a generated source set; never edit or copy a fork into a product.
 The app retains capture/VAD/playback/UI. Browser products use the existing shared

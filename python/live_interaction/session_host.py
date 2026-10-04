@@ -6,6 +6,8 @@ authorization and mutations.
 """
 from __future__ import annotations
 
+from .tool_parts import function_response
+
 import asyncio
 import hashlib
 import inspect
@@ -569,11 +571,9 @@ class LiveSessionHost:
             if len(calls) == 1:
                 call_id = str(calls[0].get("id") or "")
                 if call_id and call_id in session.tool_results:
-                    self._send_tool_responses(session, [{
-                        "name": str(calls[0].get("name") or "unknown"),
-                        "id": call_id,
-                        "response": {"result": session.tool_results[call_id]},
-                    }])
+                    self._send_tool_responses(session, [function_response(
+                        str(calls[0].get("name") or "unknown"), call_id, session.tool_results[call_id]
+                    )])
                     return
             resolver = getattr(self.adapter, "resolve_capability", None)
             if callable(resolver):
@@ -689,7 +689,7 @@ class LiveSessionHost:
                             else None,
                         },
                     )
-                    responses.append({"name": name, "id": call_id, "response": {"result": result}})
+                    responses.append(function_response(name, call_id, result))
                 except Exception as exc:
                     code = getattr(exc, "code", "LIVE_TOOL_ERROR")
                     self._emit(
