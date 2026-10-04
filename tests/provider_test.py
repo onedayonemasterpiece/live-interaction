@@ -614,3 +614,16 @@ class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VersionMetadataTest(unittest.TestCase):
+    def test_version_metadata_stays_consistent(self):
+        import tomllib
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        init_text = (root / "python/live_interaction/__init__.py").read_text(encoding="utf-8")
+        expected = pyproject["project"]["version"]
+        self.assertEqual(package["version"], expected)
+        self.assertIn(f'__version__ = "{expected}"', init_text)
