@@ -171,6 +171,22 @@ class ProviderContract(unittest.TestCase):
         handle_server_message({'serverContent': {'inputTranscription': {'text': text}}}, emit=events.append)
         self.assertEqual(events[0]['text'], text)
 
+    def test_automatic_activity_detection_configuration_is_bounded(self):
+        setup = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={'automatic_activity_detection': {
+                'end_of_speech_sensitivity': 'END_SENSITIVITY_LOW',
+                'silence_duration_ms': 5000,
+                'prefix_padding_ms': 250,
+            }},
+        )['setup']
+        automatic = setup['realtimeInputConfig']['automaticActivityDetection']
+        self.assertFalse(automatic['disabled'])
+        self.assertEqual(automatic['endOfSpeechSensitivity'], 'END_SENSITIVITY_LOW')
+        self.assertEqual(automatic['silenceDurationMs'], 5000)
+        self.assertEqual(automatic['prefixPaddingMs'], 250)
+
     def test_audio_tail_is_emitted_before_completion(self):
         events=[]
         handle_server_message({'serverContent':{'modelTurn':{'parts':[{'inlineData':{'mimeType':'audio/pcm;rate=24000','data':'AAAA'}}]},'turnComplete':True}},emit=events.append)
