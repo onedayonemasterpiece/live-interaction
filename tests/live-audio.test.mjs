@@ -31,6 +31,7 @@ test('bounded handoff catch-up drains a startup backlog then restores the steady
  assert.equal(sender.seed(frames),true);
  assert.equal(error,undefined);
  assert.equal(sender.stats().catchup,true);
+ assert.equal(sent[0]?.startup_catchup,true);
  assert.ok(sender.stats().queued_pcm_bytes>48000);
  releaseFirst();
  for(let i=0;i<100&&sender.stats().catchup;i++)await tick();
@@ -246,4 +247,13 @@ test('honors a longer configured speech-end silence window',async()=>{
  at+=100;sender.push(new Int16Array(1600),0);await tick();
  assert.equal(sent.filter(message=>message.audio_stream_end).length,1);
  sender.stop();
+});
+
+test('steady-state PCM is not marked as startup catchup',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({send:async message=>sent.push(message),now:()=>at});
+  for(let i=0;i<8;i++){at+=90;sender.push(new Int16Array(1440).fill(1000),.05);await tick();}
+  assert.ok(sent.some(message=>message.pcm));
+  assert.ok(sent.filter(message=>message.pcm).every(message=>message.startup_catchup===false));
+  sender.stop();
 });
