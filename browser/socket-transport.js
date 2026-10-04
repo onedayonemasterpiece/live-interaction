@@ -1,6 +1,7 @@
 export const LIVE_SOCKET_PROTOCOL='wl-live-v1';
 const INPUT_MAGIC=0x574c4131;
 const OUTPUT_MAGIC=0x574c4f31;
+const STARTUP_CATCHUP_FLAG=0x80000000;
 
 function socketUrl(value){
   const base=globalThis.location?.href??'http://localhost/';
@@ -11,10 +12,12 @@ function socketUrl(value){
   return url.href;
 }
 function u32(view,offset,value){view.setUint32(offset,Math.max(0,Math.min(0xffffffff,Math.round(value)||0)),false);}
-export function encodeLiveAudioFrame(pcm,{seq=0,age_ms=0}={}){
+export function encodeLiveAudioFrame(pcm,{seq=0,age_ms=0,startup_catchup=false}={}){
   if(!(pcm instanceof Int16Array))throw new TypeError('PCM frame must be Int16Array');
+  const age=Math.max(0,Math.min(STARTUP_CATCHUP_FLAG-1,Math.round(age_ms)||0));
+  const encodedAge=age+(startup_catchup?STARTUP_CATCHUP_FLAG:0);
   const bytes=new Uint8Array(12+pcm.byteLength),view=new DataView(bytes.buffer);
-  view.setUint32(0,INPUT_MAGIC,false);u32(view,4,seq);u32(view,8,age_ms);
+  view.setUint32(0,INPUT_MAGIC,false);u32(view,4,seq);u32(view,8,encodedAge);
   bytes.set(new Uint8Array(pcm.buffer,pcm.byteOffset,pcm.byteLength),12);
   return bytes;
 }
@@ -135,7 +138,7 @@ export function createLiveSocketTransport({
   function send(message){
     requireOpen();
     if(message?.pcm instanceof Int16Array){
-      const seq=++audioSeq,frame=encodeLiveAudioFrame(message.pcm,{seq,age_ms:message.age_ms});
+      const seq=++audioSeq,frame=encodeLiveAudioFrame(message.pcm,{seq,age_ms:message.age_ms,startup_catchup:message.startup_catchup===true});
       return new Promise((resolve,reject)=>{
         const pending={at:now(),resolve,reject,timer:null};sent.set(seq,pending);
         try{socket.send(frame);}catch(error){sent.delete(seq);reject(error);return;}
@@ -144,7 +147,7 @@ export function createLiveSocketTransport({
           const m=metrics();sent.delete(seq);
           reject(Object.assign(new Error('Live WebSocket acknowledgement timeout'),{code:'LIVE_SOCKET_BACKPRESSURE',metrics:m}));
         },maxUnackedAgeMs);
-        onTiming('socket_audio_sent',{seq,pcm_bytes:message.pcm.byteLength,capture_age_ms:Math.round(message.age_ms??0),...metrics()});
+        onTiming('socket_audio_sent',{seq,pcm_bytes:message.pcm.byteLength,capture_age_ms:Math.round(message.age_ms??0),startup_catchup:message.startup_catchup===true,...metrics()});
       });
     }
     const safe=message?.audio_stream_end?{type:'input',message:{audio_stream_end:true,captured_at_ms:message.captured_at_ms,age_ms:message.age_ms}}

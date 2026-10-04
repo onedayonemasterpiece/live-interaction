@@ -23,6 +23,8 @@ from .session_host import LiveError, LiveSessionHost, _maybe_await
 SOCKET_PROTOCOL = "wl-live-v1"
 TICKET_TTL_SECONDS = 15
 MAX_CAPTURE_AGE_MS = 2500
+MAX_STARTUP_CATCHUP_AGE_MS = 20_000
+MAX_STARTUP_CATCHUP_PCM_BYTES = 720_000
 LOG = logging.getLogger("live_interaction.socket")
 
 
@@ -214,6 +216,8 @@ class SocketBinding:
         self.last_audio_seq: int | None = None
         self.connected = False
         self.stopped = False
+        self.startup_catchup_open = True
+        self.startup_catchup_pcm_bytes = 0
 
     @property
     def attempt_id(self):
@@ -225,6 +229,8 @@ class SocketBinding:
         if self.state.claim != self.claim or self.session.closed:
             raise LiveError("LIVE_SOCKET_CLOSED", "Live socket is closed")
         self.connected = True
+        self.startup_catchup_open = generation == 1
+        self.startup_catchup_pcm_bytes = 0
         self.state.generation = generation
         self.state.used_wss = True
         self.host._touch(self.session)
@@ -244,13 +250,25 @@ class SocketBinding:
             raise LiveError("LIVE_SOCKET_CLOSED", "Live socket is closed")
         self.host._touch(self.session)
 
-    async def input(self, message, *, frame_seq=None, capture_age_ms=None, pcm_bytes=None):
+    async def input(self, message, *, frame_seq=None, capture_age_ms=None, pcm_bytes=None,
+                    startup_catchup=False):
         self.heartbeat()
         if frame_seq is not None:
             if frame_seq <= 0 or (self.last_audio_seq is not None and frame_seq != self.last_audio_seq + 1):
                 raise LiveError("LIVE_SOCKET_SEQUENCE", "Audio frame sequence is not contiguous")
-            if capture_age_ms is None or not 0 <= capture_age_ms <= MAX_CAPTURE_AGE_MS:
-                raise LiveError("LIVE_SOCKET_STALE_AUDIO", "Audio frame is stale")
+            if startup_catchup:
+                if not self.startup_catchup_open or self.state.generation != 1:
+                    raise LiveError("LIVE_SOCKET_STALE_AUDIO", "Startup catchup is not allowed")
+                if capture_age_ms is None or not 0 <= capture_age_ms <= MAX_STARTUP_CATCHUP_AGE_MS:
+                    raise LiveError("LIVE_SOCKET_STALE_AUDIO", "Startup catchup audio is stale")
+                size = int(pcm_bytes or 0)
+                if size <= 0 or self.startup_catchup_pcm_bytes + size > MAX_STARTUP_CATCHUP_PCM_BYTES:
+                    raise LiveError("LIVE_SOCKET_BACKPRESSURE", "Startup catchup audio exceeds its bound")
+                self.startup_catchup_pcm_bytes += size
+            else:
+                self.startup_catchup_open = False
+                if capture_age_ms is None or not 0 <= capture_age_ms <= MAX_CAPTURE_AGE_MS:
+                    raise LiveError("LIVE_SOCKET_STALE_AUDIO", "Audio frame is stale")
         result = await self.host.input(session_id=self.session.id, resource_id=self.session.resource_id,
                                       actor=self.session.actor, message=message, _socket_claim=self.claim)
         if frame_seq is not None:
@@ -258,6 +276,7 @@ class SocketBinding:
             if frame_seq == 1 or frame_seq % 16 == 0:
                 self.host.diagnostic(self.session, "socket_audio_accepted", frame_seq=frame_seq,
                                      pcm_bytes=pcm_bytes, capture_age_ms=capture_age_ms,
+                                     startup_catchup=bool(startup_catchup),
                                      connection_generation=self.state.generation)
         return result
 

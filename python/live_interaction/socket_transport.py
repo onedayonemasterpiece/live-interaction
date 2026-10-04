@@ -19,6 +19,7 @@ from .socket_host import SOCKET_PROTOCOL
 
 INPUT_MAGIC = 0x574C4131
 OUTPUT_MAGIC = 0x574C4F31
+STARTUP_CATCHUP_FLAG = 1 << 31
 MAX_PCM_BYTES = 11000
 MAX_CONTROL_BYTES = 65536
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -45,10 +46,12 @@ def same_origin(origin, host):
 def decode_audio(data):
     if not isinstance(data, bytes) or not 14 <= len(data) <= MAX_PCM_BYTES + 12 or len(data) % 2:
         raise LiveError("LIVE_SOCKET_FRAME", "Invalid PCM frame length")
-    magic, seq, age = struct.unpack("!III", data[:12])
+    magic, seq, encoded_age = struct.unpack("!III", data[:12])
     if magic != INPUT_MAGIC:
         raise LiveError("LIVE_SOCKET_FRAME", "Invalid PCM frame version")
-    return seq, age, data[12:]
+    startup_catchup = bool(encoded_age & STARTUP_CATCHUP_FLAG)
+    age = encoded_age & (STARTUP_CATCHUP_FLAG - 1)
+    return seq, age, startup_catchup, data[12:]
 
 
 def encode_output(event):
@@ -125,9 +128,10 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             if frame is None:
                 return
             if isinstance(frame, bytes):
-                seq, age, pcm = decode_audio(frame)
+                seq, age, startup_catchup, pcm = decode_audio(frame)
                 await binding.input({"audio_base64": base64.b64encode(pcm).decode("ascii")},
-                                    frame_seq=seq, capture_age_ms=age, pcm_bytes=len(pcm))
+                                    frame_seq=seq, capture_age_ms=age, pcm_bytes=len(pcm),
+                                    startup_catchup=startup_catchup)
                 await asyncio.wait_for(send(json.dumps({"type": "audio_ack", "seq": seq,
                     "server_received_at": round(time.time() * 1000)})), send_timeout)
                 continue
