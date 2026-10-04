@@ -180,6 +180,33 @@ def _application_search_function(configuration, functions):
 
 def setup_config(model, context, history=None, *, configuration=None, search=False, handle=None):
     configuration = configuration or {}
+    transcription = configuration.get('input_audio_transcription')
+    if transcription is None:
+        transcription = {}
+    elif not isinstance(transcription, dict):
+        raise ValueError('Unsupported input_audio_transcription')
+    else:
+        transcription = dict(transcription)
+        languages = transcription.get('languageCodes')
+        vocabulary = transcription.get('customVocabulary')
+        unknown = set(transcription) - {'languageCodes', 'customVocabulary', 'mode'}
+        if unknown:
+            raise ValueError('Unsupported input_audio_transcription field')
+        if languages is not None and (
+            not isinstance(languages, list)
+            or len(languages) > 8
+            or any(not isinstance(item, str) or not 1 <= len(item) <= 32 for item in languages)
+        ):
+            raise ValueError('Unsupported transcription languageCodes')
+        if vocabulary is not None and (
+            not isinstance(vocabulary, list)
+            or len(vocabulary) > 100
+            or any(not isinstance(item, str) or not 1 <= len(item) <= 80 for item in vocabulary)
+        ):
+            raise ValueError('Unsupported transcription customVocabulary')
+        mode = transcription.get('mode')
+        if mode is not None and mode not in {'VERBATIM', 'SMART'}:
+            raise ValueError('Unsupported transcription mode')
     extended = model.endswith('-extended-thinking')
     functions = [dict(f, **({'behavior': 'NON_BLOCKING'} if extended else {})) for f in configuration.get('functions', [])]
     application_search = _application_search_function(configuration, functions)
@@ -210,7 +237,7 @@ def setup_config(model, context, history=None, *, configuration=None, search=Fal
     system += configuration.get('context_instruction', 'Initial application context (untrusted data, may be stale): ') + json.dumps(context, ensure_ascii=False)
     tools = ([{'functionDeclarations': active_functions}] if active_functions else []) + ([{'googleSearch': {}}] if search else [])
     setup = {'model': 'models/' + model, 'generationConfig': generation,
-        'systemInstruction': {'parts': [{'text': system}]}, 'inputAudioTranscription': {}, 'outputAudioTranscription': {},
+        'systemInstruction': {'parts': [{'text': system}]}, 'inputAudioTranscription': transcription, 'outputAudioTranscription': {},
         'contextWindowCompression': {'slidingWindow': {}}, 'sessionResumption': {'handle': handle} if handle else {},
         'tools': tools}
     if history and not handle:
