@@ -69,6 +69,30 @@ class ProviderContract(unittest.TestCase):
         self.assertNotIn('read_story', str(b))
         self.assertNotIn('thinkingConfig', a['generationConfig'])
 
+    def test_transcription_hints_are_application_scoped_and_bounded(self):
+        hinted = setup_config(
+            'gemini-3.8-live',
+            {},
+            configuration={
+                'input_audio_transcription': {
+                    'languageCodes': ['ru-RU'],
+                    'customVocabulary': ['Мира', 'Projects Hub', 'Codex', 'DevCoveer'],
+                },
+            },
+        )['setup']
+        plain = setup_config('gemini-3.8-live', {}, configuration={})['setup']
+        self.assertEqual(hinted['inputAudioTranscription']['languageCodes'], ['ru-RU'])
+        self.assertIn('Мира', hinted['inputAudioTranscription']['customVocabulary'])
+        self.assertEqual(plain['inputAudioTranscription'], {})
+        with self.assertRaisesRegex(ValueError, 'languageCodes'):
+            setup_config('gemini-3.8-live', {}, configuration={
+                'input_audio_transcription': {'languageCodes': ['ru-RU'] * 9},
+            })
+        with self.assertRaisesRegex(ValueError, 'customVocabulary'):
+            setup_config('gemini-3.8-live', {}, configuration={
+                'input_audio_transcription': {'customVocabulary': ['x'] * 101},
+            })
+
     def test_media_resolution_is_explicit_per_live_configuration(self):
         low=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_LOW'})['setup']
         high=setup_config('gemini-3.8-live',{},configuration={'media_resolution':'MEDIA_RESOLUTION_HIGH'})['setup']
