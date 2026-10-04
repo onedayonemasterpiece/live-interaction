@@ -73,7 +73,7 @@ export function createLiveAudioSender({
     if(closed||busy||!queue.length)return;
     clearTimeout(timer);timer=null;
     maybeFinishCatchup();
-    const first=queue[0],parts=[];let size=0;
+    const first=queue[0],parts=[];let size=0,startupCatchup=catchup;
     if(first.end)queue.shift();
     else{
       if(first.pcm&&!catchup&&now()-first.at>maxAgeMs){
@@ -87,9 +87,9 @@ export function createLiveAudioSender({
     const pcm=new Int16Array(size/2);let offset=0;
     for(const part of parts){pcm.set(part,offset);offset+=part.length;}
     busy=true;const at=now();
-    report('post_start',{capture_at_ms:first.at,batch_chunks:parts.length,pcm_bytes:size,queue_age_ms:at-first.at,stream_end:Boolean(first.end)});
+    report('post_start',{capture_at_ms:first.at,batch_chunks:parts.length,pcm_bytes:size,queue_age_ms:at-first.at,stream_end:Boolean(first.end),startup_catchup:startupCatchup});
     try{
-      await send(first.end?{audio_stream_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}:{pcm,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)});
+      await send(first.end?{audio_stream_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}:{pcm,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at),startup_catchup:startupCatchup});
       report('post_end',{duration_ms:now()-at,pcm_bytes:size});
     }catch(error){
       if(!closed)fail(error);
