@@ -244,6 +244,33 @@ def setup_config(model, context, history=None, *, configuration=None, search=Fal
         setup['historyConfig'] = {'initialHistoryInClientContent': True}
     if configuration.get('manual_activity_detection'):
         setup['realtimeInputConfig'] = {'automaticActivityDetection': {'disabled': True}}
+    else:
+        vad = configuration.get('automatic_activity_detection')
+        if vad is not None:
+            if not isinstance(vad, dict):
+                raise ValueError('automatic_activity_detection must be an object')
+            automatic = {'disabled': False}
+            silence = vad.get('silence_duration_ms')
+            if silence is not None:
+                if isinstance(silence, bool) or not isinstance(silence, int) or not 100 <= silence <= 10000:
+                    raise ValueError('silence_duration_ms must be between 100 and 10000')
+                automatic['silenceDurationMs'] = silence
+            prefix = vad.get('prefix_padding_ms')
+            if prefix is not None:
+                if isinstance(prefix, bool) or not isinstance(prefix, int) or not 0 <= prefix <= 2000:
+                    raise ValueError('prefix_padding_ms must be between 0 and 2000')
+                automatic['prefixPaddingMs'] = prefix
+            start = vad.get('start_of_speech_sensitivity')
+            if start is not None:
+                if start not in {'START_SENSITIVITY_LOW', 'START_SENSITIVITY_HIGH'}:
+                    raise ValueError('Unsupported start_of_speech_sensitivity')
+                automatic['startOfSpeechSensitivity'] = start
+            end = vad.get('end_of_speech_sensitivity')
+            if end is not None:
+                if end not in {'END_SENSITIVITY_LOW', 'END_SENSITIVITY_HIGH'}:
+                    raise ValueError('Unsupported end_of_speech_sensitivity')
+                automatic['endOfSpeechSensitivity'] = end
+            setup['realtimeInputConfig'] = {'automaticActivityDetection': automatic}
     return {'setup': setup}
 
 

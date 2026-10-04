@@ -12,11 +12,13 @@ export function createLiveAudioSender({
   maxQueueMs=2500,
   maxAgeMs=2500,
   maxBootstrapMs=20000,
+  speechEndMs=2000,
   persist=null
 }={}){
   let queue=[],preRoll=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
   let catchup=false,catchupSealed=false,catchupSeedBytes=0;
   let durableBytes=0,durableItems=0,durableChain=Promise.resolve(),durableError=null,lastStagedWasEnd=false;
+  if(!Number.isFinite(speechEndMs)||speechEndMs<500||speechEndMs>10000)throw new TypeError('Invalid speechEndMs');
   const bytesPerSecond=32000;
   const steadyByteLimit=bytesPerSecond*maxQueueMs/1000;
   const catchupByteLimit=bytesPerSecond*(maxBootstrapMs+maxQueueMs)/1000;
@@ -169,7 +171,7 @@ export function createLiveAudioSender({
       quietMs=0;stage(item);
     }else if(active){
       stage(item);quietMs+=duration;
-      if(quietMs>=2000){
+      if(quietMs>=speechEndMs){
         active=false;stage({end:true,at});report('speech_end',{capture_at_ms:at});
       }
     }else{
