@@ -25,8 +25,22 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackCaptureAt=0,suppressResponseReason=null;
   const adaptiveDuplexGate=createAdaptiveDuplexGate();
-  const pendingTools=new Set();
+  const pendingTools=new Set(),pendingPlayback=new Set();
+  let playbackGeneration=0,responseComplete=false;
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
+  function maybeListening(){
+    if(sessionId&&microphoneEnabled&&microphone?.running&&!budgetPaused&&responseComplete&&!awaitingReply&&!playing.size&&!pendingPlayback.size)onState('listening');
+  }
+  async function resumePlaybackContext(){
+    let timer;
+    try{
+      await Promise.race([
+        playContext.resume(),
+        new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error('Audio playback did not start'),{code:'LIVE_PLAYBACK_BLOCKED'})),2500);})
+      ]);
+      if(typeof playContext.state==='string'&&playContext.state!=='running')throw Object.assign(new Error('Audio playback is not running'),{code:'LIVE_PLAYBACK_BLOCKED'});
+    }finally{clearTimeout(timer);}
+  }
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
   function beginWait(){
     if(waitAt!==null)return;
@@ -58,14 +72,16 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return true;
   }
   function stopPlayback(reason='user_stop'){
+    ++playbackGeneration;pendingPlayback.clear();
     if(playing.size)onTiming('playback_cancelled',{reason,queued_buffers:playing.size,remaining_ms:Math.max(0,(nextPlayAt-playContext.currentTime)*1000)});
     for(const node of playing){try{node.liveCancelled=true;node.stop();}catch{}}
     playing.clear();nextPlayAt=0;adaptiveDuplexGate.resetPlayback();
   }
   async function play(event,epoch){
-    const Context=Audio();if(!Context)return;
-    playContext??=new Context();if(playContext.state==='suspended')await playContext.resume().catch(()=>{});
-    if(epoch!==generation||!sessionId)return;
+    const playbackEpoch=playbackGeneration;
+    const Context=Audio();if(!Context)throw Object.assign(new Error('Audio playback is unavailable'),{code:'LIVE_PLAYBACK_UNAVAILABLE'});
+    playContext??=new Context();if(playContext.state==='suspended')await resumePlaybackContext();
+    if(epoch!==generation||playbackEpoch!==playbackGeneration||!sessionId)return;
     const bytes=event.pcm instanceof Uint8Array?event.pcm:(()=>{const raw=atob(event.data);return Uint8Array.from(raw,c=>c.charCodeAt(0));})();
     const rate=Number(/rate=(\d+)/.exec(event.mime_type??'')?.[1]??24000),samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
     let peak=0,sumSquares=0;
@@ -87,7 +103,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const at=Math.max(playContext.currentTime+(runStart?.4:.02),nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
     if(runStart)onTiming('playback_buffering',{buffer_ms:400,first_chunk_ms:buffer.duration*1000});
     onTiming('audio_scheduled',{...playbackFacts,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
-    source.onended=()=>{playing.delete(source);if(!playing.size)adaptiveDuplexGate.resetPlayback();source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);};source.start(at);
+    source.onended=()=>{playing.delete(source);if(!playing.size)adaptiveDuplexGate.resetPlayback();source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);maybeListening();};source.start(at);
   }
   function input(message){
     if(!sessionId)return Promise.resolve();
@@ -222,7 +238,15 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     }else if(event.type==='audio'){
       awaitingReply=false;clearWait();
       if(suppressOutput)onTiming('response_output_suppressed',{reason:suppressResponseReason,event_type:'audio',pcm_bytes:Number(event?.pcm?.byteLength??0)||undefined});
-      else{if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});onState('answering');await play(event,epoch);}
+      else{
+        responseComplete=false;
+        const pending={},playbackEpoch=playbackGeneration;pendingPlayback.add(pending);
+        if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});
+        onState('answering');
+        try{await play(event,epoch);}
+        catch(error){if(epoch===generation&&playbackEpoch===playbackGeneration){onTiming('playback_error',{code:String(error?.code??'LIVE_PLAYBACK_ERROR').slice(0,80)});onNotice('playback_error',error);}}
+        finally{pendingPlayback.delete(pending);maybeListening();}
+      }
     }else if(event.type==='input_timing'){
       // Compare events within the server clock only; browser clock may differ.
       if(waitAt!==null&&(event.audio_stream_end_sent_at||event.text_sent_at))waitStage=pendingTools.size?'action':'provider';
@@ -233,6 +257,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     else if(event.type==='turn_complete'){
       if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
       if(suppressResponseReason){onTiming('response_suppression_ended',{reason:suppressResponseReason});suppressResponseReason=null;}
+      responseComplete=true;maybeListening();
     }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
     else if(event.type==='resource_budget_wait'){
       beginWait();waitStage='resource';
@@ -328,7 +353,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         await socketTransport.connect({url:socketUrl,ticket:started.socket_ticket,attempt_id:attemptId,cursor,connection_generation:connectionGeneration});
       }
       const {socket_ticket,...startedPublic}=started;onState('started',startedPublic);
-      const Context=Audio();if(Context){playContext??=new Context();await playContext.resume().catch(()=>{});}
+      const Context=Audio();if(Context){playContext??=new Context();await resumePlaybackContext().catch(error=>{if(epoch===generation)onNotice('playback_error',error);});}
       if(epoch!==generation)return;
       starting=false;if(transport==='http')void poll();
       const handoff=microphoneEnabled
@@ -352,5 +377,6 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return startMic(epoch,handoff);
   }
   function disableMicrophone(){microphoneEnabled=false;closeMic();}
-  return {start,stop,input,enableMicrophone,disableMicrophone,suppressCurrentResponse,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;},get microphoneEnabled(){return microphoneEnabled;},get responseSuppressed(){return Boolean(suppressResponseReason);}};
+  function finishTurn(){return Boolean(sessionId&&microphoneEnabled&&!budgetPaused&&sender?.endTurn());}
+  return {start,stop,input,finishTurn,enableMicrophone,disableMicrophone,suppressCurrentResponse,get sessionId(){return sessionId;},get starting(){return starting;},get generation(){return generation;},get playingCount(){return playing.size;},get microphoneEnabled(){return microphoneEnabled;},get responseSuppressed(){return Boolean(suppressResponseReason);}};
 }
