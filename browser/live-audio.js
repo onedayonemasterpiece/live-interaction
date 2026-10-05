@@ -13,12 +13,19 @@ export function createLiveAudioSender({
   maxAgeMs=2500,
   maxBootstrapMs=20000,
   speechEndMs=2000,
+  longSpeechEndMs=null,
+  longSpeechAfterMs=null,
+  manualActivityDetection=false,
   persist=null
 }={}){
   let queue=[],preRoll=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
+  let activityOpen=false,turnElapsedMs=0;
   let catchup=false,catchupSealed=false,catchupSeedBytes=0;
   let durableBytes=0,durableItems=0,durableChain=Promise.resolve(),durableError=null,lastStagedWasEnd=false;
   if(!Number.isFinite(speechEndMs)||speechEndMs<500||speechEndMs>10000)throw new TypeError('Invalid speechEndMs');
+  if((longSpeechEndMs===null)!==(longSpeechAfterMs===null))throw new TypeError('Long speech silence settings must be configured together');
+  if(longSpeechEndMs!==null&&(!Number.isFinite(longSpeechEndMs)||longSpeechEndMs<speechEndMs||longSpeechEndMs>10000))throw new TypeError('Invalid longSpeechEndMs');
+  if(longSpeechAfterMs!==null&&(!Number.isFinite(longSpeechAfterMs)||longSpeechAfterMs<1000||longSpeechAfterMs>600000))throw new TypeError('Invalid longSpeechAfterMs');
   const bytesPerSecond=32000;
   const steadyByteLimit=bytesPerSecond*maxQueueMs/1000;
   const catchupByteLimit=bytesPerSecond*(maxBootstrapMs+maxQueueMs)/1000;
@@ -44,7 +51,9 @@ export function createLiveAudioSender({
     catchup,
     catchup_seed_pcm_bytes:catchupSeedBytes,
     durable_pending_items:durableItems,
-    durable_pending_pcm_bytes:durableBytes
+    durable_pending_pcm_bytes:durableBytes,
+    activity_open:activityOpen,
+    turn_elapsed_ms:Math.round(turnElapsedMs)
   });
   const report=(event,extra={})=>onTiming(event,{...stats(),...extra});
   const rebaseQueuedAge=()=>{
@@ -74,7 +83,7 @@ export function createLiveAudioSender({
     clearTimeout(timer);timer=null;
     maybeFinishCatchup();
     const first=queue[0],parts=[];let size=0,startupCatchup=catchup;
-    if(first.end)queue.shift();
+    if(first.activity_start||first.end)queue.shift();
     else{
       if(first.pcm&&!catchup&&now()-first.at>maxAgeMs){
         fail(Object.assign(new Error('Сеть не успевает передавать речь. Запустите Live снова.'),{code:'LIVE_AUDIO_QUEUE_AGE'}));
@@ -87,9 +96,17 @@ export function createLiveAudioSender({
     const pcm=new Int16Array(size/2);let offset=0;
     for(const part of parts){pcm.set(part,offset);offset+=part.length;}
     busy=true;const at=now();
-    report('post_start',{capture_at_ms:first.at,batch_chunks:parts.length,pcm_bytes:size,queue_age_ms:at-first.at,stream_end:Boolean(first.end),startup_catchup:startupCatchup});
+    const boundary=first.activity_start?'activity_start':first.end?(manualActivityDetection?'activity_end':'audio_stream_end'):null;
+    report('post_start',{capture_at_ms:first.at,batch_chunks:parts.length,pcm_bytes:size,queue_age_ms:at-first.at,stream_end:Boolean(first.end),boundary,startup_catchup:startupCatchup});
     try{
-      await send(first.end?{audio_stream_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}:{pcm,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at),startup_catchup:startupCatchup});
+      const outbound=first.activity_start
+        ?{activity_start:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}
+        :first.end
+          ?(manualActivityDetection
+            ?{activity_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)}
+            :{audio_stream_end:true,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at)})
+          :{pcm,captured_at_ms:first.at,age_ms:Math.max(0,now()-first.at),startup_catchup:startupCatchup};
+      await send(outbound);
       report('post_end',{duration_ms:now()-at,pcm_bytes:size});
     }catch(error){
       if(!closed)fail(error);
@@ -133,8 +150,18 @@ export function createLiveAudioSender({
   async function drainDurable(){await durableChain;if(durableError)throw durableError;}
   async function finish(){
     if(!lastStagedWasEnd){
-      active=false;quietMs=0;preRoll=[];
-      stage({end:true,at:now()});
+      const at=now();
+      active=false;quietMs=0;preRoll=[];turnElapsedMs=0;
+      if(manualActivityDetection){
+        if(activityOpen){
+          activityOpen=false;
+          stage({end:true,activity_end:true,at});
+        }else if(typeof persist==='function'){
+          await persist({audio_stream_end:true,captured_at_ms:at});
+        }
+      }else{
+        stage({end:true,at});
+      }
     }
     await drainDurable();
   }
@@ -149,7 +176,7 @@ export function createLiveAudioSender({
       return;
     }
     if(busy)return;
-    if(queue.some(x=>x.end)||bytes>=bytesPerSecond*batchMs/1000)void pump();
+    if(queue.some(x=>x.end||x.activity_start)||bytes>=bytesPerSecond*batchMs/1000)void pump();
     else if(queue.length&&!timer)timer=setTimeout(()=>{timer=null;void pump();},Math.max(0,batchMs-(now()-queue[0].at)));
   }
 
@@ -163,16 +190,25 @@ export function createLiveAudioSender({
     // Keep onset conservative, but do not cut quiet words after a turn began.
     if(rms>=(active?0.003:0.008)){
       if(!active){
-        active=true;
+        active=true;turnElapsedMs=0;
+        if(manualActivityDetection){
+          activityOpen=true;
+          enqueue({activity_start:true,at});
+        }
         for(const previous of preRoll)stage(previous);
         preRoll=[];
-        report('speech_start',{capture_at_ms:at});
+        report('speech_start',{capture_at_ms:at,manual_activity_detection:manualActivityDetection});
       }
-      quietMs=0;stage(item);
+      turnElapsedMs+=duration;quietMs=0;stage(item);
     }else if(active){
-      stage(item);quietMs+=duration;
-      if(quietMs>=speechEndMs){
-        active=false;stage({end:true,at});report('speech_end',{capture_at_ms:at});
+      turnElapsedMs+=duration;stage(item);quietMs+=duration;
+      const endMs=longSpeechEndMs!==null&&turnElapsedMs>=longSpeechAfterMs?longSpeechEndMs:speechEndMs;
+      if(quietMs>=endMs){
+        const elapsedMs=turnElapsedMs;
+        active=false;turnElapsedMs=0;
+        if(manualActivityDetection)activityOpen=false;
+        stage({end:true,activity_end:manualActivityDetection,at});
+        report('speech_end',{capture_at_ms:at,speech_end_silence_ms:endMs,turn_elapsed_ms:elapsedMs,manual_activity_detection:manualActivityDetection});
       }
     }else{
       suppressed++;preRoll.push(item);
