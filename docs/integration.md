@@ -68,6 +68,21 @@ must not persist it as authoritative conversation history, memory, commands or
 tool authorization. The finalized provider `inputTranscription` continues to
 map to `input_transcript` and remains the durable transcript boundary.
 
+## Adaptive manual long-form turns in 0.3.17
+
+Browser consumers may opt into `manualActivityDetection:true` so the shared
+client-side PCM/VAD path sends ordered `activity_start` / `activity_end`
+boundaries instead of `audio_stream_end`. This uses the same microphone and
+energy gate; it does not add a second ASR or semantic agent.
+
+`longSpeechAfterMs` + `longSpeechEndSilenceMs` provide an optional adaptive
+end window. A consumer can keep normal short-command latency while tolerating
+longer thinking pauses once an utterance has already been substantial. Projects
+must keep the values bounded and cover their chosen policy with product tests.
+Manual activity mode requires the product adapter/provider configuration to
+disable automatic provider VAD for the same session. The browser and server
+settings must match.
+
 ## WSS transport in 0.3.x
 
 Release 0.3.11 makes the steady-state PCM byte budget use the same 2.5-second bound as the queue-age and WSS acknowledgement guards. A temporary backlog around the former 48 kB / 1.5-second watermark is retained and drained instead of terminating an otherwise healthy Live session; the sender still fails closed once queued PCM exceeds 2.5 seconds or the oldest frame / WSS ACK reaches its existing timeout.
