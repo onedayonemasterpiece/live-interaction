@@ -16,6 +16,7 @@ export function createLiveAudioSender({
   longSpeechEndMs=null,
   longSpeechAfterMs=null,
   manualActivityDetection=false,
+  continuousCapture=false,
   persist=null
 }={}){
   let queue=[],preRoll=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
@@ -23,6 +24,7 @@ export function createLiveAudioSender({
   let catchup=false,catchupSealed=false,catchupSeedBytes=0;
   let durableBytes=0,durableItems=0,durableChain=Promise.resolve(),durableError=null,lastStagedWasEnd=false;
   if(!Number.isFinite(speechEndMs)||speechEndMs<500||speechEndMs>10000)throw new TypeError('Invalid speechEndMs');
+  if(continuousCapture&&manualActivityDetection)throw new TypeError('continuousCapture cannot use manualActivityDetection');
   if((longSpeechEndMs===null)!==(longSpeechAfterMs===null))throw new TypeError('Long speech silence settings must be configured together');
   if(longSpeechEndMs!==null&&(!Number.isFinite(longSpeechEndMs)||longSpeechEndMs<speechEndMs||longSpeechEndMs>10000))throw new TypeError('Invalid longSpeechEndMs');
   if(longSpeechAfterMs!==null&&(!Number.isFinite(longSpeechAfterMs)||longSpeechAfterMs<1000||longSpeechAfterMs>600000))throw new TypeError('Invalid longSpeechAfterMs');
@@ -53,7 +55,8 @@ export function createLiveAudioSender({
     durable_pending_items:durableItems,
     durable_pending_pcm_bytes:durableBytes,
     activity_open:activityOpen,
-    turn_elapsed_ms:Math.round(turnElapsedMs)
+    turn_elapsed_ms:Math.round(turnElapsedMs),
+    continuous_capture:Boolean(continuousCapture)
   });
   const report=(event,extra={})=>onTiming(event,{...stats(),...extra});
   const rebaseQueuedAge=()=>{
@@ -184,6 +187,15 @@ export function createLiveAudioSender({
   function push(pcm,rms){
     if(closed)return;
     captured++;const at=now(),duration=pcm.length/16,item={pcm,at};
+    if(continuousCapture){
+      // Realtime provider-VAD mode: transport every captured PCM frame and let
+      // the Live provider own speech boundaries. Local RMS is telemetry only.
+      // The stream is sealed only by finish()/explicit session stop.
+      stage(item);
+      if(captured%12===0)report('capture',{capture_at_ms:at,continuous_capture:true});
+      schedule();
+      return;
+    }
     // Conservative energy gate: 250ms pre-roll preserves onsets; a 2s tail covers
     // provider VAD (700/1200ms tails failed real Gemini audio acceptance).
     // Responses can start before the tail finishes; prolonged idle silence is not sent.
