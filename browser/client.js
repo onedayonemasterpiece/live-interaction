@@ -22,7 +22,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   let microphone=null,sender=null,microphoneEnabled=false,startupCapture=null,budgetPaused=false;
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
-  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackSuppressionAt=0,suppressResponseReason=null;
+  let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackCaptureAt=0,suppressResponseReason=null;
   const pendingTools=new Set();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
@@ -158,7 +158,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         onTiming:(event,metrics)=>{
           onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
         },
-        onError:error=>{if(epoch!==generation)return;stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',error);},
+        onError:error=>{if(epoch!==generation)return;stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)}});onNotice('transport_error',error);},
         speechEndMs:speechEndSilenceMs,
         longSpeechEndMs:longSpeechEndSilenceMs,
         longSpeechAfterMs,
@@ -168,7 +168,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       const onCapturedFrame=(pcm,rms)=>{
         if(epoch!==generation||!sessionId)return;
         const suppressPlayback=typeof suppressCaptureDuringPlayback==='function'?suppressCaptureDuringPlayback():suppressCaptureDuringPlayback;
-        if(suppressPlayback&&playing.size){const at=Date.now();if(at-lastPlaybackSuppressionAt>1000){lastPlaybackSuppressionAt=at;onTiming('capture_suppressed_playback',{playing_buffers:playing.size});}return;}
+        if(playing.size){const at=Date.now();if(at-lastPlaybackCaptureAt>1000){lastPlaybackCaptureAt=at;onTiming(suppressPlayback?'capture_suppressed_playback':'capture_during_playback',{playing_buffers:playing.size});}if(suppressPlayback)return;}
         if(typeof captureTap==='function')try{captureTap(pcm,rms);}catch(error){onTiming('capture_tap_error',{error_code:String(error?.code??error?.message??'CAPTURE_TAP_ERROR').slice(0,80)});}
         sender?.push(pcm,rms);
       };
@@ -184,7 +184,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       }
       const capture=createMicrophoneCapture({
         onFrame:onCapturedFrame,        onTiming,
-        onError:error=>{if(epoch!==generation)return;closeMic();onState('microphone_unavailable');onNotice('microphone_error',error);}
+        onError:error=>{if(epoch!==generation)return;const code=String(error?.code??'MICROPHONE_CAPTURE_ERROR').slice(0,80);stop({reason:'capture_error',preservePlayback:true,detail:{code}});onState('microphone_unavailable',{reason:'capture_error',code});onNotice('microphone_error',error);}
       });
       microphone=capture;
       const started=await capture.start({stream:handoff?.stream??null,constraints:microphoneConstraints});
@@ -195,7 +195,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   }
   async function handleEvent(event,epoch){
     if(epoch!==generation)return false;
-    if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
+    if(['interim_input_transcript','input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,text_length:typeof event.text==='string'?event.text.length:undefined,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
     const suppressOutput=Boolean(suppressResponseReason&&['audio','output_transcript'].includes(event.type));
     if(event.type==='input_transcript'){
       awaitingReply=true;clearWait();
@@ -227,9 +227,14 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(suppressOutput){if(event.type==='output_transcript')onTiming('response_output_suppressed',{reason:suppressResponseReason,event_type:'output_transcript'});cursor=event.seq??cursor;return true;}
     onEvent(event,epoch);cursor=event.seq??cursor;
     if(event.type==='error'){
-      // A terminal provider error may precede the server's closed flag.
-      // Release the browser microphone as soon as the error is observed.
-      stop({reason:'provider_error',preservePlayback:true});
+      // A terminal provider error may precede the server's closed flag. Preserve
+      // its first concrete code through cleanup so hosts can distinguish policy
+      // denial from provider failure instead of rendering a generic idle state.
+      const code=String(event.code??'LIVE_PROVIDER_ERROR').slice(0,80);
+      const reason=code.startsWith('RESOURCE_')?'resource_denial':'provider_failure';
+      const error=Object.assign(new Error(String(event.message??reason)),{code});
+      onNotice(reason,error);
+      stop({reason,preservePlayback:true,detail:{code}});
       return false;
     }
     return epoch===generation;
@@ -267,13 +272,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
           return true;
         }catch(error){lastError=error;onTiming('socket_reconnect_attempt_failed',{attempt,code:error?.code??'LIVE_SOCKET_RECONNECT'});if(attempt<3)await new Promise(resolve=>setTimeout(resolve,Math.min(1000,150*2**attempt)));}
       }
-      if(epoch===generation){stop({reason:'transport_error',preservePlayback:true});onNotice('transport_error',lastError??new Error('Live WebSocket reconnect failed'));}
+      if(epoch===generation){const error=lastError??new Error('Live WebSocket reconnect failed');stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_SOCKET_RECONNECT').slice(0,80)}});onNotice('transport_error',error);}
       return false;
     })().finally(()=>{reconnectPromise=null;});
     return reconnectPromise;
   }
   function remoteStop(url,keepalive=false){onTiming('stop_request');void request(url,{method:'POST',headers:{'content-type':'application/json'},body:'{}',keepalive,signal:AbortSignal.timeout(2500)}).then(()=>onTiming('stop_response')).catch(()=>onTiming('stop_cleanup_timeout'));}
-  function stop({keepalive=false,reason='user_stop',preservePlayback=false,returnMicrophoneHandoff=false}={}){
+  function stop({keepalive=false,reason='user_stop',preservePlayback=false,returnMicrophoneHandoff=false,detail=null}={}){
     onTiming('stop_click',{reason});const url=sessionId?`${root}/${encodeURIComponent(sessionId)}/stop`:null;
     socketTransport?.close({sendStop:true,reason});socketTransport=null;reconnectPromise=null;
     ++generation;abort?.abort();abort=null;clearConfirmation();clearWait();releaseStartupCapture();
@@ -281,7 +286,8 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     clearTimeout(pollTimer);pollTimer=null;
     if(!preservePlayback)stopPlayback(reason);inputTranscript='';transcriptAt=0;suppressResponseReason=null;sessionId=null;model=null;pendingTools.clear();cursor=0;starting=false;microphoneEnabled=false;budgetPaused=false;attemptId=null;socketUrl=null;connectionGeneration=0;
     const microphone_handoff=returnedStream?{stream:returnedStream}:null;
-    onState('off',{reason,microphone_handoff});onTiming('local_ui_off',{microphone_handoff:Boolean(microphone_handoff)});if(url)remoteStop(url,keepalive);
+    const terminalDetail=detail&&typeof detail==='object'?detail:{};
+    onState('off',{...terminalDetail,reason,microphone_handoff});onTiming('local_ui_off',{reason,code:terminalDetail.code,microphone_handoff:Boolean(microphone_handoff)});if(url)remoteStop(url,keepalive);
     return microphone_handoff;
   }
   async function start({url,body={},authorize=async()=>{},takeMicrophoneHandoff=null,microphone=true,captureDuringStart=false}){
