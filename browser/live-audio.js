@@ -13,17 +13,19 @@ export function createLiveAudioSender({
   maxAgeMs=2500,
   maxBootstrapMs=20000,
   speechEndMs=2000,
+  speechStartMs=0,
   longSpeechEndMs=null,
   longSpeechAfterMs=null,
   manualActivityDetection=false,
   continuousCapture=false,
   persist=null
 }={}){
-  let queue=[],preRoll=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
-  let activityOpen=false,turnElapsedMs=0;
+  let queue=[],preRoll=[],onsetFrames=[],bytes=0,busy=false,closed=false,active=false,quietMs=0,captured=0,suppressed=0,timer=null;
+  let activityOpen=false,turnElapsedMs=0,onsetSpanMs=0,onsetVoiceMs=0,onsetQuietMs=0,rejectedOnsets=0;
   let catchup=false,catchupSealed=false,catchupSeedBytes=0;
   let durableBytes=0,durableItems=0,durableChain=Promise.resolve(),durableError=null,lastStagedWasEnd=false;
   if(!Number.isFinite(speechEndMs)||speechEndMs<500||speechEndMs>10000)throw new TypeError('Invalid speechEndMs');
+  if(!Number.isFinite(speechStartMs)||speechStartMs<0||speechStartMs>1000)throw new TypeError('Invalid speechStartMs');
   if(continuousCapture&&manualActivityDetection)throw new TypeError('continuousCapture cannot use manualActivityDetection');
   if((longSpeechEndMs===null)!==(longSpeechAfterMs===null))throw new TypeError('Long speech silence settings must be configured together');
   if(longSpeechEndMs!==null&&(!Number.isFinite(longSpeechEndMs)||longSpeechEndMs<speechEndMs||longSpeechEndMs>10000))throw new TypeError('Invalid longSpeechEndMs');
@@ -56,7 +58,9 @@ export function createLiveAudioSender({
     durable_pending_pcm_bytes:durableBytes,
     activity_open:activityOpen,
     turn_elapsed_ms:Math.round(turnElapsedMs),
-    continuous_capture:Boolean(continuousCapture)
+    continuous_capture:Boolean(continuousCapture),
+    speech_start_ms:Math.round(speechStartMs),
+    rejected_onsets:rejectedOnsets
   });
   const report=(event,extra={})=>onTiming(event,{...stats(),...extra});
   const rebaseQueuedAge=()=>{
@@ -73,8 +77,9 @@ export function createLiveAudioSender({
   };
   const stop=()=>{
     closed=true;clearTimeout(timer);timer=null;
-    queue=[];preRoll=[];bytes=0;catchup=false;catchupSealed=false;
+    queue=[];preRoll=[];onsetFrames=[];bytes=0;catchup=false;catchupSealed=false;
     active=false;activityOpen=false;quietMs=0;turnElapsedMs=0;
+    onsetSpanMs=onsetVoiceMs=onsetQuietMs=0;
   };
   const fail=error=>{
     const transportMetrics=error?.metrics&&typeof error.metrics==='object'?error.metrics:{};
@@ -199,34 +204,60 @@ export function createLiveAudioSender({
     }
     // Conservative energy gate: 250ms pre-roll preserves onsets; a 2s tail covers
     // provider VAD (700/1200ms tails failed real Gemini audio acceptance).
-    // Responses can start before the tail finishes; prolonged idle silence is not sent.
-    // Server VAD still decides turns; stream_end flushes the final tail before idle silence.
-    // Keep onset conservative, but do not cut quiet words after a turn began.
-    if(rms>=(active?0.003:0.008)){
-      if(!active){
-        active=true;turnElapsedMs=0;
-        if(manualActivityDetection){
-          activityOpen=true;
-          enqueue({activity_start:true,at});
-        }
-        for(const previous of preRoll)stage(previous);
-        preRoll=[];
-        report('speech_start',{capture_at_ms:at,manual_activity_detection:manualActivityDetection});
-      }
-      turnElapsedMs+=duration;quietMs=0;stage(item);
-    }else if(active){
-      turnElapsedMs+=duration;stage(item);quietMs+=duration;
-      const endMs=longSpeechEndMs!==null&&turnElapsedMs>=longSpeechAfterMs?longSpeechEndMs:speechEndMs;
-      if(quietMs>=endMs){
-        const elapsedMs=turnElapsedMs;
-        active=false;turnElapsedMs=0;
-        if(manualActivityDetection)activityOpen=false;
-        stage({end:true,activity_end:manualActivityDetection,at});
-        report('speech_end',{capture_at_ms:at,speech_end_silence_ms:endMs,turn_elapsed_ms:elapsedMs,manual_activity_detection:manualActivityDetection});
-      }
-    }else{
-      suppressed++;preRoll.push(item);
+    // Optional speechStartMs adds bounded onset admission before opening provider
+    // activity. Short impulses (keyboard/finger snap) are discarded instead of
+    // becoming semantic turns, while accepted speech replays its buffered onset.
+    const startThreshold=0.008,continueThreshold=0.003;
+    const trimPreRoll=()=>{
       while(preRoll.reduce((n,x)=>n+x.pcm.length/16,0)>250+duration)preRoll.shift();
+    };
+    const openSpeech=(frames,evidenceMs)=>{
+      active=true;turnElapsedMs=0;quietMs=0;
+      if(manualActivityDetection){
+        activityOpen=true;
+        enqueue({activity_start:true,at});
+      }
+      for(const previous of preRoll)stage(previous);
+      preRoll=[];
+      for(const frame of frames)stage(frame);
+      turnElapsedMs=evidenceMs;
+      onsetFrames=[];onsetSpanMs=onsetVoiceMs=onsetQuietMs=0;
+      report('speech_start',{capture_at_ms:at,manual_activity_detection:manualActivityDetection,speech_start_evidence_ms:Math.round(evidenceMs)});
+    };
+    if(active){
+      turnElapsedMs+=duration;stage(item);
+      if(rms>=continueThreshold){
+        quietMs=0;
+      }else{
+        quietMs+=duration;
+        const endMs=longSpeechEndMs!==null&&turnElapsedMs>=longSpeechAfterMs?longSpeechEndMs:speechEndMs;
+        if(quietMs>=endMs){
+          const elapsedMs=turnElapsedMs;
+          active=false;turnElapsedMs=0;
+          if(manualActivityDetection)activityOpen=false;
+          stage({end:true,activity_end:manualActivityDetection,at});
+          report('speech_end',{capture_at_ms:at,speech_end_silence_ms:endMs,turn_elapsed_ms:elapsedMs,manual_activity_detection:manualActivityDetection});
+        }
+      }
+    }else if(speechStartMs===0){
+      if(rms>=startThreshold)openSpeech([item],duration);
+      else{suppressed++;preRoll.push(item);trimPreRoll();}
+    }else{
+      if(onsetFrames.length||rms>=startThreshold){
+        onsetFrames.push(item);onsetSpanMs+=duration;
+        if(rms>=startThreshold){onsetVoiceMs+=duration;onsetQuietMs=0;}
+        else onsetQuietMs+=duration;
+        if(onsetQuietMs>80){
+          if(onsetVoiceMs>0)rejectedOnsets++;
+          suppressed+=onsetFrames.length;
+          onsetFrames=[];onsetSpanMs=onsetVoiceMs=onsetQuietMs=0;
+          preRoll.push(item);trimPreRoll();
+        }else if(onsetSpanMs>=speechStartMs&&onsetVoiceMs>=speechStartMs*.55){
+          openSpeech(onsetFrames,onsetSpanMs);
+        }
+      }else{
+        suppressed++;preRoll.push(item);trimPreRoll();
+      }
     }
     if(captured%12===0)report('capture',{capture_at_ms:at});
     schedule();
