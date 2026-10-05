@@ -15,7 +15,7 @@ export async function liveJson(url,options){
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
-export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false,transport='http',WebSocketImpl=globalThis.WebSocket,suppressCaptureDuringPlayback=false,speechEndSilenceMs=2000,longSpeechEndSilenceMs=null,longSpeechAfterMs=null,manualActivityDetection=false,captureTap=null}={}){
+export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false,transport='http',WebSocketImpl=globalThis.WebSocket,suppressCaptureDuringPlayback=false,speechEndSilenceMs=2000,longSpeechEndSilenceMs=null,longSpeechAfterMs=null,manualActivityDetection=false,continuousCapture=false,captureTap=null}={}){
   if(!['http','wss'].includes(transport))throw new TypeError('Unknown Live browser transport');
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null,attemptId=null;
   let socketTransport=null,socketUrl=null,connectionGeneration=0,reconnectPromise=null;
@@ -162,7 +162,8 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         speechEndMs:speechEndSilenceMs,
         longSpeechEndMs:longSpeechEndSilenceMs,
         longSpeechAfterMs,
-        manualActivityDetection
+        manualActivityDetection,
+        continuousCapture
       });
       const onCapturedFrame=(pcm,rms)=>{
         if(epoch!==generation||!sessionId)return;
@@ -197,6 +198,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     if(['input_transcript','tool_call','tool_result','turn_complete','input_timing'].includes(event.type))onTiming(event.type,{provider_at:event.provider_at,server_at:event.at,name:event.name,duration_ms:event.duration_ms,...(event.type==='input_timing'?{max_stdin_delay_ms:event.max_stdin_delay_ms,max_ws_send_ms:event.max_ws_send_ms}: {})});
     const suppressOutput=Boolean(suppressResponseReason&&['audio','output_transcript'].includes(event.type));
     if(event.type==='input_transcript'){
+      awaitingReply=true;clearWait();
       waitStage=pendingTools.size?'action':'provider';
       if(Date.now()-transcriptAt>2000)inputTranscript='';
       transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
