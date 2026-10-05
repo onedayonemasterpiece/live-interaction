@@ -387,3 +387,33 @@ test('continuous provider-VAD mode rejects local manual activity boundaries',()=
     /continuousCapture/
   );
 });
+
+
+test('speech onset admission rejects a keyboard-like impulse but preserves sustained speech onset',async()=>{
+ const sent=[];let at=0;
+ const sender=createLiveAudioSender({
+  send:async message=>sent.push(message),
+  now:()=>at,
+  batchMs:0,
+  manualActivityDetection:true,
+  speechStartMs:180,
+  speechEndMs:2000,
+ });
+ const frame=(rms,value)=>{at+=100;sender.push(new Int16Array(1600).fill(value),rms);};
+ frame(.04,1200);frame(0,0);await tick();await tick();
+ assert.equal(sent.some(message=>message.activity_start),false);
+ assert.equal(sent.some(message=>message.pcm),false);
+ assert.ok(sender.stats().rejected_onsets>=1);
+ frame(.03,900);frame(.03,900);await tick();await tick();
+ assert.equal(sent.filter(message=>message.activity_start).length,1);
+ assert.ok(sent.some(message=>message.pcm?.some(sample=>sample===900)));
+ sender.stop();
+});
+
+test('default speech onset remains immediate for existing products',async()=>{
+ const sent=[];
+ const sender=createLiveAudioSender({send:async message=>sent.push(message),batchMs:0,manualActivityDetection:true});
+ sender.push(new Int16Array(1600).fill(1000),.05);await tick();await tick();
+ assert.equal(sent.filter(message=>message.activity_start).length,1);
+ sender.stop();
+});

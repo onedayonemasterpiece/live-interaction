@@ -16,7 +16,7 @@ export async function liveJson(url,options){
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
 // UI, authentication and domain tools are host concerns. All audio/lifecycle paths
 // go through this client, including Stop while setup or a poll is still pending.
-export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false,transport='http',WebSocketImpl=globalThis.WebSocket,suppressCaptureDuringPlayback=false,speechEndSilenceMs=2000,longSpeechEndSilenceMs=null,longSpeechAfterMs=null,manualActivityDetection=false,continuousCapture=false,captureTap=null}={}){
+export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{},onNotice=()=>{},onTiming=()=>{},onWait=()=>{},voiceControl={isStop:isLiveStopCommand,confirmation:liveStopConfirmation},persistAudio=null,binaryAudio=false,transport='http',WebSocketImpl=globalThis.WebSocket,suppressCaptureDuringPlayback=false,speechEndSilenceMs=2000,speechStartMs=0,longSpeechEndSilenceMs=null,longSpeechAfterMs=null,manualActivityDetection=false,continuousCapture=false,captureTap=null}={}){
   if(!['http','wss'].includes(transport))throw new TypeError('Unknown Live browser transport');
   let model=null,sessionId=null,starting=false,generation=0,root=null,abort=null,cursor=0,pollTimer=null,attemptId=null;
   let socketTransport=null,socketUrl=null,connectionGeneration=0,reconnectPromise=null;
@@ -162,6 +162,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         },
         onError:error=>{if(epoch!==generation)return;stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)}});onNotice('transport_error',error);},
         speechEndMs:speechEndSilenceMs,
+        speechStartMs,
         longSpeechEndMs:longSpeechEndSilenceMs,
         longSpeechAfterMs,
         manualActivityDetection,
