@@ -157,6 +157,18 @@ export function createLiveAudioSender({
     return true;
   }
   async function drainDurable(){await durableChain;if(durableError)throw durableError;}
+  // Seal only an admitted utterance. The same ordered queue owns the boundary;
+  // capture/session stay open, and idle/noise/double clicks create no empty turn.
+  function endTurn(){
+    if(closed||continuousCapture||!active)return false;
+    const at=now(),elapsedMs=turnElapsedMs;
+    active=false;activityOpen=false;quietMs=0;turnElapsedMs=0;preRoll=[];
+    onsetFrames=[];onsetSpanMs=onsetVoiceMs=onsetQuietMs=0;
+    if(!stage({end:true,activity_end:manualActivityDetection,at}))return false;
+    report('speech_end',{capture_at_ms:at,turn_elapsed_ms:elapsedMs,explicit:true,manual_activity_detection:manualActivityDetection});
+    schedule();
+    return !closed;
+  }
   async function finish(){
     if(!lastStagedWasEnd){
       const at=now();
@@ -165,6 +177,7 @@ export function createLiveAudioSender({
         if(activityOpen){
           activityOpen=false;
           stage({end:true,activity_end:true,at});
+          schedule();
         }else if(typeof persist==='function'){
           await persist({audio_stream_end:true,captured_at_ms:at});
         }
@@ -287,5 +300,5 @@ export function createLiveAudioSender({
     return !closed;
   }
 
-  return {push,seed,finish,drainDurable,stop,stats};
+  return {push,seed,endTurn,finish,drainDurable,stop,stats};
 }
