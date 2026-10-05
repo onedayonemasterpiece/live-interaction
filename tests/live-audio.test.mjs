@@ -259,6 +259,41 @@ test('steady-state PCM is not marked as startup catchup',async()=>{
 });
 
 
+test('hybrid local endpoint emits audioStreamEnd without manual activity signals and gives long speech a wider pause',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({
+    send:async message=>sent.push(message),
+    now:()=>at,
+    batchMs:0,
+    speechEndMs:650,
+    speechStartMs:180,
+    longSpeechEndMs:1400,
+    longSpeechAfterMs:8000,
+    manualActivityDetection:false
+  });
+  const push=async(rms,ms=100)=>{
+    at+=ms;
+    sender.push(new Int16Array(ms*16).fill(rms>.01?1000:0),rms);
+    await tick();await tick();
+  };
+  for(let i=0;i<10;i++)await push(.05);
+  for(let i=0;i<6;i++)await push(0);
+  assert.equal(sent.some(message=>message.audio_stream_end),false);
+  await push(0);
+  for(let i=0;i<20&&!sent.some(message=>message.audio_stream_end);i++)await tick();
+  assert.equal(sent.filter(message=>message.audio_stream_end).length,1);
+  assert.equal(sent.some(message=>message.activity_start||message.activity_end),false);
+
+  for(let i=0;i<90;i++)await push(.05);
+  for(let i=0;i<13;i++)await push(0);
+  assert.equal(sent.filter(message=>message.audio_stream_end).length,1);
+  await push(0);
+  for(let i=0;i<20&&sent.filter(message=>message.audio_stream_end).length<2;i++)await tick();
+  assert.equal(sent.filter(message=>message.audio_stream_end).length,2);
+  assert.equal(sent.some(message=>message.activity_start||message.activity_end),false);
+  sender.stop();
+});
+
 test('manual activity boundaries bracket PCM and never emit audioStreamEnd',async()=>{
   const sent=[];let at=0;
   const sender=createLiveAudioSender({
