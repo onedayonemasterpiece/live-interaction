@@ -121,15 +121,15 @@ class SessionHostContract(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertIn(("story1", "input_transcript", "Привет"), self.adapter.observed)
 
-    async def test_trusted_transcript_is_full_but_ui_ring_is_bounded(self):
-        text = "x" * 5000
+    async def test_transcript_remains_lossless_for_product_and_client(self):
+        text = "начало " + ("x" * 5000) + " середина " + ("y" * 5000) + " конец"
         self.provider.events({"type": "input_transcript", "text": text})
         await asyncio.sleep(0)
         self.assertIn(("story1", "input_transcript", text), self.adapter.observed)
         session = self.host.sessions[self.started["session_id"]]
         projected = [e for e in session.events if e["type"] == "input_transcript"][-1]
-        self.assertEqual(len(projected["text"]), 2000)
-        self.assertTrue(projected["truncated"])
+        self.assertEqual(projected["text"], text)
+        self.assertNotIn("truncated", projected)
 
     async def test_manual_activity_requires_explicit_boundaries(self):
         class ManualAdapter(Adapter):
