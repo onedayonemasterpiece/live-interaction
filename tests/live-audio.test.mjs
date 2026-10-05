@@ -358,3 +358,32 @@ test('short utterances keep the ordinary four-second completion latency',async()
   assert.equal(sent.filter(message=>message.activity_end).length,1);
   sender.stop();
 });
+
+
+test('continuous provider-VAD mode streams silence and never closes a turn on local RMS',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({
+    send:async message=>sent.push(message),
+    now:()=>at,
+    batchMs:0,
+    continuousCapture:true
+  });
+  for(let i=0;i<10;i++){at+=100;sender.push(new Int16Array(1600),0);await tick();}
+  for(let i=0;i<10;i++){at+=100;sender.push(new Int16Array(1600).fill(900),.05);await tick();}
+  for(let i=0;i<80;i++){at+=100;sender.push(new Int16Array(1600),0);await tick();}
+  assert.ok(sent.some(message=>message.pcm instanceof Int16Array));
+  assert.equal(sent.some(message=>message.audio_stream_end||message.activity_end),false);
+  assert.equal(sender.stats().suppressed_chunks,0);
+  assert.equal(sender.stats().continuous_capture,true);
+  await sender.finish();
+  for(let i=0;i<20&&!sent.some(message=>message.audio_stream_end);i++)await tick();
+  assert.equal(sent.filter(message=>message.audio_stream_end).length,1);
+  sender.stop();
+});
+
+test('continuous provider-VAD mode rejects local manual activity boundaries',()=>{
+  assert.throws(
+    ()=>createLiveAudioSender({send:async()=>{},continuousCapture:true,manualActivityDetection:true}),
+    /continuousCapture/
+  );
+});
