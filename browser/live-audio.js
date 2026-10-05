@@ -8,7 +8,7 @@ export function createLiveAudioSender({
   onTiming=()=>{},
   onError=()=>{},
   now=()=>performance.now(),
-  batchMs=80,
+  batchMs=40,
   maxQueueMs=2500,
   maxAgeMs=2500,
   maxBootstrapMs=20000,
