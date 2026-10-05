@@ -36,13 +36,13 @@ test('Stop while getUserMedia is pending leaves no live track after late permiss
 });
 test('terminal provider error releases the active browser microphone before closed poll flag',async()=>{
  const originalNavigator=globalThis.navigator,originalAudio=globalThis.AudioContext;
- let releaseEvents,stopCalls=0;const states=[];
+ let releaseEvents,stopCalls=0;const states=[],notices=[];
  const track={readyState:'live',stop(){stopCalls++;this.readyState='ended';}};
  class FakeNode{connect(){}disconnect(){}}
  class FakeContext{sampleRate=48000;state='running';destination={};audioWorklet={addModule:async()=>{}};createMediaStreamSource(){return new FakeNode();}createScriptProcessor(){return {connect(){},disconnect(){},onaudioprocess:null};}async resume(){}async close(){this.state='closed';}}
  Object.defineProperty(globalThis,'navigator',{value:{mediaDevices:{getUserMedia:async()=>({getTracks:()=>[track]})}},configurable:true});
  globalThis.AudioContext=FakeContext;
- const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:s=>states.push(s)});
+ const client=createLiveClient({request:url=>url==='/live'?Promise.resolve({session_id:'one',model:'gemini-3.8-live'}):url.includes('/events')?new Promise(resolve=>{releaseEvents=resolve;}):Promise.resolve({ok:true}),onState:(state,detail)=>states.push({state,detail}),onNotice:(kind,error)=>notices.push({kind,code:error?.code})});
  try{
   await client.start({url:'/live'});
   for(let i=0;i<30&&!releaseEvents;i++)await tick();
@@ -50,7 +50,9 @@ test('terminal provider error releases the active browser microphone before clos
   releaseEvents({events:[{seq:1,type:'error',code:'RESOURCE_TOKEN_BUDGET',message:'Live capability transition failed'}],cursor:1,closed:false});
   for(let i=0;i<30&&track.readyState==='live';i++)await tick();
   assert.equal(track.readyState,'ended');assert.equal(stopCalls,1);
-  assert.equal(client.sessionId,null);assert.equal(states.at(-1),'off');
+  assert.equal(client.sessionId,null);assert.equal(states.at(-1).state,'off');
+  assert.equal(states.at(-1).detail.reason,'resource_denial');assert.equal(states.at(-1).detail.code,'RESOURCE_TOKEN_BUDGET');
+  assert.deepEqual(notices,[{kind:'resource_denial',code:'RESOURCE_TOKEN_BUDGET'}]);
  }finally{
   client.stop();
   if(originalNavigator===undefined)delete globalThis.navigator;else Object.defineProperty(globalThis,'navigator',{value:originalNavigator,configurable:true});
@@ -488,4 +490,43 @@ test('local control can suppress one provider response without ending the Live s
     assert.equal(timings.some(item=>item.event==='audio_scheduled'),false);
     assert.equal(timings.filter(item=>item.event==='response_output_suppressed').length,2);
   }finally{client.stop();releaseEvents?.({events:[],cursor:3,closed:true});}
+});
+
+
+test('barge-in microphone frames stay transport-active during playback when suppression is disabled',async()=>{
+ const originalAudio=globalThis.AudioContext;let releaseEvents,onFrame=null;const inputs=[],timings=[];
+ class Context{
+  state='running';sampleRate=48000;destination={};audioWorklet={addModule:async()=>{}};
+  createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
+  createBufferSource(){return {buffer:null,onended:null,liveCancelled:false,connect(){},start(){},stop(){}};}
+  async resume(){}async close(){this.state='closed';}
+ }
+ globalThis.AudioContext=Context;
+ const capture={running:true,setOnFrame(fn){onFrame=fn;},stop(){this.running=false;}};
+ const client=createLiveClient({
+  binaryAudio:true,
+  suppressCaptureDuringPlayback:false,
+  onTiming:(event,metrics)=>timings.push({event,...metrics}),
+  request:async(url,options={})=>{
+   if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+   if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+   if(url==='/live/one/input'){inputs.push(decodedInput(options));return {ok:true};}
+   if(url==='/live/one/stop')return {ok:true};
+   throw new Error('unexpected '+url);
+  }
+ });
+ try{
+  await client.start({url:'/live',takeMicrophoneHandoff:async()=>({capture,frames:[]})});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  releaseEvents({events:[{seq:1,type:'audio',data:Buffer.alloc(4800).toString('base64'),mime_type:'audio/pcm;rate=24000'}],cursor:1,closed:false});
+  for(let i=0;i<30&&!timings.some(item=>item.event==='first_output_audio');i++)await tick();
+  assert.equal(typeof onFrame,'function');
+  onFrame(new Int16Array(1600).fill(900),.02);
+  for(let i=0;i<30&&!inputs.some(item=>item.pcm?.byteLength);i++)await new Promise(resolve=>setTimeout(resolve,20));
+  assert.ok(inputs.some(item=>item.pcm?.byteLength>0),'barge-in PCM must reach the ordered sender during playback');
+  assert.equal(timings.some(item=>item.event==='capture_during_playback'),true);
+ }finally{
+  client.stop();releaseEvents?.({events:[],cursor:1,closed:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
 });
