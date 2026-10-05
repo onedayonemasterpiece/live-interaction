@@ -301,12 +301,9 @@ class LiveSessionHost:
                 observed = self.adapter.on_event(session, event)
                 if inspect.isawaitable(observed):
                     asyncio.create_task(observed)
+            # Transcript text is user-visible conversational source, not a
+            # diagnostic preview. Keep it lossless end-to-end.
             projected = event
-            if kind in {"input_transcript", "output_transcript"} and isinstance(event.get("text"), str):
-                text = event["text"]
-                projected = {**event, "text": text[:2000]}
-                if len(text) > 2000:
-                    projected["truncated"] = True
             if kind == "capability_ready":
                 self._emit(session, projected)
                 if (
