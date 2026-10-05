@@ -26,7 +26,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackCaptureAt=0,suppressResponseReason=null;
   const adaptiveDuplexGate=createAdaptiveDuplexGate();
   const pendingTools=new Set(),pendingPlayback=new Set();
-  let playbackGeneration=0,responseComplete=false;
+  let playbackGeneration=0,responseComplete=false,responsePlaybackStarted=false;
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function maybeListening(){
     if(sessionId&&microphoneEnabled&&microphone?.running&&!budgetPaused&&responseComplete&&!awaitingReply&&!playing.size&&!pendingPlayback.size)onState('listening');
@@ -72,7 +72,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     return true;
   }
   function stopPlayback(reason='user_stop'){
-    ++playbackGeneration;pendingPlayback.clear();
+    ++playbackGeneration;pendingPlayback.clear();responsePlaybackStarted=false;
     if(playing.size)onTiming('playback_cancelled',{reason,queued_buffers:playing.size,remaining_ms:Math.max(0,(nextPlayAt-playContext.currentTime)*1000)});
     for(const node of playing){try{node.liveCancelled=true;node.stop();}catch{}}
     playing.clear();nextPlayAt=0;adaptiveDuplexGate.resetPlayback();
@@ -97,11 +97,16 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     };
     const source=playContext.createBufferSource();source.buffer=buffer;source.connect(playContext.destination);
     // Gemini can emit a very short first chunk (for example 50 ms) hundreds of
-    // milliseconds before the next one. Hold the start of each playback run so
-    // normal provider/poll jitter does not become an audible gap.
+    // milliseconds before the next one. Keep the generous reserve only for the
+    // first audio of a response. If the same response later underflows, a second
+    // 400 ms reserve turns ordinary network jitter into an audible stutter; use
+    // only a small recovery cushion there.
     const runStart=nextPlayAt<=playContext.currentTime;
-    const at=Math.max(playContext.currentTime+(runStart?.4:.02),nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
-    if(runStart)onTiming('playback_buffering',{buffer_ms:400,first_chunk_ms:buffer.duration*1000});
+    const firstRun=!responsePlaybackStarted;
+    const reserve=runStart?(firstRun?.4:.05):.02;
+    const at=Math.max(playContext.currentTime+reserve,nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
+    if(runStart)onTiming(firstRun?'playback_buffering':'playback_underflow',{buffer_ms:reserve*1000,first_chunk_ms:buffer.duration*1000});
+    responsePlaybackStarted=true;
     onTiming('audio_scheduled',{...playbackFacts,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
     source.onended=()=>{playing.delete(source);if(!playing.size)adaptiveDuplexGate.resetPlayback();source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);maybeListening();};source.start(at);
   }
@@ -236,12 +241,13 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       if(Date.now()-transcriptAt>2000)inputTranscript='';
       transcriptAt=Date.now();inputTranscript=(inputTranscript+' '+event.text).trim().slice(-1000);voice();
     }else if(event.type==='audio'){
+      const firstOutputAudio=!responsePlaybackStarted;
       awaitingReply=false;clearWait();
       if(suppressOutput)onTiming('response_output_suppressed',{reason:suppressResponseReason,event_type:'audio',pcm_bytes:Number(event?.pcm?.byteLength??0)||undefined});
       else{
         responseComplete=false;
         const pending={},playbackEpoch=playbackGeneration;pendingPlayback.add(pending);
-        if(!playing.size)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});
+        if(firstOutputAudio)onTiming('first_output_audio',{server_at:event.at,provider_at:event.provider_at});
         onState('answering');
         try{await play(event,epoch);}
         catch(error){if(epoch===generation&&playbackEpoch===playbackGeneration){onTiming('playback_error',{code:String(error?.code??'LIVE_PLAYBACK_ERROR').slice(0,80)});onNotice('playback_error',error);}}
@@ -258,6 +264,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       if(!model?.endsWith('-extended-thinking')){awaitingReply=false;clearWait();}if(stopPending&&inputTranscript&&!stopConfirmTimer)clearConfirmation();if(!stopConfirmTimer)inputTranscript='';
       if(suppressResponseReason){onTiming('response_suppression_ended',{reason:suppressResponseReason});suppressResponseReason=null;}
       responseComplete=true;maybeListening();
+      responsePlaybackStarted=false;
     }else if(event.type==='reconnecting'){closeMic();onState('reconnecting');}
     else if(event.type==='resource_budget_wait'){
       beginWait();waitStage='resource';
