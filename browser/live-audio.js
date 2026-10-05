@@ -165,6 +165,7 @@ export function createLiveAudioSender({
         }
       }else{
         stage({end:true,at});
+        schedule();
       }
     }
     await drainDurable();
