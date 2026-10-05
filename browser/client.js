@@ -2,6 +2,7 @@ import {createLiveAudioSender} from './live-audio.js';
 import {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
 import {isLiveStopCommand,liveStopConfirmation} from './live-commands.js';
 import {createLiveSocketTransport} from './socket-transport.js';
+import {createAdaptiveDuplexGate} from './duplex-gate.js';
 
 export {createLiveAudioSender} from './live-audio.js';
 export {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,microphoneConstraints} from './capture.js';
@@ -23,6 +24,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   let playContext=null,nextPlayAt=0,playing=new Set(),inputTranscript='',transcriptAt=0;
   let stopPending=false,stopExpiry=null,stopConfirmTimer=null;
   let waitAt=null,waitTimer=null,waitStage='transport',awaitingReply=false,lastPlaybackCaptureAt=0,suppressResponseReason=null;
+  const adaptiveDuplexGate=createAdaptiveDuplexGate();
   const pendingTools=new Set();
   const Audio=()=>globalThis.AudioContext||globalThis.webkitAudioContext;
   function clearWait(){waitAt=null;clearInterval(waitTimer);waitTimer=null;onWait(null);}
@@ -58,7 +60,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   function stopPlayback(reason='user_stop'){
     if(playing.size)onTiming('playback_cancelled',{reason,queued_buffers:playing.size,remaining_ms:Math.max(0,(nextPlayAt-playContext.currentTime)*1000)});
     for(const node of playing){try{node.liveCancelled=true;node.stop();}catch{}}
-    playing.clear();nextPlayAt=0;
+    playing.clear();nextPlayAt=0;adaptiveDuplexGate.resetPlayback();
   }
   async function play(event,epoch){
     const Context=Audio();if(!Context)return;
@@ -85,7 +87,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
     const at=Math.max(playContext.currentTime+(runStart?.4:.02),nextPlayAt||0);nextPlayAt=at+buffer.duration;playing.add(source);
     if(runStart)onTiming('playback_buffering',{buffer_ms:400,first_chunk_ms:buffer.duration*1000});
     onTiming('audio_scheduled',{...playbackFacts,starts_at:Date.now()+(at-playContext.currentTime)*1000,buffered_ms:(nextPlayAt-playContext.currentTime)*1000});
-    source.onended=()=>{playing.delete(source);source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);};source.start(at);
+    source.onended=()=>{playing.delete(source);if(!playing.size)adaptiveDuplexGate.resetPlayback();source.disconnect();onTiming(source.liveCancelled?'audio_cancelled':'audio_played',playbackFacts);};source.start(at);
   }
   function input(message){
     if(!sessionId)return Promise.resolve();
@@ -167,8 +169,22 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       });
       const onCapturedFrame=(pcm,rms)=>{
         if(epoch!==generation||!sessionId)return;
-        const suppressPlayback=typeof suppressCaptureDuringPlayback==='function'?suppressCaptureDuringPlayback():suppressCaptureDuringPlayback;
-        if(playing.size){const at=Date.now();if(at-lastPlaybackCaptureAt>1000){lastPlaybackCaptureAt=at;onTiming(suppressPlayback?'capture_suppressed_playback':'capture_during_playback',{playing_buffers:playing.size});}if(suppressPlayback)return;}
+        const suppression=typeof suppressCaptureDuringPlayback==='function'?suppressCaptureDuringPlayback():suppressCaptureDuringPlayback;
+        if(playing.size&&suppression==='adaptive'){
+          const decision=adaptiveDuplexGate.observe(pcm,rms,{playback:true});
+          const at=Date.now();
+          if(decision.action==='barge'){
+            stopPlayback('barge_in_local');
+            onTiming('barge_in_admitted',{playing_buffers:playing.size,buffered_ms:decision.buffered_ms,threshold_rms:decision.threshold_rms,echo_floor_rms:decision.echo_floor_rms});
+            for(const frame of decision.frames)sender?.push(frame.pcm,frame.rms);
+          }else if(at-lastPlaybackCaptureAt>1000){
+            lastPlaybackCaptureAt=at;
+            onTiming('capture_suppressed_echo',{playing_buffers:playing.size,rms,threshold_rms:decision.threshold_rms,echo_floor_rms:decision.echo_floor_rms,candidate_ms:decision.candidate_ms??0});
+          }
+          return;
+        }
+        adaptiveDuplexGate.observe(pcm,rms,{playback:false});
+        if(playing.size){const at=Date.now();if(at-lastPlaybackCaptureAt>1000){lastPlaybackCaptureAt=at;onTiming(suppression?'capture_suppressed_playback':'capture_during_playback',{playing_buffers:playing.size});}if(suppression)return;}
         if(typeof captureTap==='function')try{captureTap(pcm,rms);}catch(error){onTiming('capture_tap_error',{error_code:String(error?.code??error?.message??'CAPTURE_TAP_ERROR').slice(0,80)});}
         sender?.push(pcm,rms);
       };

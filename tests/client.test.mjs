@@ -530,3 +530,55 @@ test('barge-in microphone frames stay transport-active during playback when supp
   if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
  }
 });
+
+
+test('adaptive duplex gate suppresses playback echo but admits sustained user barge-in',async()=>{
+ const originalAudio=globalThis.AudioContext;let releaseEvents,onFrame=null;const inputs=[],timings=[];
+ class Context{
+  state='running';sampleRate=48000;destination={};currentTime=1;audioWorklet={addModule:async()=>{}};
+  createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
+  createBufferSource(){return {buffer:null,onended:null,liveCancelled:false,connect(){},start(){},stop(){this.liveCancelled=true;}};}
+  async resume(){}async close(){this.state='closed';}
+ }
+ globalThis.AudioContext=Context;
+ const capture={running:true,setOnFrame(fn){onFrame=fn;},stop(){this.running=false;}};
+ const client=createLiveClient({
+  binaryAudio:true,
+  suppressCaptureDuringPlayback:'adaptive',
+  onTiming:(event,metrics)=>timings.push({event,...metrics}),
+  request:async(url,options={})=>{
+   if(url==='/live')return {session_id:'one',model:'gemini-3.8-live'};
+   if(url.startsWith('/live/one/events'))return new Promise(resolve=>{releaseEvents=resolve;});
+   if(url==='/live/one/input'){inputs.push(decodedInput(options));return {ok:true};}
+   if(url==='/live/one/stop')return {ok:true};
+   throw new Error('unexpected '+url);
+  }
+ });
+ try{
+  await client.start({url:'/live',takeMicrophoneHandoff:async()=>({capture,frames:[]})});
+  for(let i=0;i<30&&!releaseEvents;i++)await tick();
+  releaseEvents({events:[{seq:1,type:'audio',data:Buffer.alloc(9600).toString('base64'),mime_type:'audio/pcm;rate=24000'}],cursor:1,closed:false});
+  for(let i=0;i<30&&!timings.some(item=>item.event==='first_output_audio');i++)await tick();
+  assert.equal(typeof onFrame,'function');
+  // Residual speaker echo stays below the adaptive barge threshold.
+  for(let i=0;i<6;i++)onFrame(new Int16Array(3200).fill(400),.012);
+  await new Promise(resolve=>setTimeout(resolve,30));
+  assert.equal(inputs.some(item=>item.pcm?.byteLength>0),false,'echo PCM must not reach Live');
+  assert.ok(timings.some(item=>item.event==='capture_suppressed_echo'));
+  // One spike is not enough.
+  onFrame(new Int16Array(3200).fill(1400),.05);
+  onFrame(new Int16Array(3200).fill(400),.012);
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(inputs.some(item=>item.pcm?.byteLength>0),false,'single spike must stay suppressed');
+  // Sustained independent speech cancels playback and forwards its buffered onset.
+  onFrame(new Int16Array(3200).fill(1400),.05);
+  onFrame(new Int16Array(3200).fill(1400),.05);
+  for(let i=0;i<30&&!inputs.some(item=>item.pcm?.byteLength);i++)await new Promise(resolve=>setTimeout(resolve,20));
+  assert.ok(inputs.some(item=>item.pcm?.byteLength>0),'sustained barge-in PCM must reach Live');
+  assert.ok(timings.some(item=>item.event==='barge_in_admitted'));
+  assert.ok(timings.some(item=>item.event==='playback_cancelled'&&item.reason==='barge_in_local'));
+ }finally{
+  client.stop();releaseEvents?.({events:[],cursor:1,closed:true});
+  if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;
+ }
+});
