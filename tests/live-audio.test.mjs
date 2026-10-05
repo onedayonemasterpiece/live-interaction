@@ -257,3 +257,104 @@ test('steady-state PCM is not marked as startup catchup',async()=>{
   assert.ok(sent.filter(message=>message.pcm).every(message=>message.startup_catchup===false));
   sender.stop();
 });
+
+
+test('manual activity boundaries bracket PCM and never emit audioStreamEnd',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({
+    send:async message=>sent.push(message),
+    now:()=>at,
+    batchMs:0,
+    speechEndMs:500,
+    manualActivityDetection:true
+  });
+  const push=async(rms)=>{
+    at+=100;
+    sender.push(new Int16Array(1600).fill(rms>.01?1000:0),rms);
+    await tick();await tick();
+  };
+  await push(.05);
+  for(let i=0;i<5;i++)await push(0);
+  for(let i=0;i<20&&sender.stats().queued_chunks;i++)await tick();
+  assert.equal(sent[0]?.activity_start,true);
+  assert.ok(sent.some(message=>message.pcm instanceof Int16Array));
+  assert.equal(sent.at(-1)?.activity_end,true);
+  assert.equal(sent.some(message=>message.audio_stream_end),false);
+  sender.stop();
+});
+
+test('adaptive long-form boundary tolerates a six-second thinking pause after a long utterance',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({
+    send:async message=>sent.push(message),
+    now:()=>at,
+    batchMs:0,
+    speechEndMs:4000,
+    longSpeechEndMs:8000,
+    longSpeechAfterMs:12000,
+    manualActivityDetection:true
+  });
+  const push=async(rms)=>{
+    at+=200;
+    sender.push(new Int16Array(3200).fill(rms>.01?1000:0),rms);
+    await tick();await tick();
+  };
+  for(let i=0;i<75;i++)await push(.05); // 15 seconds of speech.
+  for(let i=0;i<30;i++)await push(0);   // 6 seconds of silence.
+  assert.equal(sent.some(message=>message.activity_end),false);
+  for(let i=0;i<10;i++)await push(0);   // 8 seconds total.
+  for(let i=0;i<20&&!sent.some(message=>message.activity_end);i++)await tick();
+  assert.equal(sent.filter(message=>message.activity_end).length,1);
+  sender.stop();
+});
+
+test('three minutes of continuous speech stays one manual activity',async()=>{
+  let at=0,starts=0,ends=0;
+  const sender=createLiveAudioSender({
+    send:async message=>{
+      if(message.activity_start)starts++;
+      if(message.activity_end)ends++;
+    },
+    now:()=>at,
+    batchMs:0,
+    speechEndMs:4000,
+    longSpeechEndMs:8000,
+    longSpeechAfterMs:12000,
+    manualActivityDetection:true
+  });
+  for(let i=0;i<900;i++){
+    at+=200;
+    sender.push(new Int16Array(3200).fill(1000),.05);
+    await tick();
+  }
+  for(let i=0;i<20&&sender.stats().queued_chunks;i++)await tick();
+  assert.equal(starts,1);
+  assert.equal(ends,0);
+  assert.equal(sender.stats().activity_open,true);
+  sender.stop();
+});
+
+test('short utterances keep the ordinary four-second completion latency',async()=>{
+  const sent=[];let at=0;
+  const sender=createLiveAudioSender({
+    send:async message=>sent.push(message),
+    now:()=>at,
+    batchMs:0,
+    speechEndMs:4000,
+    longSpeechEndMs:8000,
+    longSpeechAfterMs:12000,
+    manualActivityDetection:true
+  });
+  const push=async(rms)=>{
+    at+=200;
+    sender.push(new Int16Array(3200).fill(rms>.01?1000:0),rms);
+    await tick();await tick();
+  };
+  for(let i=0;i<20;i++)await push(.05); // 4 seconds speech.
+  for(let i=0;i<19;i++)await push(0);
+  assert.equal(sent.some(message=>message.activity_end),false);
+  await push(0);
+  for(let i=0;i<20&&!sent.some(message=>message.activity_end);i++)await tick();
+  assert.equal(sent.filter(message=>message.activity_end).length,1);
+  sender.stop();
+});
