@@ -160,6 +160,42 @@ test('short first provider audio chunk is buffered until following audio can pla
   assert.equal(scheduled.pcm_peak,0);assert.equal(scheduled.pcm_rms,0);
  }finally{client.stop();if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;}
 });
+test('same-response playback underflow does not add another 400 ms jitter reserve',async()=>{
+ const originalAudio=globalThis.AudioContext,starts=[];let now=.1,releasePoll;
+ class FakeAudioContext{
+  state='running';sampleRate=48000;baseLatency=0;outputLatency=0;destination={};
+  get currentTime(){return now;}
+  createBuffer(_channels,length,rate){const samples=new Float32Array(length);return {duration:length/rate,getChannelData:()=>samples};}
+  createBufferSource(){const context=this;return {buffer:null,onended:null,connect(){},disconnect(){},start(at){starts.push({at,receivedAt:context.currentTime,duration:this.buffer.duration});},stop(){}};}
+  async resume(){}
+ }
+ globalThis.AudioContext=FakeAudioContext;
+ const timings=[];const client=createLiveClient({request:url=>{
+  if(url==='/live')return Promise.resolve({session_id:'one',model:'gemini-3.8-live'});
+  if(url.includes('/events'))return new Promise(resolve=>{releasePoll=resolve;});
+  return Promise.resolve({ok:true});
+ },onTiming:(event,metrics)=>timings.push({event,...metrics})});
+ const audio=(seq,length)=>({seq,type:'audio',data:Buffer.alloc(length*2).toString('base64'),mime_type:'audio/pcm;rate=24000'});
+ try{
+  await client.start({url:'/live',microphone:false});
+  for(let i=0;i<30&&!releasePoll;i++)await tick();
+  releasePoll({events:[audio(1,1200)],cursor:1});
+  for(let i=0;i<30&&starts.length<1;i++)await tick();
+  assert.ok(starts[0].at-starts[0].receivedAt>=.38,'first chunk still gets the full jitter reserve');
+  now=starts[0].at+starts[0].duration+.2;
+  releasePoll=null;
+  await new Promise(r=>setTimeout(r,180));
+  assert.equal(typeof releasePoll,'function');
+  releasePoll({events:[audio(2,2400)],cursor:2});
+  for(let i=0;i<30&&starts.length<2;i++)await tick();
+  const recovery=starts[1].at-starts[1].receivedAt;
+  assert.ok(recovery>=.045&&recovery<.1,'same-response recovery reserve was '+recovery+'s');
+  const underflow=timings.find(item=>item.event==='playback_underflow');
+  assert.equal(underflow?.buffer_ms,50);
+  assert.equal(timings.filter(item=>item.event==='playback_buffering').length,1);
+  assert.equal(timings.filter(item=>item.event==='first_output_audio').length,1);
+ }finally{client.stop();if(originalAudio===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalAudio;}
+});
 test('Stop during setup is local; late setup is cleaned without starting a microphone',async()=>{
  let release;const calls=[],states=[];
  const client=createLiveClient({request:(url)=>{calls.push(url);return url==='/live'?new Promise(r=>release=r):Promise.resolve({});},onState:s=>states.push(s)});
