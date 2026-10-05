@@ -71,6 +71,7 @@ export function createLiveAudioSender({
   const stop=()=>{
     closed=true;clearTimeout(timer);timer=null;
     queue=[];preRoll=[];bytes=0;catchup=false;catchupSealed=false;
+    active=false;activityOpen=false;quietMs=0;turnElapsedMs=0;
   };
   const fail=error=>{
     const transportMetrics=error?.metrics&&typeof error.metrics==='object'?error.metrics:{};
