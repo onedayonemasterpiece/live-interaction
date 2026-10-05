@@ -187,6 +187,23 @@ class ProviderContract(unittest.TestCase):
         self.assertEqual(automatic['silenceDurationMs'], 5000)
         self.assertEqual(automatic['prefixPaddingMs'], 250)
 
+    def test_interim_input_transcription_is_exposed_without_replacing_final(self):
+        events = []
+        handle_server_message(
+            {'serverContent': {
+                'interimInputTranscription': {'text': 'Проверь мо'},
+                'inputTranscription': {'text': 'Проверь мой календарь'},
+            }},
+            emit=events.append,
+        )
+        self.assertEqual(
+            [(event['type'], event['text']) for event in events],
+            [
+                ('interim_input_transcript', 'Проверь мо'),
+                ('input_transcript', 'Проверь мой календарь'),
+            ],
+        )
+
     def test_audio_tail_is_emitted_before_completion(self):
         events=[]
         handle_server_message({'serverContent':{'modelTurn':{'parts':[{'inlineData':{'mimeType':'audio/pcm;rate=24000','data':'AAAA'}}]},'turnComplete':True}},emit=events.append)

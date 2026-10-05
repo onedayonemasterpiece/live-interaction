@@ -289,9 +289,15 @@ def handle_server_message(obj, emit=emit):
         emit({'type': 'grounding', 'metadata': content['groundingMetadata']})
     if obj.get('usageMetadata'):
         emit({'type': 'usage', 'metadata': obj['usageMetadata']})
-    for field, kind in [('inputTranscription', 'input_transcript'), ('outputTranscription', 'output_transcript')]:
+    for field, kind in [
+        ('interimInputTranscription', 'interim_input_transcript'),
+        ('inputTranscription', 'input_transcript'),
+        ('outputTranscription', 'output_transcript'),
+    ]:
         if content.get(field, {}).get('text'):
             # Preserve provider transcription losslessly for trusted product observers.
+            # Interim input text is speculative UI telemetry and must not be persisted
+            # as the authoritative user transcript by product adapters.
             emit({'type': kind, 'text': content[field]['text']})
     if content.get('interrupted'):
         emit({'type': 'interrupted'})

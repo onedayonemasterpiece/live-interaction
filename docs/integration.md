@@ -58,6 +58,16 @@ remain complete for the trusted adapter `on_event` observer; only the polling/UI
 transcript text to a bounded 2000-character preview. A durable observer must persist or
 durably enqueue the trusted event before returning.
 
+## Interim input transcript in 0.3.16
+
+Gemini Live now exposes `serverContent.interimInputTranscription` while the
+speaker is still talking. The shared provider maps this to
+`interim_input_transcript`. This event is speculative and intended for
+responsive UI captions / "still listening" feedback only. Product adapters
+must not persist it as authoritative conversation history, memory, commands or
+tool authorization. The finalized provider `inputTranscription` continues to
+map to `input_transcript` and remains the durable transcript boundary.
+
 ## WSS transport in 0.3.x
 
 Release 0.3.11 makes the steady-state PCM byte budget use the same 2.5-second bound as the queue-age and WSS acknowledgement guards. A temporary backlog around the former 48 kB / 1.5-second watermark is retained and drained instead of terminating an otherwise healthy Live session; the sender still fails closed once queued PCM exceeds 2.5 seconds or the oldest frame / WSS ACK reaches its existing timeout.
