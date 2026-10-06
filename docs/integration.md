@@ -346,3 +346,7 @@ source IDs/manifests, retention and later upload/replay policy. When connectivit
 available again, feed the durable source through the product's deliberate buffered
 Live turn (`activityStart → PCM → activityEnd`); ordinary reconnect still never
 replays old speech automatically.
+
+## Resource waits in 0.3.11-rc.2
+
+A rolling resource wait for an unsent tool response or explicit text keeps queued text in FIFO order until admission succeeds. It never invokes the tool again. Only realtime capture is discarded by the resource recovery cutoff. A genuine capability transition retains its separate old-stage input fence. Stop, lease/key binding and the bounded admission deadline remain unchanged. This candidate addresses the retained Street Story selection failure after a tool-response token wait; actual consumer acceptance is recorded separately.

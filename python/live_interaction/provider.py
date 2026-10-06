@@ -132,7 +132,7 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
         try:
             await _guarded_send(ws, payload, resource_guard)
             if retries:
-                state['drop_inputs_before'] = round(time.time() * 1000)
+                state['drop_capture_before'] = round(time.time() * 1000)
                 emit({'type':'resource_budget_ready','input_type':kind,'retries':retries})
             return True
         except Exception as exc:
@@ -147,7 +147,7 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
             if remaining <= 0 or state['stopped'] or state['ws'] is not ws:
                 raise
             retries += 1
-            state['drop_inputs_before'] = round(time.time() * 1000)
+            state['drop_capture_before'] = round(time.time() * 1000)
             wait_seconds = min(remaining, max(.05, min(5, getattr(exc,'retry_after_ms',3000) / 1000 or 3)))
             emit({'type':'resource_budget_wait','input_type':kind,'retry':retries,'wait_ms':round(wait_seconds*1000)})
             await asyncio.sleep(wait_seconds)
@@ -280,6 +280,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         'transition_started_event': asyncio.Event(),
         'transition_wait': None,
         'drop_inputs_before': 0,
+        'drop_capture_before': 0,
         'context': start.get('context') or {},
         'configuration': start.get('configuration', {}) or {},
         'reconnects': 0,
@@ -386,6 +387,11 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 continue
             if kind in ('audio','audio_stream_end','activity_start','activity_end','text','snapshot') and message.get('queued_at', 0) <= state['drop_inputs_before']:
                 emit({'type':'input_dropped','reason':'capability_transition','input_type':kind})
+                continue
+            # Resource waits invalidate real-time capture. Explicit text remains
+            # ordered in the input queue; it is not stale microphone replay.
+            if kind in ('audio','audio_stream_end','activity_start','activity_end','snapshot') and message.get('queued_at', 0) <= state['drop_capture_before']:
+                emit({'type':'input_dropped','reason':'resource_budget','input_type':kind})
                 continue
             if kind == 'audio':
                 if audio_chunks == 0:
@@ -508,7 +514,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             ], 'turnComplete': True}}, resource_guard)
                             emit({'type':'capability_continuation_sent','capability':transition['capability']})
                         if transition.get('budget_retries'):
-                            state['drop_inputs_before'] = round(time.time() * 1000)
+                            state['drop_capture_before'] = round(time.time() * 1000)
                             emit({'type':'resource_budget_ready','input_type':'setup','retries':transition['budget_retries']})
                     else:
                         emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})

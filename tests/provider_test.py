@@ -554,7 +554,8 @@ class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ws.sent),1)
         self.assertEqual(json.loads(ws.sent[0]),payload)
         self.assertEqual([e['type'] for e in events],['resource_budget_wait','resource_budget_ready'])
-        self.assertGreater(state['drop_inputs_before'],0)
+        self.assertGreater(state['drop_capture_before'],0)
+        self.assertEqual(state['drop_inputs_before'],0)
 
     async def test_guarded_send_charges_before_provider_write(self):
         guard = _Guard()
