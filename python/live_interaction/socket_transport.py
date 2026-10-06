@@ -89,6 +89,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
     unsubscribe = lambda: None
     close_code, close_reason = 1000, "closed"
     fatal = False
+    rejection = {}
 
     def enqueue(event):
         nonlocal queued_bytes
@@ -98,6 +99,19 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             payload = encode_output(event)
             size = len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
             if queued_bytes + size > max_output_bytes or queue.full():
+                kind = event.get("type")
+                seq = event.get("seq")
+                rejection.update({
+                    "output_event_type": kind if isinstance(kind, str) and re.fullmatch(r"[a-z_]{1,64}", kind) else "unknown",
+                    "output_seq": seq if type(seq) is int and 0 < seq <= 0xFFFFFFFF else 0,
+                    "output_payload_bytes": size,
+                    "queue_count_at_reject": queue.qsize(),
+                    "queue_bytes_at_reject": queued_bytes,
+                    "egress_limit_bytes": max_output_bytes,
+                    "egress_limit_events": queue.maxsize,
+                    "egress_reject_reason": "single_payload" if size > max_output_bytes else
+                        "queued_bytes" if queued_bytes + size > max_output_bytes else "event_count",
+                })
                 raise LiveError("LIVE_SOCKET_EGRESS_BACKPRESSURE", "Live output queue exceeded its bound")
             queue.put_nowait((event, payload, size))
             queued_bytes += size
@@ -198,7 +212,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         close_code = 1002 if isinstance(exc, LiveError) else 1011
         close_reason = exc.code if isinstance(exc, LiveError) else "LIVE_SOCKET_IO"
         binding.host.diagnostic(binding.session, "socket_failed", code=close_reason,
-                                connection_generation=binding.state.generation, queue_bytes=queued_bytes)
+                                connection_generation=binding.state.generation, queue_bytes=queued_bytes, **rejection)
     finally:
         unsubscribe()
         for task in tasks:

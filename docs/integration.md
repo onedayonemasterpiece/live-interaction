@@ -350,3 +350,9 @@ replays old speech automatically.
 ## Resource waits in 0.3.11-rc.2
 
 A rolling resource wait for an unsent tool response or explicit text keeps queued text in FIFO order until admission succeeds. It never invokes the tool again. Only realtime capture is discarded by the resource recovery cutoff. A genuine capability transition retains its separate old-stage input fence. Stop, lease/key binding and the bounded admission deadline remain unchanged. This candidate addresses the retained Street Story selection failure after a tool-response token wait; actual consumer acceptance is recorded separately.
+
+## Native candidate 0.3.11-rc.3
+
+Valid provider PCM is emitted in ordered 11,000-byte chunks before host sequence assignment. The shared dispatcher yields between events and messages so buffered provider replies do not starve the bounded output sender. PCM content, sample rate, transcript/tool boundaries, Stop and resource guards are preserved. The 256 KiB/320-event output bounds remain authoritative for stalled receivers. Rejection diagnostics retain event type, encoded size and queue watermark without media or transcripts.
+
+This candidate continues rc.2 resource-wait behavior. Existing stable consumers remain pinned. Offline contract checks do not establish real Live acceptance; retain exact candidate provenance and actual provider/application readback for each deliberately updated consumer.

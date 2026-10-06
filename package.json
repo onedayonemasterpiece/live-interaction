@@ -1,6 +1,6 @@
 {
   "name": "@onedayonemasterpiece/live-interaction",
-  "version": "0.3.11-rc.2",
+  "version": "0.3.11-rc.3",
   "private": true,
   "type": "module",
   "description": "Shared browser/native audio lifecycle and Gemini Live transport with application adapters",

@@ -87,7 +87,9 @@ class LiveSocketSessionHost(LiveSessionHost):
         super().__init__(adapter_factory=guarded_factory, **kwargs)
 
     def diagnostic(self, session, event: str, **fields):
-        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms"}
+        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms",
+                   "output_event_type", "output_seq", "output_payload_bytes", "queue_count_at_reject",
+                   "queue_bytes_at_reject", "egress_limit_bytes", "egress_limit_events", "egress_reject_reason"}
         record = {"event": event, "transport": "wss", "session_id": session.id,
                   "resource_id": session.resource_id, "model": session.model}
         state = self._socket_states.get(session.id)
