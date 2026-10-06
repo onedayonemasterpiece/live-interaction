@@ -2,6 +2,7 @@ import unittest
 
 from live_interaction.transcribe import (
     MODEL,
+    _provider_error_event,
     handle_server_message,
     input_payload,
     setup_config,
@@ -79,6 +80,13 @@ class TranscribeLiveContract(unittest.TestCase):
         )
         self.assertEqual(seen[0]["text"], "промежуточный")
         self.assertEqual(seen[1]["text"], "финальный")
+
+    def test_clean_local_stop_does_not_emit_provider_error(self):
+        exc = RuntimeError("normal close")
+        self.assertIsNone(_provider_error_event(exc, "fixture-key", stopped=True))
+        event = _provider_error_event(exc, "fixture-key", stopped=False)
+        self.assertEqual(event["type"], "error")
+        self.assertEqual(event["code"], "RuntimeError")
 
 
 if __name__ == "__main__":

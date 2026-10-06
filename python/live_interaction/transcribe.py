@@ -111,6 +111,17 @@ def handle_server_message(obj, emit):
         emit({"type": "turn_complete"})
 
 
+def _provider_error_event(exc, key, *, stopped):
+    if stopped:
+        return None
+    safe = str(exc).replace(key, "[REDACTED]").replace(quote(key, safe=""), "[REDACTED]")
+    return {
+        "type": "error",
+        "code": type(exc).__name__,
+        "message": re.sub(r"AIza[A-Za-z0-9_-]{20,}", "[REDACTED]", safe)[:500],
+    }
+
+
 async def run(*, load_key=default_key, reader=None, on_event=None, resource_guard=None):
     from websockets import connect
 
@@ -191,9 +202,6 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
     except Exception as exc:
         if _is_resource_failure(exc):
             raise
-        safe = str(exc).replace(key, "[REDACTED]").replace(quote(key, safe=""), "[REDACTED]")
-        emit({
-            "type": "error",
-            "code": type(exc).__name__,
-            "message": re.sub(r"AIza[A-Za-z0-9_-]{20,}", "[REDACTED]", safe)[:500],
-        })
+        event = _provider_error_event(exc, key, stopped=stopped)
+        if event is not None:
+            emit(event)
