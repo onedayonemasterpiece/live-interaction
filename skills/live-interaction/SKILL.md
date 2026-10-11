@@ -71,3 +71,11 @@ full playback and result readback. Distinguish prepared PCM from a physical mic.
 Long-session/resumption checks and real provider receipts are required before
 claiming those properties; a unit test, setup handshake or APK build is not Live
 acceptance. Keep managed artifacts and exact source/dependency versions.
+
+
+Browser socket send/ACK failures recover through bounded same-session ticket
+renewal before any full setup retry. Stop capture and drop stale PCM; never send
+provider Stop solely for a recoverable socket gap. Retain typed `RESOURCE_*`
+startup errors and `retry_after_ms` through HTTP/UI; a resource refusal is not a
+provider outage and must not trigger a transport retry loop. Native recovery
+policy is unchanged. Require real transport acceptance for lifecycle releases.

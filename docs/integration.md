@@ -355,3 +355,21 @@ source IDs/manifests, retention and later upload/replay policy. When connectivit
 available again, feed the durable source through the product's deliberate buffered
 Live turn (`activityStart → PCM → activityEnd`); ordinary reconnect still never
 replays old speech automatically.
+
+## Browser gap recovery and typed startup failure
+
+The browser client renews a one-use socket ticket for the existing session when
+an ordered sender detects a closed/failed socket or stale ACK/transport queue,
+including when that signal arrives before the browser's close callback. It stops
+capture and drops pending PCM, closes only the transport without a provider Stop,
+and uses the existing three-attempt, ten-second reconnect bound. Fresh capture
+resumes after hello acknowledgement. A replaced socket cannot affect the new
+connection's ACKs, heartbeat or events. Explicit Stop invalidates recovery at
+any await boundary. Durable persistence failures remain terminal.
+
+Startup errors preserve their typed code and optional bounded numeric
+`retry_after_ms` through Python `LiveError` and browser `liveJson`; HTTP adapters
+must preserve these fields in their `error` or FastAPI `detail` envelope. A
+`RESOURCE_*` refusal is not provider unavailability. Resource admission during
+ticket renewal is terminal and is not retried as a transport failure. None of
+these paths change quota accounting, switch provider/key or replay speech/tools.

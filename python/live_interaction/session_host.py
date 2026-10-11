@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import re
 import time
 import uuid
@@ -23,9 +24,12 @@ LIVE_SESSION_MODELS = ("gemini-3.8-live", "gemini-3.8-live-extended-thinking")
 
 
 class LiveError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, retry_after_ms: Any = None):
         super().__init__(message)
         self.code = code
+        if (isinstance(retry_after_ms, (int, float)) and not isinstance(retry_after_ms, bool)
+                and math.isfinite(retry_after_ms) and retry_after_ms >= 0):
+            self.retry_after_ms = min(86_400_000, math.ceil(retry_after_ms))
 
 
 class _QueueReader:
@@ -336,7 +340,11 @@ class LiveSessionHost:
                 self._emit(session, projected)
                 if session.ready and not session.ready.done():
                     session.ready.set_exception(
-                        LiveError("LIVE_PROVIDER_ERROR", str(event.get("message") or "Gemini Live error")[:500])
+                        LiveError(
+                            str(event.get("code") or "LIVE_PROVIDER_ERROR")[:80],
+                            str(event.get("message") or "Gemini Live error")[:500],
+                            retry_after_ms=event.get("retry_after_ms"),
+                        )
                     )
                 return
             if kind == "tool_cancelled":
@@ -375,9 +383,16 @@ class LiveSessionHost:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._emit(session, {"type": "error", "code": type(exc).__name__, "message": str(exc)[:500]})
+                failure = LiveError(
+                    str(getattr(exc, "code", None) or "LIVE_PROVIDER_ERROR")[:80],
+                    str(exc)[:500], retry_after_ms=getattr(exc, "retry_after_ms", None),
+                )
+                event = {"type": "error", "code": failure.code, "message": str(failure)}
+                if hasattr(failure, "retry_after_ms"):
+                    event["retry_after_ms"] = failure.retry_after_ms
+                self._emit(session, event)
                 if session.ready and not session.ready.done():
-                    session.ready.set_exception(LiveError("LIVE_PROVIDER_ERROR", str(exc)[:500]))
+                    session.ready.set_exception(failure)
             finally:
                 session.closed = True
                 reader.close()
