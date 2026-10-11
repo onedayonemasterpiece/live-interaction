@@ -88,16 +88,17 @@ export function createLiveSocketTransport({
     return new Promise((resolve,reject)=>{
       let settled=false,helloTimer=null;
       const ws=new WebSocketImpl(socketUrl(url),[LIVE_SOCKET_PROTOCOL,`wl-ticket.${ticket}`]);socket=ws;ws.binaryType='arraybuffer';
-      const fail=error=>{clearTimeout(helloTimer);if(!settled){settled=true;reject(error);}onError(error);};
+      const current=()=>socket===ws&&epoch===generation;
+      const fail=error=>{clearTimeout(helloTimer);if(!settled){settled=true;reject(error);}if(current())onError(error);};
       const protocolFail=error=>{fail(error);try{ws.close(1002,String(error.code??'protocol').slice(0,80));}catch{}};
       ws.onopen=()=>{
-        if(epoch!==generation){try{ws.close(1000,'stale');}catch{}return;}
+        if(!current()){try{ws.close(1000,'stale');}catch{}return;}
         ws.send(JSON.stringify({type:'hello',protocol:LIVE_SOCKET_PROTOCOL,attempt_id:String(attempt_id??'').slice(0,96),cursor:Number.isSafeInteger(cursor)?cursor:0,connection_generation:generation}));
         onTiming('socket_open',{connection_generation:generation});
         helloTimer=setTimeout(()=>protocolFail(Object.assign(new Error('Live WebSocket hello acknowledgement timeout'),{code:'LIVE_SOCKET_HELLO_TIMEOUT'})),helloTimeoutMs);
       };
       ws.onmessage=event=>{
-        if(epoch!==generation)return;
+        if(!current())return;
         try{
           if(typeof event.data==='string'){
             handleText(event.data,()=>{
@@ -105,7 +106,7 @@ export function createLiveSocketTransport({
               clearTimeout(helloTimer);settled=true;lastPong=now();
               clearHeartbeat();
               heartbeatTimer=setInterval(()=>{
-                if(epoch!==generation||closed)return;
+                if(!current()||closed)return;
                 if(now()-lastPong>heartbeatTimeoutMs){
                   protocolFail(Object.assign(new Error('Live heartbeat timeout'),{code:'LIVE_SOCKET_HEARTBEAT_TIMEOUT'}));return;
                 }
@@ -126,7 +127,13 @@ export function createLiveSocketTransport({
       ws.onerror=()=>fail(Object.assign(new Error('Live WebSocket transport failed'),{code:'LIVE_SOCKET_ERROR'}));
       ws.onclose=event=>{
         clearTimeout(helloTimer);
-        if(socket===ws){socket=null;clearHeartbeat();}
+        // A replaced socket can close after the new hello/PCM. Its callbacks
+        // must not reject the new connection's ACKs or clear its heartbeat.
+        if(!current()){
+          if(!settled){settled=true;reject(Object.assign(new Error('Live WebSocket replaced'),{code:'LIVE_SOCKET_CLOSED'}));}
+          return;
+        }
+        socket=null;clearHeartbeat();
         const wasClosed=closed;
         const closeError=Object.assign(new Error('Live WebSocket closed'),{code:'LIVE_SOCKET_CLOSED',metrics:metrics()});
         for(const pending of sent.values()){clearTimeout(pending.timer);pending.reject(closeError);}sent.clear();
@@ -141,7 +148,7 @@ export function createLiveSocketTransport({
       const seq=++audioSeq,frame=encodeLiveAudioFrame(message.pcm,{seq,age_ms:message.age_ms,startup_catchup:message.startup_catchup===true});
       return new Promise((resolve,reject)=>{
         const pending={at:now(),resolve,reject,timer:null};sent.set(seq,pending);
-        try{socket.send(frame);}catch(error){sent.delete(seq);reject(error);return;}
+        try{socket.send(frame);}catch{sent.delete(seq);reject(Object.assign(new Error('Live WebSocket send failed'),{code:'LIVE_SOCKET_ERROR'}));return;}
         pending.timer=setTimeout(()=>{
           if(!sent.has(seq))return;
           const m=metrics();sent.delete(seq);
@@ -153,7 +160,7 @@ export function createLiveSocketTransport({
     const safe=message?.audio_stream_end?{type:'input',message:{audio_stream_end:true,captured_at_ms:message.captured_at_ms,age_ms:message.age_ms}}
       :message?.text!==undefined?{type:'input',message:{text:message.text}}
       :{type:'input',message};
-    socket.send(JSON.stringify(safe));
+    try{socket.send(JSON.stringify(safe));}catch{throw Object.assign(new Error('Live WebSocket send failed'),{code:'LIVE_SOCKET_ERROR'});}
     onTiming('socket_control_sent',{input_type:message?.audio_stream_end?'audio_stream_end':message?.text!==undefined?'text':'context',...metrics()});
     return Promise.resolve({});
   }

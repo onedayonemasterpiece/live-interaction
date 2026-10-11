@@ -10,7 +10,13 @@ export {createMicrophoneCapture,createDurableMicrophoneCapture,pcm16,frameRms,mi
 export async function liveJson(url,options){
   const response=await fetch(url,{cache:'no-store',credentials:'same-origin',signal:AbortSignal.timeout(30000),...options});
   const payload=await response.json().catch(()=>({}));
-  if(!response.ok){const error=new Error(payload?.error?.message??`HTTP ${response.status}`);error.status=response.status;throw error;}
+  if(!response.ok){
+    const detail=payload?.error??payload?.detail??{};
+    const error=new Error(detail?.message??`HTTP ${response.status}`);error.status=response.status;
+    if(typeof detail.code==='string')error.code=detail.code.slice(0,80);
+    if(Number.isFinite(detail.retry_after_ms)&&detail.retry_after_ms>=0)error.retry_after_ms=Math.min(86400000,detail.retry_after_ms);
+    throw error;
+  }
   return payload;
 }
 function base64(bytes){let text='';for(let i=0;i<bytes.length;i+=0x8000)text+=String.fromCharCode(...bytes.subarray(i,i+0x8000));return btoa(text);}
@@ -181,7 +187,15 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         onTiming:(event,metrics)=>{
           onTiming(event,metrics);if(event==='speech_start'){inputTranscript='';awaitingReply=true;clearWait();}if(event==='speech_end'&&awaitingReply&&!playing.size)beginWait();
         },
-        onError:error=>{if(epoch!==generation)return;stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)}});onNotice('transport_error',error);},
+        onError:error=>{
+          if(epoch!==generation)return;
+          // A sender sees a failed send/ACK before the browser necessarily emits
+          // close. Recover the existing session; never send Stop for this gap.
+          if(transport==='wss'&&['LIVE_SOCKET_CLOSED','LIVE_SOCKET_ERROR','LIVE_SOCKET_BACKPRESSURE','LIVE_AUDIO_QUEUE_AGE','LIVE_AUDIO_QUEUE_BYTES'].includes(error?.code)){
+            onNotice('connection_error',error);void reconnectSocket(epoch);return;
+          }
+          stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_AUDIO_TRANSPORT').slice(0,80)}});onNotice('transport_error',error);
+        },
         speechEndMs:speechEndSilenceMs,
         speechStartMs,
         longSpeechEndMs:longSpeechEndSilenceMs,
@@ -282,6 +296,7 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
       const code=String(event.code??'LIVE_PROVIDER_ERROR').slice(0,80);
       const reason=code.startsWith('RESOURCE_')?'resource_denial':'provider_failure';
       const error=Object.assign(new Error(String(event.message??reason)),{code});
+      if(Number.isFinite(event.retry_after_ms)&&event.retry_after_ms>=0)error.retry_after_ms=Math.min(86400000,event.retry_after_ms);
       onNotice(reason,error);
       stop({reason,preservePlayback:true,detail:{code}});
       return false;
@@ -305,8 +320,8 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
   async function reconnectSocket(epoch){
     if(transport!=='wss'||epoch!==generation||!sessionId)return false;
     if(reconnectPromise)return reconnectPromise;
-    reconnectPromise=(async()=>{
-      closeMic();onState('reconnecting');onTiming('socket_reconnect_started',{connection_generation:connectionGeneration});
+    const recovery=(async()=>{
+      closeMic();socketTransport?.close({sendStop:false,reason:'transport_gap'});onState('reconnecting');onTiming('socket_reconnect_started',{connection_generation:connectionGeneration});
       const deadline=Date.now()+10000;
       let attempt=0,lastError=null;
       while(epoch===generation&&sessionId&&Date.now()<deadline&&attempt<3){
@@ -316,15 +331,23 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
           if(epoch!==generation||!sessionId)return false;
           connectionGeneration++;
           await socketTransport.connect({url:result.socket_url??socketUrl,ticket:result.socket_ticket,attempt_id:attemptId,cursor,connection_generation:connectionGeneration});
+          if(epoch!==generation||!sessionId)return false;
           onTiming('socket_reconnect_ready',{attempt,connection_generation:connectionGeneration});
           if(microphoneEnabled&&!budgetPaused)await startMic(epoch);
           return true;
-        }catch(error){lastError=error;onTiming('socket_reconnect_attempt_failed',{attempt,code:error?.code??'LIVE_SOCKET_RECONNECT'});if(attempt<3)await new Promise(resolve=>setTimeout(resolve,Math.min(1000,150*2**attempt)));}
+        }catch(error){lastError=error;onTiming('socket_reconnect_attempt_failed',{attempt,code:error?.code??'LIVE_SOCKET_RECONNECT'});if(String(error?.code??'').startsWith('RESOURCE_'))break;if(attempt<3)await new Promise(resolve=>setTimeout(resolve,Math.min(1000,150*2**attempt)));}
       }
-      if(epoch===generation){const error=lastError??new Error('Live WebSocket reconnect failed');stop({reason:'connection_failure',preservePlayback:true,detail:{code:String(error?.code??'LIVE_SOCKET_RECONNECT').slice(0,80)}});onNotice('transport_error',error);}
+      if(epoch===generation){
+        const error=lastError??new Error('Live WebSocket reconnect failed');
+        const code=String(error?.code??'LIVE_SOCKET_RECONNECT').slice(0,80);
+        const resourceFailure=code.startsWith('RESOURCE_');
+        stop({reason:resourceFailure?'resource_denial':'connection_failure',preservePlayback:true,detail:{code}});
+        onNotice(resourceFailure?'resource_denial':'transport_error',error);
+      }
       return false;
-    })().finally(()=>{reconnectPromise=null;});
-    return reconnectPromise;
+    })();
+    reconnectPromise=recovery;
+    try{return await recovery;}finally{if(reconnectPromise===recovery)reconnectPromise=null;}
   }
   function remoteStop(url,keepalive=false){onTiming('stop_request');void request(url,{method:'POST',headers:{'content-type':'application/json'},body:'{}',keepalive,signal:AbortSignal.timeout(2500)}).then(()=>onTiming('stop_response')).catch(()=>onTiming('stop_cleanup_timeout'));}
   function stop({keepalive=false,reason='user_stop',preservePlayback=false,returnMicrophoneHandoff=false,detail=null}={}){
@@ -355,10 +378,11 @@ export function createLiveClient({request=liveJson,onEvent=()=>{},onState=()=>{}
         socketTransport=createLiveSocketTransport({WebSocketImpl,onTiming,
           onEvent:event=>{void handleEvent(event,epoch);},
           onError:error=>{if(epoch===generation)onNotice('connection_error',error);},
-          onClose:detail=>{if(epoch!==generation||detail.expected)return;void reconnectSocket(epoch);}
+          onClose:detail=>{if(epoch!==generation||starting||detail.expected)return;void reconnectSocket(epoch);}
         });
         await socketTransport.connect({url:socketUrl,ticket:started.socket_ticket,attempt_id:attemptId,cursor,connection_generation:connectionGeneration});
       }
+      if(epoch!==generation||!sessionId)return;
       const {socket_ticket,...startedPublic}=started;onState('started',startedPublic);
       const Context=Audio();if(Context){playContext??=new Context();await resumePlaybackContext().catch(error=>{if(epoch===generation)onNotice('playback_error',error);});}
       if(epoch!==generation)return;
