@@ -96,6 +96,10 @@ class _Session:
     audio_end_sent_generation: int = 0
     audio_end_awaiting_ack: deque[int] = field(default_factory=deque)
     audio_end_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Output audio belongs to one model response. A reattach replays audio only
+    # of the still-open response; finished or interrupted answers never replay.
+    response_seq: int = 0
+    response_open: bool = False
 
 
 def _now_ms() -> int:
@@ -184,6 +188,14 @@ class LiveSessionHost:
         )
 
     def _emit(self, session: _Session, event: dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "audio":
+            if not session.response_open:
+                session.response_seq += 1
+                session.response_open = True
+            event = {**event, "response_id": session.response_seq}
+        elif kind in ("turn_complete", "interrupted"):
+            session.response_open = False
         item = {"seq": session.next_seq, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **event}
         session.next_seq += 1
         session.events.append(item)

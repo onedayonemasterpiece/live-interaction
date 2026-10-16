@@ -225,8 +225,12 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         # gap, stale speech must not play and must not overflow the egress bound.
         audio_budget = max_output_bytes // 2
         keep_audio = set()
+        session = binding.session
+        open_response = session.response_seq if getattr(session, "response_open", False) else None
         for event in reversed(backlog):
             if event.get("type") != "audio":
+                continue
+            if open_response is None or event.get("response_id") != open_response:
                 continue
             size = len(event.get("data") or "") * 3 // 4 + 12
             if size > audio_budget:

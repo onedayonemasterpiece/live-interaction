@@ -261,7 +261,7 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task2, 2)
         self.assertEqual(self.host.size(), 0)
 
-    async def test_ack_send_failure_detaches_without_stopping_session(self):
+    async def test_last_frame_ack_send_failure_detaches_and_fences_without_further_input(self):
         binding = self.open()
         inbound = asyncio.Queue()
         closed = []
@@ -320,6 +320,56 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio"})
         await settle(lambda: self.host._socket_states[self.sid].damaged)
         self.assertTrue(any(r["event"] == "provider_input_dropped" for r in self.records))
+
+    async def reattach(self, generation, cursor=0):
+        sent = []
+        async def send(frame):
+            sent.append(frame)
+        async def close(code, reason):
+            pass
+        inbound = asyncio.Queue()
+        task = asyncio.create_task(serve_socket(self.open(self.renew()), receive=inbound.get, send=send, close=close))
+        await self.hello(inbound, generation=generation, cursor=cursor)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("type") == "hello_ack" for x in sent))
+        await asyncio.sleep(0.02)
+        return task, inbound, sent
+
+    async def test_small_audio_of_finished_response_is_never_replayed_after_reattach(self):
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\1\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        self.provider.events({"type": "turn_complete"})
+        task, inbound, sent = await self.reattach(generation=2)
+        self.assertFalse(any(isinstance(x, bytes) for x in sent))
+        self.assertTrue(any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_STALE_OUTPUT_SKIPPED" for x in sent))
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_audio_of_still_open_response_is_delivered_after_reattach(self):
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\1\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        self.provider.events({"type": "turn_complete"})
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\2\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        task, inbound, sent = await self.reattach(generation=2)
+        audio = [x for x in sent if isinstance(x, bytes)]
+        self.assertEqual([x[12:] for x in audio], [b"\2\0" * 4])
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_eof_right_after_last_frame_fences_open_turn(self):
+        binding = self.open()
+        inbound = asyncio.Queue()
+        async def send(frame):
+            pass
+        async def close(code, reason):
+            pass
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound)
+        await settle(lambda: binding.connected)
+        await inbound.put(json.dumps({"type": "input", "message": {"activity_start": True}}))
+        await inbound.put(struct.pack("!III", 0x574C4131, 1, 10) + b"\0\0" * 160)
+        await inbound.put(None)  # client vanished after its last frame, no further input
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(self.host.size(), 1)
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+        self.assertTrue(any(r["event"] == "socket_gap" and r.get("audio_turn_open") for r in self.records))
 
     async def test_wrong_hello_and_json_audio_are_rejected_without_provider_input(self):
         for bad in ({"type": "hello", "protocol": "other"}, {"type": "hello", "protocol": SOCKET_PROTOCOL,
