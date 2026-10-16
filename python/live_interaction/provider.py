@@ -112,18 +112,23 @@ def _guard_check(resource_guard):
         resource_guard.check()
 
 
-async def _guarded_send(ws, payload, resource_guard=None):
+async def _guarded_send(ws, payload, resource_guard=None, *, before_write=None):
     _guard_check(resource_guard)
     if resource_guard is not None:
         pending = resource_guard.before_send(payload)
         if inspect.isawaitable(pending):
             await pending
         _guard_check(resource_guard)
+    if before_write is not None and not before_write():
+        return False
     await ws.send(json.dumps(payload))
     _guard_check(resource_guard)
+    return True
 
 
-async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False, deadline_seconds=SEND_BUDGET_DEADLINE_SECONDS):
+async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False,
+                                 deadline_seconds=SEND_BUDGET_DEADLINE_SECONDS, deadline_at=None,
+                                 connection_is_current=None):
     """Retry admission for one unsent control message; never rerun a product tool.
 
     A frame is optional and can be dropped. Live PCM cannot safely wait behind a
@@ -132,10 +137,27 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + deadline_seconds
+    if deadline_at is not None:
+        deadline = min(deadline, deadline_at)
+    current = connection_is_current or (lambda: state['ws'] is ws)
     retries = 0
+    pending_error = None
+    def ready_to_write():
+        # Admission itself may await an RPC. Check both before it and immediately
+        # before writing; bootstrap history has no public ready socket to close.
+        if state['stopped'] or not current():
+            return False
+        if loop.time() >= deadline:
+            if pending_error is not None:
+                raise pending_error
+            raise TimeoutError('Live message admission deadline')
+        return True
     while True:
+        if not ready_to_write():
+            return False
         try:
-            await _guarded_send(ws, payload, resource_guard)
+            if not await _guarded_send(ws, payload, resource_guard, before_write=ready_to_write):
+                return False
             if retries:
                 state['drop_inputs_before'] = round(time.time() * 1000)
                 emit({'type':'resource_budget_ready','input_type':kind,'retries':retries})
@@ -146,16 +168,24 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
             if kind == 'snapshot' and optional:
                 emit({'type':'input_dropped','reason':'resource_budget','input_type':kind})
                 return False
-            if kind not in ('tool_response','text','audio_stream_end','activity_end','activity_start'):
+            if kind not in ('tool_response','text','history_restore',
+                            'audio_stream_end','activity_end','activity_start'):
                 raise
+            pending_error = exc
             remaining = deadline - loop.time()
-            if remaining <= 0 or state['stopped'] or state['ws'] is not ws:
+            if remaining <= 0 or state['stopped'] or not current():
                 raise
             retries += 1
             state['drop_inputs_before'] = round(time.time() * 1000)
             wait_seconds = min(remaining, max(.05, min(5, getattr(exc,'retry_after_ms',3000) / 1000 or 3)))
             emit({'type':'resource_budget_wait','input_type':kind,'retry':retries,'wait_ms':round(wait_seconds*1000)})
-            await asyncio.sleep(wait_seconds)
+            if state.get('stop_event') is None:
+                await asyncio.sleep(wait_seconds)
+            else:
+                try:
+                    await asyncio.wait_for(state['stop_event'].wait(), timeout=wait_seconds)
+                except TimeoutError:
+                    pass
 
 
 async def _guarded_recv(ws, resource_guard=None):
@@ -342,6 +372,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
     state = {
         'ws': None,
         'stopped': False,
+        'stop_event': asyncio.Event(),
         'handle': _resume_handle(start.get('resume_handle')),
         'resume_requested': bool(_resume_handle(start.get('resume_handle'))),
         'handle_event': asyncio.Event(),
@@ -384,6 +415,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
             message = await read_line(reader)
             if message is None or message.get('type') == 'stop':
                 state['stopped'] = True
+                state['stop_event'].set()
                 if state['ws']:
                     await state['ws'].close()
                 return
@@ -512,6 +544,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if _is_resource_failure(exc):
                     state['resource_error'] = exc
                     state['stopped'] = True
+                    state['stop_event'].set()
                     try:
                         await ws.close()
                     except Exception:
@@ -522,6 +555,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
     sender_task = asyncio.create_task(sender())
     try:
         while not state['stopped']:
+            setup_sent = False
             try:
                 _guard_check(resource_guard)
                 transition = state.get('transition')
@@ -546,6 +580,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     history = [] if state['handle'] else dialogue.snapshot()
                     setup = setup_config(model, state['context'], history, configuration=configuration, search=search, handle=state['handle'])
                     await _guarded_send(ws, setup, resource_guard)
+                    setup_sent = True
                     remaining = max(.001, transition['deadline']-loop.time()) if transition else 20
                     async with asyncio.timeout(min(20,remaining)):
                         while True:
@@ -559,10 +594,15 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     if transition and loop.time() >= transition['deadline']:
                         raise TimeoutError('capability transition setup deadline')
                     if history:
-                        await _guarded_send(ws, {'clientContent': {'turns': [
+                        restored = await _send_with_budget_wait(ws, {'clientContent': {'turns': [
                             {'role': item['role'], 'parts': [{'text': item['text']}]}
                             for item in history
-                        ], 'turnComplete': True}}, resource_guard)
+                        ], 'turnComplete': True}}, resource_guard, emit, 'history_restore', state,
+                            deadline_at=transition['deadline'] if transition else None,
+                            connection_is_current=lambda generation=state['connection_generation']:
+                                state['connection_generation'] == generation)
+                        if not restored:
+                            return
                         emit({'type':'history_restored', **dialogue.metrics(),
                               'connection_generation':state['connection_generation']})
                     state['ws'] = ws
@@ -634,7 +674,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     # A denied setup grant commits no tokens. During a tool-bundle
                     # switch the previous socket is already closed, so wait for a
                     # short rolling-budget refill within the existing deadline.
-                    if (transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
+                    if (not setup_sent and transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
                             and transition.get('budget_retries', 0) < MAX_TRANSITION_BUDGET_RETRIES
                             and transition['deadline'] - loop.time() > TRANSITION_BUDGET_RETRY_SECONDS + 1):
                         transition['budget_retries'] = transition.get('budget_retries', 0) + 1
@@ -705,6 +745,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         emit({'type': 'error', 'code': type(exc).__name__, 'message': re.sub(r'AIza[A-Za-z0-9_-]{20,}', '[REDACTED]', message)[:500]})
     finally:
         state['stopped'] = True
+        state['stop_event'].set()
         sender_task.cancel()
         await asyncio.gather(sender_task, return_exceptions=True)
 
