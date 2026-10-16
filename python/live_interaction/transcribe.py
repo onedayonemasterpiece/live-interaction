@@ -21,6 +21,7 @@ from .provider import (
     default_key,
     read_line,
 )
+from .reconnect import ReconnectBudget
 
 MODEL = "gemini-3.5-transcribe-live"
 MAX_VOCABULARY = 1000
@@ -122,7 +123,8 @@ def _provider_error_event(exc, key, *, stopped):
     }
 
 
-async def run(*, load_key=default_key, reader=None, on_event=None, resource_guard=None):
+async def run(*, load_key=default_key, reader=None, on_event=None, resource_guard=None,
+              reconnect_budget=None):
     from websockets import connect
 
     emit = on_event or (lambda _event: None)
@@ -151,54 +153,91 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
         })
         return
 
+    budget = reconnect_budget or ReconnectBudget()
     stopped = False
+    connected_once = False
+    activity_open = False
     try:
-        async with connect(
-            ENDPOINT + "?key=" + quote(key, safe=""),
-            open_timeout=15,
-            close_timeout=2,
-            max_size=4 * 1024 * 1024,
-        ) as ws:
-            await _guarded_send(
-                ws,
-                setup_config(start.get("configuration")) ,
-                resource_guard,
-            )
-            async with asyncio.timeout(20):
-                while True:
-                    obj = json.loads(await _guarded_recv(ws, resource_guard))
-                    if "setupComplete" in obj:
-                        break
-                    handle_server_message(obj, emit)
-            emit({"type": "ready", "model": MODEL})
-
-            async def sender():
-                nonlocal stopped
-                while not stopped:
-                    message = await read_line(reader)
-                    if message is None or message.get("type") == "stop":
-                        stopped = True
-                        await ws.close()
-                        return
-                    payload = input_payload(message)
-                    if payload is not None:
-                        await _guarded_send(ws, payload, resource_guard)
-
-            sender_task = asyncio.create_task(sender())
+        while not stopped:
+            planned = False
             try:
-                while not stopped:
-                    obj = json.loads(await _guarded_recv(ws, resource_guard))
-                    if obj.get("goAway"):
-                        emit({
-                            "type": "go_away",
-                            "time_left": (obj.get("goAway") or {}).get("timeLeft"),
-                        })
-                        break
-                    handle_server_message(obj, emit)
-            finally:
-                stopped = True
-                sender_task.cancel()
-                await asyncio.gather(sender_task, return_exceptions=True)
+                async with connect(
+                    ENDPOINT + "?key=" + quote(key, safe=""),
+                    open_timeout=15,
+                    close_timeout=2,
+                    max_size=4 * 1024 * 1024,
+                ) as ws:
+                    await _guarded_send(
+                        ws,
+                        setup_config(start.get("configuration")) ,
+                        resource_guard,
+                    )
+                    async with asyncio.timeout(20):
+                        while True:
+                            obj = json.loads(await _guarded_recv(ws, resource_guard))
+                            if "setupComplete" in obj:
+                                break
+                            handle_server_message(obj, emit)
+                    budget.succeeded()
+                    if activity_open:
+                        # A renewal inside an open caption activity reopens it so the
+                        # remaining audio of the utterance is still transcribed.
+                        await _guarded_send(ws, {"realtimeInput": {"activityStart": {}}}, resource_guard)
+                    emit({"type": "resumed" if connected_once else "ready", "model": MODEL})
+                    connected_once = True
+
+                    async def sender():
+                        nonlocal stopped, activity_open
+                        while not stopped:
+                            message = await read_line(reader)
+                            if message is None or message.get("type") == "stop":
+                                stopped = True
+                                await ws.close()
+                                return
+                            payload = input_payload(message)
+                            if payload is not None:
+                                kind = message.get("type")
+                                if kind == "activity_start":
+                                    activity_open = True
+                                elif kind in ("activity_end", "audio_stream_end"):
+                                    activity_open = False
+                                await _guarded_send(ws, payload, resource_guard)
+
+                    sender_task = asyncio.create_task(sender())
+                    try:
+                        while not stopped:
+                            obj = json.loads(await _guarded_recv(ws, resource_guard))
+                            if obj.get("goAway"):
+                                planned = True
+                                emit({
+                                    "type": "go_away",
+                                    "time_left": (obj.get("goAway") or {}).get("timeLeft"),
+                                })
+                                break
+                            handle_server_message(obj, emit)
+                    finally:
+                        sender_task.cancel()
+                        await asyncio.gather(sender_task, return_exceptions=True)
+                if stopped:
+                    return
+                if not planned:
+                    raise ConnectionError("caption_connection_closed")
+            except Exception as exc:
+                if stopped or _is_resource_failure(exc) or not connected_once:
+                    raise
+                message = str(exc).lower()
+                if any(x in message for x in ("permission", "unauthorized", "api key", "quota")):
+                    raise
+                if not budget.allow():
+                    raise
+                if not planned:
+                    budget.failed()
+                emit({"type": "reconnecting", "planned": planned})
+                await asyncio.sleep(budget.delay())
+                continue
+            if not budget.allow():
+                raise ConnectionError("caption_renewal_budget_exhausted")
+            emit({"type": "reconnecting", "planned": True})
     except Exception as exc:
         if _is_resource_failure(exc):
             raise

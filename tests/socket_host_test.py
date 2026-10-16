@@ -224,7 +224,11 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed[-1][0], 1000)
         self.assertEqual(self.host.size(), 0)
 
-    async def test_relay_output_overflow_fails_instead_of_dropping_audio(self):
+    async def hello(self, inbound, generation=1, cursor=0):
+        await inbound.put(json.dumps({"type": "hello", "protocol": SOCKET_PROTOCOL,
+            "attempt_id": "attempt_test", "connection_generation": generation, "cursor": cursor}))
+
+    async def test_relay_output_overflow_detaches_socket_but_keeps_session(self):
         binding = self.open()
         inbound = asyncio.Queue()
         sent, closed = [], []
@@ -233,13 +237,89 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         async def close(code, reason):
             closed.append((code, reason))
         task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close, max_output_bytes=1024))
-        await inbound.put(json.dumps({"type": "hello", "protocol": SOCKET_PROTOCOL,
-            "attempt_id": "attempt_test", "connection_generation": 1, "cursor": 0}))
+        await self.hello(inbound)
         await settle(lambda: sent)
         self.provider.events({"type": "audio", "data": base64.b64encode(b"\0" * 2048).decode(), "mime_type": "audio/pcm;rate=24000"})
         await asyncio.wait_for(task, 2)
         self.assertEqual(closed[-1][1], "LIVE_SOCKET_EGRESS_BACKPRESSURE")
+        # Slow downlink is a transport condition: the logical conversation survives.
+        self.assertEqual(self.host.size(), 1)
+        self.assertFalse(self.session.closed)
+        self.assertTrue(any(r["event"] == "socket_detached" for r in self.records))
+        # Reattach replays text state but never the stale oversized audio.
+        sent2, closed2 = [], []
+        async def send2(frame):
+            sent2.append(frame)
+        async def close2(code, reason):
+            closed2.append((code, reason))
+        inbound2 = asyncio.Queue()
+        task2 = asyncio.create_task(serve_socket(self.open(self.renew()), receive=inbound2.get, send=send2, close=close2, max_output_bytes=1024))
+        await self.hello(inbound2, generation=2)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_STALE_OUTPUT_SKIPPED" for x in sent2))
+        self.assertFalse(any(isinstance(x, bytes) for x in sent2))
+        await inbound2.put('{"type":"stop"}')
+        await asyncio.wait_for(task2, 2)
         self.assertEqual(self.host.size(), 0)
+
+    async def test_ack_send_failure_detaches_without_stopping_session(self):
+        binding = self.open()
+        inbound = asyncio.Queue()
+        closed = []
+        async def send(frame):
+            if isinstance(frame, str) and json.loads(frame).get("type") == "audio_ack":
+                raise ConnectionResetError("client went away mid-ack")
+        async def close(code, reason):
+            closed.append((code, reason))
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound)
+        await settle(lambda: binding.connected)
+        await inbound.put(json.dumps({"type": "input", "message": {"activity_start": True}}))
+        frame = struct.pack("!III", 0x574C4131, 1, 10) + b"\0\0" * 160
+        await inbound.put(frame)
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(closed[-1], (1011, "LIVE_SOCKET_IO"))
+        self.assertEqual(self.host.size(), 1)
+        # The open speech turn is still fenced: reconnect cannot make it clean.
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+
+    async def test_hello_timeout_is_transient(self):
+        binding = self.open()
+        closed = []
+        async def never():
+            await asyncio.sleep(10)
+        async def send(frame):
+            pass
+        async def close(code, reason):
+            closed.append((code, reason))
+        await asyncio.wait_for(serve_socket(binding, receive=never, send=send, close=close, hello_timeout=0.05), 2)
+        self.assertEqual(closed[-1], (1011, "LIVE_SOCKET_IO"))
+        self.assertEqual(self.host.size(), 1)
+        self.open(self.renew())
+
+    async def test_reattach_with_trimmed_event_ring_reports_gap_and_continues(self):
+        for index in range(400):
+            self.host._emit(self.session, {"type": "output_transcript", "text": f"t{index}"})
+        binding = self.open()
+        inbound = asyncio.Queue()
+        sent = []
+        async def send(frame):
+            sent.append(frame)
+        async def close(code, reason):
+            pass
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound, cursor=1)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_EVENT_GAP" for x in sent))
+        ack = next(json.loads(x) for x in sent if isinstance(x, str) and json.loads(x).get("type") == "hello_ack")
+        self.assertTrue(ack["event_gap"])
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_provider_drop_during_open_turn_blocks_mutations(self):
+        await self.host.input(session_id=self.sid, resource_id="story1", actor=self.actor,
+                              message={"activity_start": True})
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio"})
+        await settle(lambda: self.host._socket_states[self.sid].damaged)
+        self.assertTrue(any(r["event"] == "provider_input_dropped" for r in self.records))
 
     async def test_wrong_hello_and_json_audio_are_rejected_without_provider_input(self):
         for bad in ({"type": "hello", "protocol": "other"}, {"type": "hello", "protocol": SOCKET_PROTOCOL,
@@ -285,3 +365,4 @@ class SocketWireContract(unittest.TestCase):
         self.assertTrue(same_origin("https://example.test", "example.test"))
         for origin in (None, "https://evil.test", "https://example.test.evil", "https://user@example.test", "https://example.test?token=x"):
             self.assertFalse(same_origin(origin, "example.test"))
+

@@ -644,3 +644,108 @@ class VersionMetadataTest(unittest.TestCase):
         expected = pyproject["project"]["version"]
         self.assertEqual(package["version"], expected)
         self.assertIn(f'__version__ = "{expected}"', init_text)
+
+
+class ProviderLongSessionContract(unittest.IsolatedAsyncioTestCase):
+    """A 90-minute conversation renews its provider connection many times."""
+
+    def start_reader(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'}})
+        return reader
+
+    async def wait_for(self, events, predicate, timeout=2):
+        async with asyncio.timeout(timeout):
+            while not predicate(events):
+                await asyncio.sleep(.001)
+
+    async def test_repeated_planned_go_away_renewals_do_not_end_the_session(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*_args,**_kwargs):
+            index=len(sockets)
+            incoming=[{'setupComplete':{}},{'sessionResumptionUpdate':{'newHandle':f'h{index}','resumable':True}}]
+            if index<5:
+                incoming.append({'goAway':{'timeLeft':'1s'}})
+            sockets.append(_FakeSocket(incoming))
+            return sockets[-1]
+        budget=ReconnectBudget(max_attempts=10,window_seconds=60)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            await self.wait_for(events,lambda ev:sum(e.get('type')=='resumed' for e in ev)>=5)
+            # Five renewals exceed the old lifetime cap of three; all resume by checkpoint.
+            resumed=[e for e in events if e.get('type')=='resumed']
+            self.assertTrue(all(e.get('resumption_mode')=='checkpoint' for e in resumed))
+            self.assertTrue(all(e.get('planned') for e in events if e.get('type')=='reconnecting'))
+            self.assertEqual(sockets[-1].sent[0]['setup']['sessionResumption'],{'handle':'h4'})
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_unplanned_drop_before_checkpoint_restores_history_instead_of_ending(self):
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*_args,**_kwargs):
+            sockets.append(_FakeSocket([{'setupComplete':{}}]+([] if sockets else [_FakeSocket._CLOSED])))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+            resumed=next(e for e in events if e.get('type')=='resumed')
+            self.assertEqual(resumed['resumption_mode'],'history_restore')
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_reconnect_storm_is_bounded_by_rolling_window(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; calls=0
+        def connect(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            return _FakeSocket([{'setupComplete':{}},_FakeSocket._CLOSED])
+        budget=ReconnectBudget(max_attempts=3,window_seconds=60,base_delay=0.001,max_delay=0.002)
+        with patch('websockets.connect',side_effect=connect):
+            await asyncio.wait_for(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget),2)
+        self.assertEqual(calls,4)  # first connection + three budgeted attempts
+        self.assertTrue(any(e.get('type')=='error' for e in events))
+
+    async def test_authorization_failure_is_never_retried(self):
+        reader=self.start_reader(); events=[]; calls=0
+        def connect(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            return _FakeSocket([{'setupComplete':{}},{'error':{'message':'API key not valid'}}])
+        with patch('websockets.connect',side_effect=connect):
+            await asyncio.wait_for(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append),2)
+        self.assertEqual(calls,1)
+        self.assertTrue(any(e.get('type')=='error' for e in events))
+
+    async def test_audio_dropped_during_provider_outage_is_reported_once(self):
+        reader=self.start_reader(); events=[]; sockets=[]; release=asyncio.Event()
+        def connect(*_args,**_kwargs):
+            if sockets:
+                async def delayed():
+                    await release.wait()
+                    return _FakeSocket([{'setupComplete':{}}])
+                return _Delayed(delayed)
+            sockets.append(_FakeSocket([{'setupComplete':{}},_FakeSocket._CLOSED]))
+            return sockets[-1]
+        class _Delayed:
+            def __init__(self,factory):
+                self.factory=factory
+            async def __aenter__(self):
+                self.socket=await self.factory()
+                return self.socket
+            async def __aexit__(self,*_args):
+                return False
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            await self.wait_for(events,lambda ev:any(e.get('type')=='reconnecting' for e in ev))
+            for _ in range(3):
+                reader.feed({'type':'audio','data':'AAAA','queued_at':10**13})
+            await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+            await asyncio.sleep(.01)
+            self.assertEqual(sum(e.get('type')=='input_dropped' for e in events),1)
+            release.set()
+            await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)

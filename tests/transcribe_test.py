@@ -91,3 +91,37 @@ class TranscribeLiveContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranscribeRenewalContract(unittest.IsolatedAsyncioTestCase):
+    async def test_go_away_renews_caption_session_and_reopens_activity(self):
+        import asyncio
+        from unittest.mock import patch
+        from provider_test import _FakeSocket, _QueueReader
+        from live_interaction.transcribe import MODEL, run
+        reader = _QueueReader()
+        reader.feed({"type": "start", "model": MODEL, "configuration": {}})
+        events, sockets = [], []
+
+        def connect(*_args, **_kwargs):
+            incoming = [{"setupComplete": {}}]
+            sockets.append(_FakeSocket(incoming))
+            return sockets[-1]
+
+        with patch("websockets.connect", side_effect=connect):
+            task = asyncio.create_task(run(load_key=lambda: "fixture-key", reader=reader, on_event=events.append))
+            async with asyncio.timeout(2):
+                while not any(e.get("type") == "ready" for e in events):
+                    await asyncio.sleep(.001)
+            reader.feed({"type": "activity_start"})
+            async with asyncio.timeout(2):
+                while not any("realtimeInput" in m for m in sockets[0].sent[1:]):
+                    await asyncio.sleep(.001)
+            sockets[0].incoming.put_nowait({"goAway": {"timeLeft": "1s"}})
+            async with asyncio.timeout(2):
+                while not any(e.get("type") == "resumed" for e in events):
+                    await asyncio.sleep(.001)
+            self.assertEqual(sockets[1].sent[1], {"realtimeInput": {"activityStart": {}}})
+            self.assertFalse(any(e.get("type") == "error" for e in events))
+            reader.feed({"type": "stop"})
+            await asyncio.wait_for(task, 1)

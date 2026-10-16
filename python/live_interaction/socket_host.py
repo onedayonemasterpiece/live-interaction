@@ -89,7 +89,7 @@ class LiveSocketSessionHost(LiveSessionHost):
         super().__init__(adapter_factory=guarded_factory, **kwargs)
 
     def diagnostic(self, session, event: str, **fields):
-        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms"}
+        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms", "skipped_audio_events"}
         record = {"event": event, "transport": "wss", "session_id": session.id,
                   "resource_id": session.resource_id, "model": session.model}
         state = self._socket_states.get(session.id)
@@ -112,6 +112,13 @@ class LiveSocketSessionHost(LiveSessionHost):
                 if clean and state.damaged:
                     state.damaged = False
                     self.diagnostic(session, "input_damage_recovered", connection_generation=state.generation)
+        if (event.get("type") == "input_dropped" and event.get("reason") == "provider_reconnect"
+                and (session.audio_turn_open or session.activity_open)):
+            # Relay-admitted speech never reached the provider: fence this turn.
+            state.damaged = True
+            state.turn_clean = False
+            self.diagnostic(session, "provider_input_dropped", connection_generation=state.generation,
+                            audio_turn_open=True)
         item = session.events[-1]
         for listener in tuple(state.subscribers):
             try:

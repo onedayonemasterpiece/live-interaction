@@ -11,6 +11,11 @@ import time
 from urllib.parse import quote
 from websockets.exceptions import ConnectionClosed
 
+try:
+    from .reconnect import ReconnectBudget
+except ImportError:  # executed as a standalone stdin/stdout provider process
+    from reconnect import ReconnectBudget
+
 ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
 FRESH_HANDLE_WAIT_SECONDS = 8
@@ -311,7 +316,7 @@ def handle_server_message(obj, emit=emit):
         emit({'type': 'turn_complete'})
 
 
-async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None):
+async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None, reconnect_budget=None):
     from websockets import connect
     emit = on_event
     loop = asyncio.get_running_loop()
@@ -343,12 +348,16 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         'context': start.get('context') or {},
         'configuration': start.get('configuration', {}) or {},
         'reconnects': 0,
+        'connected_once': False,
+        'go_away': False,
+        'outage_drop_reported': False,
         'connection_generation': 0,
         'resource_error': None,
         'transition': None,
         'search_disabled_by_quota': False,
     }
     dialogue = DialogueHistory(start.get('history'))
+    budget = reconnect_budget or ReconnectBudget()
     def emit_observed(event):
         if event.get('type') == 'input_transcript':
             dialogue.transcript('user', event.get('text'))
@@ -441,8 +450,12 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 await ws.close()
                 continue
             ws = state['ws']
-            # Drop capture during an outage. Never queue or replay old speech.
+            # Drop capture during an outage. Never queue or replay old speech, but
+            # make the loss observable so the host can fence the open turn.
             if not ws:
+                if kind in ('audio', 'audio_stream_end', 'activity_start', 'activity_end', 'text') and not state['outage_drop_reported']:
+                    state['outage_drop_reported'] = True
+                    emit({'type': 'input_dropped', 'reason': 'provider_reconnect', 'input_type': kind})
                 continue
             if kind in ('audio','audio_stream_end','activity_start','activity_end','text','snapshot') and message.get('queued_at', 0) <= state['drop_inputs_before']:
                 emit({'type':'input_dropped','reason':'capability_transition','input_type':kind})
@@ -548,6 +561,10 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                         emit({'type':'history_restored', **dialogue.metrics(),
                               'connection_generation':state['connection_generation']})
                     state['ws'] = ws
+                    state['connected_once'] = True
+                    state['go_away'] = False
+                    state['outage_drop_reported'] = False
+                    budget.succeeded()
                     transition = state.get('transition')
                     if transition:
                         emit({'type':'resumed','model':model,'voice':'Aoede','search_available':search,
@@ -571,7 +588,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             state['drop_inputs_before'] = round(time.time() * 1000)
                             emit({'type':'resource_budget_ready','input_type':'setup','retries':transition['budget_retries']})
                     else:
-                        emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})
+                        emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search,
+                              **({'resumption_mode': 'checkpoint' if setup['setup']['sessionResumption'].get('handle') else 'history_restore',
+                                  'connection_generation': state['connection_generation']} if state['reconnects'] else {})})
                     while not state['stopped']:
                         raw = await _guarded_recv(ws, resource_guard)
                         obj = json.loads(raw)
@@ -589,6 +608,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                                 state['handle_event'].clear()
                             emit({'type': 'resumption_state', 'resumable': bool(state['handle'])})
                         if obj.get('goAway'):
+                            state['go_away'] = True
                             emit({'type': 'go_away', 'time_left': obj['goAway'].get('timeLeft')})
                             break
                         handle_server_message(obj, emit=emit_observed)
@@ -648,11 +668,22 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     continue
                 if state['stopped']:
                     break
-                if not state['handle'] or state['reconnects'] >= 3 or any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota']):
+                # Long conversations renew the provider connection many times.
+                # Bound attempts per rolling window, never per session lifetime;
+                # auth/quota failures and a setup that never succeeded stay fatal.
+                if (not state['connected_once']
+                        or any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota'])
+                        or not budget.allow()):
                     raise
+                planned = state['go_away']
+                if not planned:
+                    budget.failed()
+                state['go_away'] = False
                 state['reconnects'] += 1
-                emit({'type': 'reconnecting', 'attempt': state['reconnects']})
-                await asyncio.sleep(min(2, state['reconnects'] * .5))
+                emit({'type': 'reconnecting', 'attempt': state['reconnects'], 'planned': planned,
+                      'resumption_mode': 'checkpoint' if state['handle'] else 'history_restore',
+                      'recent_attempts': budget.recent_attempts()})
+                await asyncio.sleep(budget.delay())
     except Exception as exc:
         if _is_resource_failure(exc):
             raise

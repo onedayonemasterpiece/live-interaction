@@ -24,6 +24,20 @@ MAX_PCM_BYTES = 11000
 MAX_CONTROL_BYTES = 65536
 MAX_OUTPUT_BYTES = 256 * 1024
 
+# A transient socket failure detaches only this socket. The logical Live session
+# survives for the client's bounded reconnect; damaged-turn fences still apply.
+# Protocol, authorization and storage/domain failures stay fail-closed.
+TRANSIENT_SOCKET_CODES = frozenset({
+    "LIVE_SOCKET_IO",
+    "LIVE_SOCKET_SEND_TIMEOUT",
+    "LIVE_SOCKET_EGRESS_BACKPRESSURE",
+    "LIVE_SOCKET_STALE_AUDIO",
+})
+
+
+class SocketIOError(LiveError):
+    """Failure of the socket I/O callbacks themselves, not of Live input."""
+
 
 def socket_ticket(protocols):
     values = list(protocols or [])
@@ -77,12 +91,26 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
     close(code, reason). Every callback is async. No HTTP polling is used.
     Caller validates Origin and rejects query credentials before consuming ticket.
     """
-    raw_send = send
+    raw_send, raw_receive = send, receive
     send_lock = asyncio.Lock()
     async def ordered_send(payload):
         async with send_lock:
-            return await raw_send(payload)
-    send = ordered_send
+            try:
+                return await asyncio.wait_for(raw_send(payload), send_timeout)
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, asyncio.TimeoutError):
+                raise SocketIOError("LIVE_SOCKET_SEND_TIMEOUT", "Live socket send timed out") from None
+            except Exception:
+                raise SocketIOError("LIVE_SOCKET_IO", "Live socket send failed") from None
+    async def guarded_receive():
+        try:
+            return await raw_receive()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise SocketIOError("LIVE_SOCKET_IO", "Live socket receive failed") from None
+    send, receive = ordered_send, guarded_receive
     # Backlog, live events and acknowledgements share one serialized writer.
     queue = asyncio.Queue(maxsize=320)
     queued_bytes = 0
@@ -114,7 +142,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             try:
                 seq = int(event.get("seq") or 0)
                 if seq > last_sent:
-                    await asyncio.wait_for(send(payload), send_timeout)
+                    await send(payload)
                     last_sent = seq
                 if event.get("type") == "closed":
                     return
@@ -132,8 +160,8 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 await binding.input({"audio_base64": base64.b64encode(pcm).decode("ascii")},
                                     frame_seq=seq, capture_age_ms=age, pcm_bytes=len(pcm),
                                     startup_catchup=startup_catchup)
-                await asyncio.wait_for(send(json.dumps({"type": "audio_ack", "seq": seq,
-                    "server_received_at": round(time.time() * 1000)})), send_timeout)
+                await send(json.dumps({"type": "audio_ack", "seq": seq,
+                    "server_received_at": round(time.time() * 1000)}))
                 continue
             if not isinstance(frame, str) or len(frame.encode("utf-8")) > MAX_CONTROL_BYTES:
                 raise LiveError("LIVE_SOCKET_MESSAGE", "Live control frame exceeds its bound")
@@ -145,7 +173,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 raise LiveError("LIVE_SOCKET_MESSAGE", "Live control frame must be an object")
             if message.get("type") == "ping":
                 binding.heartbeat()
-                await asyncio.wait_for(send('{"type":"pong"}'), send_timeout)
+                await send('{"type":"pong"}')
             elif message.get("type") == "stop":
                 await binding.stop()
                 return
@@ -158,7 +186,11 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 raise LiveError("LIVE_SOCKET_MESSAGE", "Unsupported Live control frame")
 
     try:
-        first = await asyncio.wait_for(receive(), hello_timeout)
+        try:
+            first = await asyncio.wait_for(receive(), hello_timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            # A slow mobile link is a transport condition, not a protocol violation.
+            raise SocketIOError("LIVE_SOCKET_IO", "Live hello did not arrive in time") from None
         if not isinstance(first, str) or len(first.encode("utf-8")) > 4096:
             raise LiveError("LIVE_SOCKET_HELLO", "Live hello is required")
         try:
@@ -179,16 +211,45 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         # host event loop, so live events cannot overtake older queued events.
         unsubscribe = binding.subscribe(enqueue)
         page = binding.events(cursor)
+        event_gap = False
+        backlog = []
         while True:
-            if page.get("gap"):
-                raise LiveError("LIVE_SOCKET_EVENT_GAP", "Live event backlog is incomplete")
-            for event in page["events"]:
-                enqueue(event)
+            # A reattach after a long gap must not destroy the conversation.
+            # Deliver the retained backlog and tell the client what was missed.
+            event_gap = event_gap or bool(page.get("gap"))
+            backlog.extend(page["events"])
             if not page.get("has_more"):
                 break
             page = binding.events(page["cursor"])
-        await asyncio.wait_for(send(json.dumps({"type": "hello_ack", "protocol": SOCKET_PROTOCOL,
-                                               "connection_generation": generation})), send_timeout)
+        # Text/state events are always replayed. Old model audio is not: after a
+        # gap, stale speech must not play and must not overflow the egress bound.
+        audio_budget = max_output_bytes // 2
+        keep_audio = set()
+        for event in reversed(backlog):
+            if event.get("type") != "audio":
+                continue
+            size = len(event.get("data") or "") * 3 // 4 + 12
+            if size > audio_budget:
+                break
+            audio_budget -= size
+            keep_audio.add(id(event))
+        skipped_audio = 0
+        for event in backlog:
+            if event.get("type") == "audio" and id(event) not in keep_audio:
+                skipped_audio += 1
+                continue
+            enqueue(event)
+        await send(json.dumps({"type": "hello_ack", "protocol": SOCKET_PROTOCOL,
+                               "connection_generation": generation, "event_gap": event_gap}))
+        if event_gap:
+            binding.host.diagnostic(binding.session, "socket_event_gap",
+                                    connection_generation=binding.state.generation)
+            await send(json.dumps({"type": "transport_notice", "code": "LIVE_SOCKET_EVENT_GAP"}))
+        if skipped_audio:
+            binding.host.diagnostic(binding.session, "socket_stale_output_skipped",
+                                    connection_generation=binding.state.generation, skipped_audio_events=skipped_audio)
+            await send(json.dumps({"type": "transport_notice", "code": "LIVE_SOCKET_STALE_OUTPUT_SKIPPED",
+                                   "skipped_audio_events": skipped_audio}))
         tasks = [asyncio.create_task(read_loop()), asyncio.create_task(write_loop())]
         done, _ = await asyncio.wait([*tasks, failed], return_when=asyncio.FIRST_COMPLETED)
         if failed in done:
@@ -198,11 +259,14 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        fatal = True
-        close_code = 1002 if isinstance(exc, LiveError) else 1011
-        close_reason = exc.code if isinstance(exc, LiveError) else "LIVE_SOCKET_IO"
-        binding.host.diagnostic(binding.session, "socket_failed", code=close_reason,
-                                connection_generation=binding.state.generation, queue_bytes=queued_bytes)
+        code = exc.code if isinstance(exc, LiveError) else "LIVE_INPUT_FAILURE"
+        transient = isinstance(exc, LiveError) and code in TRANSIENT_SOCKET_CODES
+        fatal = not transient
+        close_code = 1002 if isinstance(exc, LiveError) and not transient else 1011
+        close_reason = code
+        binding.host.diagnostic(binding.session, "socket_detached" if transient else "socket_failed",
+                                code=close_reason, connection_generation=binding.state.generation,
+                                queue_bytes=queued_bytes)
     finally:
         unsubscribe()
         for task in tasks:
