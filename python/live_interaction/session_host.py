@@ -308,6 +308,18 @@ class LiveSessionHost:
             # Transcript text is user-visible conversational source, not a
             # diagnostic preview. Keep it lossless end-to-end.
             projected = event
+            if kind == "resumption_checkpoint":
+                # Provider checkpoint handles are host secrets: never pushed to clients.
+                handle = event.get("handle")
+                saver = getattr(self.adapter, "on_checkpoint", None)
+                if isinstance(handle, str) and callable(saver):
+                    try:
+                        saved = saver(session, handle)
+                        if inspect.isawaitable(saved):
+                            asyncio.create_task(saved)
+                    except Exception:
+                        self._emit(session, {"type": "checkpoint_persist_failed"})
+                return
             if kind == "capability_ready":
                 self._emit(session, projected)
                 if (
@@ -422,6 +434,8 @@ class LiveSessionHost:
                 "configuration": initialized.get("configuration") or {},
                 "context": initialized.get("context") or {},
                 "history": filtered_history,
+                **({"resume_handle": initialized["resume_handle"]}
+                   if isinstance(initialized.get("resume_handle"), str) else {}),
             },
         )
         try:

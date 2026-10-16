@@ -749,3 +749,48 @@ class ProviderLongSessionContract(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
             reader.feed({'type':'stop'})
             await asyncio.wait_for(task,1)
+
+
+class ProviderCheckpointContract(unittest.IsolatedAsyncioTestCase):
+    async def test_persisted_handle_resumes_without_history_and_reports_checkpoints(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'},
+                     'history':[{'role':'user','text':'old'}],'resume_handle':'persisted-h'})
+        events=[]; sockets=[]
+        def connect(*_a,**_k):
+            sockets.append(_FakeSocket([{'setupComplete':{}},{'sessionResumptionUpdate':{'newHandle':'fresh-h','resumable':True}}]))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            async with asyncio.timeout(2):
+                while not any(e.get('type')=='resumption_checkpoint' for e in events):
+                    await asyncio.sleep(.001)
+            self.assertEqual(sockets[0].sent[0]['setup']['sessionResumption'],{'handle':'persisted-h'})
+            self.assertFalse(any('clientContent' in m for m in sockets[0].sent))
+            ready=next(e for e in events if e.get('type')=='ready')
+            self.assertEqual(ready['resumption_mode'],'checkpoint')
+            self.assertEqual(next(e for e in events if e.get('type')=='resumption_checkpoint')['handle'],'fresh-h')
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_rejected_persisted_handle_falls_back_once_to_history(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'},
+                     'history':[{'role':'user','text':'remember the blue folder'}],'resume_handle':'expired-h'})
+        events=[]; sockets=[]
+        def connect(*_a,**_k):
+            if not sockets:
+                sockets.append(_FakeSocket([{'error':{'message':'session not found'}}]))
+            else:
+                sockets.append(_FakeSocket([{'setupComplete':{}}]))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            async with asyncio.timeout(2):
+                while not any(e.get('type')=='ready' for e in events):
+                    await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='resumption_rejected' for e in events))
+            self.assertEqual(sockets[1].sent[0]['setup']['sessionResumption'],{})
+            self.assertTrue(any('clientContent' in m for m in sockets[1].sent))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)

@@ -485,3 +485,33 @@ class ConcurrentStartContract(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CheckpointAdapter(Adapter):
+    def __init__(self):
+        super().__init__()
+        self.checkpoints = []
+
+    def initialize(self, **kwargs):
+        result = super().initialize(**kwargs)
+        result["resume_handle"] = "persisted-h"
+        return result
+
+    def on_checkpoint(self, session, handle):
+        self.checkpoints.append((session.id, handle))
+
+
+class SessionHostCheckpointContract(unittest.IsolatedAsyncioTestCase):
+    async def test_checkpoint_is_persisted_by_adapter_and_never_exposed_to_clients(self):
+        import json
+        adapter, provider = CheckpointAdapter(), Provider()
+        host = LiveSessionHost(adapter_factory=lambda **_kw: adapter, key_resolver=lambda *_: "fixture-key",
+                               provider_run=provider.run, ready_timeout_ms=500)
+        started = await host.start(resource_id="r1", actor={"subject": "a", "tenant_id": "t"})
+        self.assertEqual(json.loads(provider.inputs[0])["resume_handle"], "persisted-h")
+        provider.events({"type": "resumption_checkpoint", "handle": "fresh-h"})
+        session = host.sessions[started["session_id"]]
+        self.assertEqual(adapter.checkpoints, [(session.id, "fresh-h")])
+        self.assertFalse(any(e.get("type") == "resumption_checkpoint" or "fresh-h" in json.dumps(e)
+                             for e in session.events))
+        await host.stop_all()

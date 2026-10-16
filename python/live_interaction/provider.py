@@ -183,6 +183,10 @@ def _application_search_function(configuration, functions):
     return name if any(str(item.get('name') or '') == name for item in functions if isinstance(item, dict)) else None
 
 
+def _resume_handle(value):
+    return value if isinstance(value, str) and 0 < len(value) <= 4096 else None
+
+
 def setup_config(model, context, history=None, *, configuration=None, search=False, handle=None):
     configuration = configuration or {}
     transcription = configuration.get('input_audio_transcription')
@@ -338,7 +342,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
     state = {
         'ws': None,
         'stopped': False,
-        'handle': None,
+        'handle': _resume_handle(start.get('resume_handle')),
+        'resume_requested': bool(_resume_handle(start.get('resume_handle'))),
         'handle_event': asyncio.Event(),
         'handle_generation': 0,
         'transition_handle_event': asyncio.Event(),
@@ -590,7 +595,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     else:
                         emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search,
                               **({'resumption_mode': 'checkpoint' if setup['setup']['sessionResumption'].get('handle') else 'history_restore',
-                                  'connection_generation': state['connection_generation']} if state['reconnects'] else {})})
+                                  'connection_generation': state['connection_generation']} if state['reconnects'] or state['resume_requested'] else {})})
                     while not state['stopped']:
                         raw = await _guarded_recv(ws, resource_guard)
                         obj = json.loads(raw)
@@ -599,6 +604,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                         if update is not None:
                             state['handle'] = update.get('newHandle') if update.get('resumable') else None
                             if state['handle']:
+                                # Host-only: lets a product persist the checkpoint so a
+                                # backend restart resumes the same provider conversation.
+                                emit({'type': 'resumption_checkpoint', 'handle': state['handle']})
                                 state['handle_generation'] += 1
                                 state['handle_event'].set()
                                 wait = state.get('transition_wait')
@@ -671,9 +679,15 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 # Long conversations renew the provider connection many times.
                 # Bound attempts per rolling window, never per session lifetime;
                 # auth/quota failures and a setup that never succeeded stay fatal.
-                if (not state['connected_once']
-                        or any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota'])
-                        or not budget.allow()):
+                auth_failure = any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota'])
+                if not state['connected_once'] and state['resume_requested'] and not auth_failure:
+                    # A persisted checkpoint may have expired or belong to another
+                    # provider binding: fall back once to bounded history restore.
+                    state['resume_requested'] = False
+                    state['handle'] = None
+                    emit({'type': 'resumption_rejected', 'reason': type(exc).__name__})
+                    continue
+                if not state['connected_once'] or auth_failure or not budget.allow():
                     raise
                 planned = state['go_away']
                 if not planned:
