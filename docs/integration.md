@@ -104,9 +104,11 @@ resumption handles in a WebSocket URL.
 
 The browser sends `hello` with a pre-session `attempt_id`, the event cursor and a
 monotonic connection generation. Audio frames are binary PCM16/16 kHz with a bounded
-header carrying frame sequence and capture age. The server may send asynchronous
-`audio_ack` receipt telemetry, but the next audio frame never waits for that
-acknowledgement. Provider events are pushed immediately; output PCM is binary. A new
+header carrying frame sequence and capture age. The browser audio send completes only
+after the server's relay `audio_ack`; the ordered sender uses it for transport pacing.
+This ACK is not a durable-source receipt. Negotiated native/mobile v2 compression and
+durable ACK semantics are specified in [the voice continuity draft](voice-continuity-contract.md).
+Provider events are pushed immediately; v1 output PCM is binary. A new
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
 
