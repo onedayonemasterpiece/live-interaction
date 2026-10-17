@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: npm test
-      - run: python -m pip install -e .
+      - run: python -m pip install -e '.[audio]'
       - run: npm run test:python
   native:
     runs-on: ubuntu-latest
@@ -30,4 +30,6 @@ jobs:
         if: always()
         with:
           name: native-wss-contracts
-          path: android/build/reports/tests/
+          path: |
+            android/build/reports/tests/
+            android/platform/build/reports/tests/

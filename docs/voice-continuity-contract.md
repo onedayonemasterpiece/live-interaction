@@ -1,6 +1,6 @@
 # Voice continuity contract (draft for wl-live-v2)
 
-Status: **draft, 16 October 2026; clarified 17 October 2026**. Working contract for the native Android + PWA voice
+Status: **implementation candidate, 17 October 2026; physical/provider acceptance pending**. Continuation of the 16 October draft for native Android + PWA voice
 delivery (projects-hub task `docs/prompts/projects-hub-native-voice-pwa-delivery-20261016.md`).
 Numbers marked *hypothesis* are starting values for the network bench, not accepted limits.
 Native/mobile v2 requires codec compression in **both directions**. `wl-live-v1` remains
@@ -71,7 +71,9 @@ attached ──transient I/O──▶ detached ──reattach (fresh ticket, gen
 dormant ──speech or reattach──▶ renewing ──▶ attached
 ```
 
-- `detached`: provider session continues; output that becomes stale is not replayed as audio.
+- `detached`: the provider session and its bounded output archive continue. A receiver can
+  request original compressed output from its actual played position; cancelled responses
+  remain saved and are excluded from automatic playback.
 - `dormant` (*hypothesis* after 60 s detached or N minutes idle): saves provider budget; resume
   by checkpoint handle while valid ([provider session-management documentation](https://ai.google.dev/gemini-api/docs/live-api/session-management)
   gives a two-hour resumption window after the last session termination), otherwise journal
@@ -114,20 +116,26 @@ Rules:
 
 ## 5. Wire v2 additions (negotiated)
 
-Subprotocols offered by the client: `["wl-live-v2", "wl-live-v1", "wl-ticket.<ticket>"]`.
+The native v2 candidate offers `["wl-live-v2", "wl-ticket.<ticket>"]`. Explicitly selecting
+the legacy compatibility client instead offers `wl-live-v1`; a failed v2 handshake never
+silently changes the codec or transport version. Existing Cookie, exact Origin and one-use
+ticket checks still apply to both protocols.
 
 `hello` adds `capabilities`:
 ```json
 {"type":"hello","protocol":"wl-live-v2","attempt_id":"…","cursor":42,"connection_generation":3,
  "capabilities":{"uplink_codecs":["opus/ogg;channels=1","aac/adts;rate=16000;channels=1"],
                  "downlink_codecs":["opus/ogg;channels=1"]},
- "resume":[{"source_id":"src_…","last_server_durable_seq":118,"pending_codec_epochs":["ce_1"]}]}
+ "resume":[{"source_id":"local_…","last_server_durable_seq":118,"pending_codec_epochs":["ce_1"]}],
+ "playback_resume":{"source_id":"out_session_7","played_ms":420}}
 ```
 These codec choices are bench candidates, not an accepted quality profile. `hello_ack`
-selects one compressed uplink and one compressed downlink profile, returns per-source
-`server_durable_seq`, `event_gap`, and the bounds below. Its durable cursors come from the
-server's committed prefixes, not the client's last-observed ACK. The client resends
-device-durable chunks after `server_durable_seq` under the recovery budget.
+selects one compressed uplink and one compressed downlink profile and returns `event_gap`,
+`recovery_profiles`, and the bounds below. Pending input sources are initially
+`awaiting_source_descriptor`; subsequent `source_bound` returns the authoritative
+`server_durable_seq` after actor/conversation-scoped source binding. The server never
+promotes a client's last-observed ACK into a durable receipt. Source binding and old-source
+delivery do not delay the hello acknowledgement or readiness of a fresh Live lane.
 
 Each source codec epoch has an immutable descriptor: epoch id, codec/container and version,
 channels, codec timestamp timebase, decoded PCM rate, and required decoder initialization
@@ -152,10 +160,61 @@ stream headers plus ordered codec state or a defined restart/pre-roll boundary. 
 dependencies during tail flush and partial recovery
 ([Ogg Opus specification](https://www.rfc-editor.org/rfc/rfc7845)).
 
-Binary uplink frame v2 (`WLA2`): magic, version, flags (`deferred`, `portion_start`,
-`portion_end`), `source_id` hash/index, `chunk_seq`, original capture start (ms, server-clock
-offset from hello), duration (ms), codec epoch id, payload. Payload is the encoded bytes exactly
-as the server stores them (Ogg stream segments or ADTS frames); no transcoding before storage.
+### 5.1 Executable frame and input hooks
+
+Both `WLA2` and `WLO2` have exactly **56 header bytes**, big-endian integers, followed by
+the original encoded payload. The magic identifies version and direction.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `WLA2` / `WLO2` |
+| 4 | 1 | flags |
+| 5 | 1 | reserved, zero |
+| 6 | 2 | header length, 56 |
+| 8 | 4 | socket-local source/stream reference, nonzero |
+| 12 | 4 | socket-local codec epoch reference, nonzero |
+| 16 | 8 | source-wide chunk sequence, first 1, at most 2^53−1 |
+| 24 | 8 | original source-relative capture/media start, microseconds |
+| 32 | 4 | valid captured/media duration, microseconds |
+| 36 | 4 | encoded payload length |
+| 40 | 4 | delivery generation; distinct from source and codec identity |
+| 44 | 4 | reserved, zero |
+| 48 | 8 | original host event sequence for output; zero for input |
+
+Flags are `RECOVERY=1`, `PORTION_START=2`, `PORTION_END=4`, `EPOCH_END=8`, and
+output-only `EVENT_END=16`. `RECOVERY`, delivery generations, references and `EVENT_END`
+are not part of durable chunk identity. Stable identity includes source/epoch IDs, source-wide
+sequence, original source-relative start and duration, portion/EPOCH_END flags, and SHA-256
+of the unchanged payload. A retry can change its transport lane without changing its original.
+
+`source_open` carries `source_id`, `started_at_unix_ms`, `source_time_now_us`, and
+`lane: live|recovery`. The product assigns `server_source_id`; client metadata never selects
+the actor or conversation. `source_bound` returns both IDs, `source_ref` and committed prefix.
+`codec_epoch` carries `source_ref` and the immutable descriptor; `epoch_bound` returns
+`epoch_ref`. A socket admits one new live source and up to eight recovery sources. A source
+with a previously committed prefix uses recovery; fresh Live starts its own new source, so
+an old missing chunk cannot block it. Sequence numbers stay source-wide across codec epochs.
+
+`source_seal` records `source_ref`, `last_chunk_seq` and `capture_end_us`. This intent can
+precede still-missing recovery chunks. Completion requires the contiguous prefix through
+that final sequence, exact valid end, and terminal chunks for every used codec epoch.
+Acknowledging a seal request alone is not a completed source receipt.
+
+`source_sealed` includes the store's `server_durable_seq` and `complete` result.
+`source_unbind` / `source_unbound` release only socket references, never original bytes or
+their disposition. Recovery references can be recycled; a former live source can be unbound
+after its complete durable seal and decoder EOS. New references increase monotonically,
+so freed slots cannot reinterpret late frames. This permits further sources without a
+reconnect that would interrupt fresh capture.
+
+The entire captured original, including silence, is encoded and stored. Portion flags limit
+which decoded spans reach the Live provider; the decoder still receives the ordered complete
+codec stream. The typed `EncodedAudioStore` hook commits original bytes before one stateful
+decode. `DurablePCMProjection` then enters `LiveSessionHost.input_pcm` and the product's
+`input_audio` hook. Its receipt is an internal Python value, never a JSON bypass flag.
+Legacy `adapter.input(audio_base64)` is not called again for that projection. The same decoded
+PCM can feed captions. Stop/socket generation are checked after awaited product hooks before
+provider delivery. Recovery commits/ACKs never automatically replay old speech into fresh Live.
 
 Bounds announced in `hello_ack` (numeric values remain *hypothesis* until measured): max
 encoded bytes and decoded duration per frame; live unacknowledged bytes/duration and oldest
@@ -166,11 +225,66 @@ negotiated peer limits. At a bound, surface backpressure/full/error status; neve
 unbounded audio or silently discard an undelivered durable source. Account for live and
 recovery work separately so fresh input and Stop retain their priority.
 
-Downlink: compressed binary `WLO2` with generation, response id and codec epoch id.
-On barge-in the client reports the played position
-(`{"type":"playback_position","response_id":…,"played_ms":…}`) so the host can
-align the agent context where the provider supports it; otherwise the UX must not claim the
-model knows where it was interrupted.
+The executable candidate caps each payload at 8,192 bytes and valid duration at 240 ms;
+decoder work and codec initialization have separate hard caps. Input windows are 32,768 bytes /
+960 ms for live and 16,384 bytes / 480 ms for recovery. Source/disk retention limits remain
+product-owned and finite. These are implemented admission limits, not measured throughput,
+quality or maximum volatile-loss guarantees.
+
+### 5.2 Original output, received durability and actual playback
+
+`AudioV2Services.output_store_factory` supplies an actor/conversation-scoped
+`EncodedOutputStore`. The existing host owns one ordered, bounded archive worker and native
+codec state across socket loss. Each provider response is one stable `out_<session>_<response>`
+source and one codec epoch in this candidate. A PCM-rate change inside a response fails
+explicitly. Output is encoded once, committed with its original event sequence, and sealed
+after the real codec tail. Detached sockets do not cancel archiving. Interrupted/Stopped tails
+can finish persistence while playback cancellation remains immediate; saved cancelled output
+is marked as such and cannot automatically resume as speech.
+
+`output_epoch` binds `source_id`, `server_source_id`, `stream_ref`, `provider_response_id`,
+`epoch_ref`, `server_durable_seq`, `connection_generation` and the original descriptor.
+`WLO2` carries unchanged compressed chunks. Android syncs each original output chunk before
+both playback and `output_ack {source_id,chunk_seq,stage:"device_durable"}`. This cumulative
+prefix frees the bounded delivery window; it is not a played position. Output live/recovery
+windows have independent byte/duration caps, with the same candidate sizes as input.
+
+The receiver reports `playback_position {source_id,played_ms,connection_generation}` from
+actual AudioTrack progress. It persists this separately from received event/chunk cursors.
+The provider's understanding of an interruption still depends on its supported context
+alignment API; recording a played position does not imply that the model knows it.
+
+After hello, `output_available.sources` is a bounded manifest (at most eight pending sources)
+with IDs, committed prefix, `played_us`, `duration_us`, `complete` and `cancelled`. It is an
+availability notice, not automatic playback. The optional hello `playback_resume`, or later
+`output_resume {source_id,played_ms}`, requests one source in the independent recovery lane.
+The current decoder replays original headers and the ordered compressed prefix and discards
+already played samples; it does not invent random-access codec state. Prefix transfer/decoding
+is bounded per batch and paced independently of fresh Live. Efficient indexed Opus seeking
+with preroll remains a performance gate, not an implemented promise.
+
+Replay preserves original event sequence metadata but omits `EVENT_END`, so old-session audio
+does not advance a new session's text cursor. `output_replayed` reports `through_seq` and
+`complete`. A persisted prefix lacking a true terminal chunk reports incomplete recovery;
+neither server nor device invents EOS, a played receipt or source completion. Cancelled
+originals remain stored and are excluded from the pending playback manifest.
+
+After playback progress, `output_list` requests the next bounded pending manifest. It is
+ordered after the prior played-position commit, allowing the ninth and later saved response
+to progress without a socket reset. A recovery reader waits for an original still being
+produced by this host; an empty read batch is not mistaken for a crashed/incomplete source.
+
+The Python implementation uses the optional pinned `audio` extra (`av==18.1.0`) and runtime
+codec capability checks. Opus/Ogg is the primary profile; mono 16 kHz AAC-LC/ADTS is explicit
+uplink compatibility when native capability and encoder delay are available. The single shared
+decode supplies 16 kHz provider/caption PCM; Opus clock/pre-skip stay 48 kHz. There is no Go/Rust
+port, per-chunk ffmpeg process, second caption decoder, or second provider host.
+
+`tests/fixtures/wl-live-v2-vectors.json` is consumed by Python and pure Java conformance tests.
+Native codec tests exercise pre-skip, partial tails, CRC/sequence/expansion rejection; WSS tests
+exercise durable barriers, separate lanes, Stop fences, output windows, detached archiving,
+and byte-identical replay after a new host session. These tests do not replace handset,
+network, power-loss, load, or real-provider release acceptance.
 
 ## 6. What stays product-owned
 

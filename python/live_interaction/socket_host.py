@@ -43,6 +43,7 @@ class _SocketState:
     turn_has_audio: bool = False
     boundaries: deque = field(default_factory=deque)
     subscribers: set = field(default_factory=set)
+    output_archive: Any = None
 
 
 class _GuardedAdapter:
@@ -80,9 +81,11 @@ class LiveSocketSessionHost(LiveSessionHost):
     transport-loss admission. Legacy HTTP sessions remain explicitly compatible.
     """
 
-    def __init__(self, *, adapter_factory, diagnostic: Callable | None = None, **kwargs):
+    def __init__(self, *, adapter_factory, diagnostic: Callable | None = None, audio_v2=None, **kwargs):
         self._socket_states: dict[str, _SocketState] = {}
         self._diagnostic_callback = diagnostic
+        self.audio_v2 = audio_v2
+        self._host_close_task = None
 
         def guarded_factory(**hooks):
             return _GuardedAdapter(self, adapter_factory(**hooks))
@@ -138,6 +141,8 @@ class LiveSocketSessionHost(LiveSessionHost):
             self.diagnostic(session, "provider_input_dropped", connection_generation=state.generation,
                             audio_turn_open=True)
         item = session.events[-1]
+        if state.output_archive is not None:
+            state.output_archive.enqueue(item)
         for listener in tuple(state.subscribers):
             try:
                 listener(item)
@@ -145,15 +150,32 @@ class LiveSocketSessionHost(LiveSessionHost):
                 self.diagnostic(session, "subscriber_failed", code="LIVE_SOCKET_SUBSCRIBER")
 
     async def start(self, *, resource_id, actor, attempt_id=None, **kwargs):
+        if self._host_close_task is not None:
+            raise LiveError("LIVE_HOST_CLOSED", "The Live host has been closed")
         if attempt_id is None:
             attempt_id = "attempt_" + secrets.token_hex(12)
         if not isinstance(attempt_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,96}", attempt_id):
             raise LiveError("INVALID_ARGUMENT", "Invalid Live attempt identifier")
         result = await super().start(resource_id=resource_id, actor=actor, **kwargs)
+        if self._host_close_task is not None:
+            session = self.sessions.get(result["session_id"])
+            if session is not None:
+                await self._discard(session, graceful=True)
+            raise LiveError("LIVE_HOST_CLOSED", "The Live host closed during session setup")
         session = self._get(result["session_id"], resource_id, actor)
         if session.closed:
             raise LiveError("LIVE_SESSION_CLOSED", "Live session closed during setup")
         self._socket_states[session.id] = _SocketState(attempt_id)
+        if (self.audio_v2 is not None and self.audio_v2.output_store_factory is not None
+                and self.audio_v2.codecs.profiles("downlink")):
+            from .audio_socket import AudioWorkPool
+            from .audio_output import AudioOutputArchive
+            if not hasattr(self, "_audio_work_pool"):
+                self._audio_work_pool = AudioWorkPool()
+            archive = AudioOutputArchive(self, session, self.audio_v2, self._audio_work_pool)
+            self._socket_states[session.id].output_archive = archive
+            for event in session.events:
+                archive.enqueue(event)
         ticket = self.issue_socket_ticket(session_id=session.id, resource_id=resource_id, actor=actor)
         return {**result, **ticket}
 
@@ -167,6 +189,7 @@ class LiveSocketSessionHost(LiveSessionHost):
         state.ticket_expires = time.monotonic() + TICKET_TTL_SECONDS
         self._touch(session)
         return {"socket_ticket": ticket, "transport_protocol": SOCKET_PROTOCOL,
+                "transport_protocols": [SOCKET_PROTOCOL, "wl-live-v2"] if state.output_archive is not None else [SOCKET_PROTOCOL],
                 "expires_in_ms": TICKET_TTL_SECONDS * 1000, "attempt_id": state.attempt_id}
 
     def open_socket(self, *, session_id, resource_id, ticket):
@@ -185,13 +208,20 @@ class LiveSocketSessionHost(LiveSessionHost):
         self._touch(session)
         return SocketBinding(self, session, state, state.claim)
 
-    async def input(self, *, session_id, resource_id, message, actor=None, received_at=None, _socket_claim=None):
+    async def input(self, *, session_id, resource_id, message, actor=None, received_at=None, _socket_claim=None,
+                    _audio_projection=None):
         session = self._get(session_id, resource_id, actor)
         state = self._socket_states.get(session_id)
         if not isinstance(message, dict):
             raise LiveError("INVALID_ARGUMENT", "Live input must be an object")
         if state and state.used_wss and (not _socket_claim or _socket_claim != state.claim):
             raise LiveError("LIVE_TRANSPORT_MISMATCH", "This Live session uses WSS; HTTP input is not a fallback")
+        generation = state.generation if state else 0
+        def delivery_guard():
+            if (session.closed or session.stop_reason is not None or
+                    (state and _socket_claim and (state.claim != _socket_claim or state.generation != generation))):
+                raise LiveError("LIVE_SOCKET_CLOSED", "Live input admission changed while waiting")
+        delivery_guard()
         begin = bool(message.get("activity_start")) or (
             "audio_base64" in message and not session.manual_activity_detection and not session.audio_turn_open)
         end = bool(message.get("activity_end") or message.get("audio_stream_end"))
@@ -210,7 +240,8 @@ class LiveSocketSessionHost(LiveSessionHost):
             state.boundaries.append(marker)
         try:
             return await super().input(session_id=session_id, resource_id=resource_id, message=message,
-                                       actor=actor, received_at=received_at)
+                                       actor=actor, received_at=received_at, _audio_projection=_audio_projection,
+                                       _delivery_guard=delivery_guard)
         except Exception:
             if state and begin:
                 state.turn_serial, state.turn_clean = previous_serial, previous_clean
@@ -234,6 +265,31 @@ class LiveSocketSessionHost(LiveSessionHost):
             if state:
                 state.ticket_digest = None
                 state.subscribers.clear()
+                if state.output_archive is not None:
+                    await state.output_archive.close()
+
+    async def _close_runtime(self):
+        deadline = asyncio.get_running_loop().time() + 15.0
+        stopping = asyncio.create_task(self.stop_all())
+        try:
+            done, _ = await asyncio.wait({stopping}, timeout=15.0)
+            if not done:
+                # Native calls keep their context until they return; cancelling
+                # an asyncio task cannot safely kill a running native thread.
+                stopping.cancel()
+                stopping.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+                raise LiveError("LIVE_HOST_SHUTDOWN_TIMEOUT", "Live shutdown exceeded its flush bound")
+            stopping.result()
+        finally:
+            pool = getattr(self, "_audio_work_pool", None)
+            if pool is not None:
+                await pool.close(timeout=max(0.0, min(5.0, deadline - asyncio.get_running_loop().time())))
+
+    async def close(self):
+        """Terminal application shutdown; stop/stop_all keep this host reusable."""
+        if self._host_close_task is None:
+            self._host_close_task = asyncio.create_task(self._close_runtime(), name="live-host-shutdown")
+        await asyncio.shield(self._host_close_task)
 
 
 class SocketBinding:
@@ -309,6 +365,19 @@ class SocketBinding:
     async def stop(self):
         self.stopped = True
         return await self.host.stop(session_id=self.session.id, resource_id=self.session.resource_id, actor=self.session.actor)
+
+    async def input_pcm(self, projection):
+        self.heartbeat()
+        if self.stopped:
+            raise LiveError("LIVE_SOCKET_CLOSED", "Live socket is stopped")
+        return await self.host.input_pcm(session_id=self.session.id, resource_id=self.session.resource_id,
+                                         actor=self.session.actor, projection=projection, _socket_claim=self.claim)
+
+    async def activate_audio_source(self, source):
+        self.heartbeat()
+        hook = getattr(self.host.adapter, "activate_audio_source", None)
+        if hook:
+            await _maybe_await(hook(self.session, source))
 
     async def close(self):
         if self.state.claim != self.claim:

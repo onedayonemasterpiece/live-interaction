@@ -1,4 +1,4 @@
-"""Framework-neutral wl-live-v1 relay. ASGI/aiohttp supply three I/O callbacks.
+"""Framework-neutral wl-live-v1/v2 relay. ASGI/aiohttp supply three I/O callbacks.
 
 No framework, credential resolver, product function or Google client is imported
 here. Input is ordered; output is pushed with a byte-bounded queue. ACK means
@@ -32,6 +32,10 @@ TRANSIENT_SOCKET_CODES = frozenset({
     "LIVE_SOCKET_SEND_TIMEOUT",
     "LIVE_SOCKET_EGRESS_BACKPRESSURE",
     "LIVE_SOCKET_STALE_AUDIO",
+    "LIVE_AUDIO_BACKPRESSURE",
+    "LIVE_AUDIO_STALE",
+    "LIVE_AUDIO_OUTPUT_ACK_TIMEOUT",
+    "LIVE_AUDIO_OUTPUT_HISTORY",
 })
 
 
@@ -42,9 +46,19 @@ class SocketIOError(LiveError):
 def socket_ticket(protocols):
     values = list(protocols or [])
     tickets = [value[10:] for value in values if isinstance(value, str) and value.startswith("wl-ticket.")]
-    if SOCKET_PROTOCOL not in values or len(tickets) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", tickets[0]):
+    if not any(value in values for value in (SOCKET_PROTOCOL, "wl-live-v2")) or len(tickets) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", tickets[0]):
         raise LiveError("LIVE_SOCKET_TICKET", "A versioned socket protocol and ticket are required")
     return tickets[0]
+
+
+def socket_protocol(protocols, *, allow_v2=False):
+    """Select the accepted subprotocol without changing Origin/cookie/ticket auth."""
+    values = list(protocols or [])
+    if allow_v2 and "wl-live-v2" in values:
+        return "wl-live-v2"
+    if SOCKET_PROTOCOL in values:
+        return SOCKET_PROTOCOL
+    raise LiveError("LIVE_SOCKET_PROTOCOL", "No supported Live socket protocol was offered")
 
 
 def same_origin(origin, host):
@@ -84,7 +98,7 @@ def encode_output(event):
 
 
 async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
-                       send_timeout=5.0, max_output_bytes=MAX_OUTPUT_BYTES):
+                       send_timeout=5.0, max_output_bytes=MAX_OUTPUT_BYTES, protocol=None):
     """Run one already-authorized, accepted socket.
 
     receive() -> str | bytes | None (disconnect), send(str | bytes),
@@ -117,17 +131,33 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
     last_sent = 0
     failed = asyncio.get_running_loop().create_future()
     tasks = []
+    urgent_tasks = set()
     unsubscribe = lambda: None
     close_code, close_reason = 1000, "closed"
     fatal = False
+    audio_v2 = None
 
     def enqueue(event):
         nonlocal queued_bytes
         if failed.done():
             return
         try:
-            payload = encode_output(event)
-            size = len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
+            if audio_v2 is not None and event.get("type") == "interrupted":
+                async def interrupt(response_id=binding.session.response_seq):
+                    try:
+                        await audio_v2.interrupt_output(response_id)
+                    except Exception as error:
+                        if not failed.done():
+                            failed.set_result(error)
+                task = asyncio.create_task(interrupt())
+                urgent_tasks.add(task)
+                task.add_done_callback(urgent_tasks.discard)
+            if audio_v2 is not None:
+                payload = None
+                size = len(event.get("data") or "") if event.get("type") == "audio" else len(json.dumps(event).encode("utf-8"))
+            else:
+                payload = encode_output(event)
+                size = len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
             if queued_bytes + size > max_output_bytes or queue.full():
                 raise LiveError("LIVE_SOCKET_EGRESS_BACKPRESSURE", "Live output queue exceeded its bound")
             queue.put_nowait((event, payload, size))
@@ -141,9 +171,13 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             event, payload, size = await queue.get()
             try:
                 seq = int(event.get("seq") or 0)
-                if seq > last_sent:
-                    await send(payload)
-                    last_sent = seq
+                if seq > last_sent or (audio_v2 is not None and event.get("type") == "audio"):
+                    if audio_v2 is not None:
+                        async for output in audio_v2.output(event):
+                            await send(output)
+                    else:
+                        await send(payload)
+                    last_sent = max(last_sent, seq)
                 if event.get("type") == "closed":
                     return
             finally:
@@ -156,6 +190,9 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             if frame is None:
                 return
             if isinstance(frame, bytes):
+                if audio_v2 is not None:
+                    audio_v2.audio(frame)
+                    continue
                 seq, age, startup_catchup, pcm = decode_audio(frame)
                 await binding.input({"audio_base64": base64.b64encode(pcm).decode("ascii")},
                                     frame_seq=seq, capture_age_ms=age, pcm_bytes=len(pcm),
@@ -177,6 +214,8 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             elif message.get("type") == "stop":
                 await binding.stop()
                 return
+            elif audio_v2 is not None:
+                audio_v2.control(message)
             elif message.get("type") == "input" and isinstance(message.get("message"), dict):
                 body = message["message"]
                 if "audio_base64" in body:
@@ -197,8 +236,19 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             hello = json.loads(first)
         except (ValueError, TypeError):
             raise LiveError("LIVE_SOCKET_HELLO", "Live hello is invalid") from None
-        if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("protocol") != SOCKET_PROTOCOL:
+        if (not isinstance(hello, dict) or hello.get("type") != "hello" or
+                hello.get("protocol") not in (SOCKET_PROTOCOL, "wl-live-v2") or
+                (protocol is not None and hello.get("protocol") != protocol)):
             raise LiveError("LIVE_SOCKET_HELLO", "Live hello protocol does not match")
+        negotiated_protocol = hello["protocol"]
+        v2_metadata = {}
+        if negotiated_protocol == "wl-live-v2":
+            services = getattr(binding.host, "audio_v2", None)
+            if services is None:
+                raise LiveError("LIVE_AUDIO_CODECS_UNAVAILABLE", "Compressed v2 audio is not configured")
+            from .audio_socket import SocketAudioV2
+            audio_v2 = SocketAudioV2(binding, services, send, failed)
+            v2_metadata = audio_v2.negotiate(hello)
         if hello.get("attempt_id") != binding.attempt_id:
             raise LiveError("LIVE_SOCKET_ATTEMPT", "Live attempt does not match")
         cursor = hello.get("cursor", 0)
@@ -230,7 +280,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         for event in reversed(backlog):
             if event.get("type") != "audio":
                 continue
-            if open_response is None or event.get("response_id") != open_response:
+            if event.get("response_id") != open_response or open_response is None:
                 continue
             size = len(event.get("data") or "") * 3 // 4 + 12
             if size > audio_budget:
@@ -243,8 +293,8 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 skipped_audio += 1
                 continue
             enqueue(event)
-        await send(json.dumps({"type": "hello_ack", "protocol": SOCKET_PROTOCOL,
-                               "connection_generation": generation, "event_gap": event_gap}))
+        await send(json.dumps({"type": "hello_ack", "protocol": negotiated_protocol,
+                               "connection_generation": generation, "event_gap": event_gap, **v2_metadata}))
         if event_gap:
             binding.host.diagnostic(binding.session, "socket_event_gap",
                                     connection_generation=binding.state.generation)
@@ -255,6 +305,8 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             await send(json.dumps({"type": "transport_notice", "code": "LIVE_SOCKET_STALE_OUTPUT_SKIPPED",
                                    "skipped_audio_events": skipped_audio}))
         tasks = [asyncio.create_task(read_loop()), asyncio.create_task(write_loop())]
+        if audio_v2 is not None:
+            tasks.extend(audio_v2.start())
         done, _ = await asyncio.wait([*tasks, failed], return_when=asyncio.FIRST_COMPLETED)
         if failed in done:
             raise failed.result()
@@ -275,8 +327,14 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         unsubscribe()
         for task in tasks:
             task.cancel()
+        for task in urgent_tasks:
+            task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if urgent_tasks:
+            await asyncio.gather(*urgent_tasks, return_exceptions=True)
+        if audio_v2 is not None:
+            await audio_v2.close()
         if fatal:
             await binding.stop()
         await binding.close()

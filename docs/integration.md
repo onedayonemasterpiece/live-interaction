@@ -50,12 +50,40 @@ characters, paginates a 320-event ring, serializes tools, deduplicates successfu
 provider call IDs, honors cancellation before execution, and never replays a mutation.
 Applications still authenticate every HTTP route before calling the host.
 
+The Python host can report a long-running tool through the same Live model when
+its server-owned `configuration.functions` declaration explicitly sets
+`behavior: "NON_BLOCKING"`. After `tool_progress_delay_ms` (default 2500, bounded
+to 1–60000), one timer for the currently executing call sends the same call ID a
+FunctionResponse with `response: {status: "pending", elapsed_ms}`, outer
+`willContinue: true` and `scheduling: "WHEN_IDLE"`. The corresponding client
+event is `tool_progress` with `name`, `id`, `status` and `elapsed_ms`; it contains
+no invented work stages or success receipt. Fast calls and cached duplicate
+calls send only the real result. Default blocking declarations are unchanged.
+The real completion uses `willContinue: false`; after new accepted text/speech
+it uses `scheduling: "SILENT"` to close the call without requesting an obsolete
+announcement. Stop, provider cancellation and closed sessions suppress subsequent
+responses. An accepted mutation still finishes through the adapter and its real
+receipt remains in the bounded deduplication cache. The timer is cancelled on
+those boundaries and in the execution's `finally`; pending is never a cached
+tool result. Already enqueued/sent provider messages cannot be withdrawn.
+Actual audible timing and interruption under resource waits require real provider
+acceptance; this host contract does not guarantee an automatic spoken filler.
+See Google's [FunctionResponse fields](https://ai.google.dev/api/generate-content#FunctionResponse)
+and [Live model behavior](https://ai.google.dev/gemini-api/docs/live-api/thinking).
+
 Python `stop(..., reason="explicit_stop")` accepts the optional trusted-internal
 reason `"detached_reclaim"` when retiring an abandoned provider before resuming its
 conversation. The existing `on_stopped(session)` hook observes `session.stop_reason`;
 an explicit Stop takes precedence over concurrent reclaim. HTTP/WSS adapters must
 keep the default for user Stop and must not accept this reason from client input.
 `stop_all()` remains shutdown cleanup and does not call `on_stopped`.
+For a Python WSS host, application shutdown must `await host.close()` before
+closing product audio storage. This terminal, idempotent operation flushes/stops
+sessions and retires the shared codec executor; subsequent `start` calls fail
+with `LIVE_HOST_CLOSED`. Ordinary `stop`/`stop_all` leave the host reusable.
+Terminal shutdown has a 15-second total wait bound, with at most 5 seconds for
+remaining native work. An expired bound is an explicit shutdown error, not a
+claim that a running native call was killed or that its tail was saved.
 
 `configuration.manual_activity_detection=true` creates a session with provider automatic
 activity detection disabled. In that mode the host accepts `activity_start`, one or more
@@ -107,10 +135,40 @@ monotonic connection generation. Audio frames are binary PCM16/16 kHz with a bou
 header carrying frame sequence and capture age. The browser audio send completes only
 after the server's relay `audio_ack`; the ordered sender uses it for transport pacing.
 This ACK is not a durable-source receipt. Negotiated native/mobile v2 compression and
-durable ACK semantics are specified in [the voice continuity draft](voice-continuity-contract.md).
+durable ACK semantics are specified in [the voice continuity candidate](voice-continuity-contract.md).
 Provider events are pushed immediately; v1 output PCM is binary. A new
 WSS consumer must not start the legacy events poller or automatically fall back to
 HTTP input if WSS setup/reconnect fails.
+
+### Native compressed v2 candidate (unreleased)
+
+The continuation's `LiveSocketSessionHost` accepts optional
+`audio_v2=AudioV2Services(store_factory=..., codecs=PyAVAudioCodecFactory(),
+output_store_factory=...)`. Install the candidate's pinned `[audio]` extra for native
+Opus/Ogg and AAC-LC/ADTS capability checks. Python 3.11 remains supported. v2 requires
+compressed profiles in both directions and a durable output archive; missing capability
+fails explicitly. Selecting legacy `wl-live-v1` remains a separate compatibility choice.
+No release tag or consumer version pin changes merely because fixture tests pass.
+
+Input store hooks are typed `open_source`, `register_epoch`, `commit_chunk` and
+`seal_source`; the product's `activate_audio_source` / `input_audio` hooks receive
+authenticated bindings and `DurablePCMProjection`, with a post-await Stop/generation
+fence before provider write. JSON cannot claim that audio is already durable. The host
+does not call the legacy PCM persistence hook a second time. Recovery commits old originals
+under a separate budget without automatically forwarding their speech to fresh Live.
+
+Output persistence implements `EncodedOutputStore` (`commit_output`, bounded `read_output`,
+`resume_source`, `epoch`, `mark_played`, `output_status`, `pending_outputs`, `cancel_output`
+and the source/epoch/seal hooks). The existing host's output worker keeps one codec state
+through socket detachment and commits originals before transport. Android uses
+`VoiceAudioV2`, `LiveSocketTransportV2`, `DurableSourceStore` and `DurableOutputStore`;
+the product supplies authenticated SessionApi and storage, while shared native platform
+code owns microphone, codec and playback. `Cookie`/authorization headers may be passed
+through the v2 transport's same-origin connect overload; credentials remain out of URLs.
+
+Wire layout, immutable identity, cumulative ACK stages, source-relative sample clocks,
+played-position recovery, finite windows and the remaining physical/provider acceptance
+gates are defined in the linked continuity contract and shared Python/Java vectors.
 
 Release 0.3.8 adds optional `captureTap(pcm,rms)` on the browser client. The tap runs synchronously on each accepted microphone frame after `suppressCaptureDuringPlayback` has rejected frames while model audio is playing and before the ordered provider sender receives the frame. It is intended for bounded local-only control processing that reuses the already-owned PCM16/16 kHz capture. The callback must not perform network I/O, acquire another microphone, block, mutate provider state or throw through the Live client; callback failures are isolated and reported only as bounded `capture_tap_error` timing telemetry. The native WSS binding remains the separately documented `0.3.7-rc.1` candidate. Release 0.3.6 serializes capability-level `media_resolution` as the scalar Gemini Live `generationConfig.mediaResolution` enum. Release 0.3.5 introduced the consumer setting, but object-wrapping the scalar is rejected by the Live setup schema. Consumers can therefore use low-resolution vision for routine verification and high resolution for dedicated image inspection without changing transport semantics.
 
