@@ -50,6 +50,13 @@ characters, paginates a 320-event ring, serializes tools, deduplicates successfu
 provider call IDs, honors cancellation before execution, and never replays a mutation.
 Applications still authenticate every HTTP route before calling the host.
 
+Python `stop(..., reason="explicit_stop")` accepts the optional trusted-internal
+reason `"detached_reclaim"` when retiring an abandoned provider before resuming its
+conversation. The existing `on_stopped(session)` hook observes `session.stop_reason`;
+an explicit Stop takes precedence over concurrent reclaim. HTTP/WSS adapters must
+keep the default for user Stop and must not accept this reason from client input.
+`stop_all()` remains shutdown cleanup and does not call `on_stopped`.
+
 `configuration.manual_activity_detection=true` creates a session with provider automatic
 activity detection disabled. In that mode the host accepts `activity_start`, one or more
 `audio_base64` chunks, then `activity_end`; `audio_stream_end` is rejected. This is for

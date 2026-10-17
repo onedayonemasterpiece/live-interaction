@@ -856,6 +856,80 @@ class ProviderLongSessionContract(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,1)
 
 
+    async def test_failed_last_audio_send_reports_its_turn_without_waiting_for_more_input(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        class FailingAudio(_FakeSocket):
+            async def send(self, payload):
+                if 'audio' in json.loads(payload).get('realtimeInput', {}):
+                    raise ConnectionError('last frame write failed')
+                await super().send(payload)
+        def connect(*args, **kwargs):
+            socket = FailingAudio([{'setupComplete':{}}]) if not sockets else _FakeSocket([{'setupComplete':{}}])
+            sockets.append(socket)
+            return socket
+        budget=ReconnectBudget(base_delay=.001,max_delay=.002)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                reader.feed({'type':'audio','data':'AAAA','queued_at':10**13,'audio_turn_generation':7})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+                drop=next(e for e in events if e.get('type')=='input_dropped')
+                self.assertEqual(drop['audio_turn_generation'],7)
+                self.assertEqual(drop['input_type'],'audio')
+                await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+                self.assertFalse(any('audio' in m.get('realtimeInput',{}) for m in sockets[1].sent))
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_provider_boundary_receipt_identifies_its_host_turn(self):
+        reader=self.start_reader(); events=[]
+        with patch('websockets.connect',return_value=_FakeSocket([{'setupComplete':{}}])):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                reader.feed({'type':'activity_end','queued_at':10**13,'audio_turn_generation':9})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_timing' for e in ev))
+                receipt=next(e for e in events if e.get('type')=='input_timing')
+                self.assertEqual(receipt['audio_turn_generation'],9)
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_old_queued_pcm_seen_after_resume_is_dropped_with_its_turn(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*args, **kwargs):
+            socket = _FakeSocket([{'setupComplete':{}}])
+            sockets.append(socket)
+            return socket
+        budget=ReconnectBudget(base_delay=.001,max_delay=.002)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                sockets[0].incoming.put_nowait(_FakeSocket._CLOSED)
+                await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+                # The old frame is only consumed after a replacement ws is ready.
+                reader.feed({'type':'audio','data':'AAAA','queued_at':1,'audio_turn_generation':12})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+                drop=next(e for e in events if e.get('type')=='input_dropped')
+                self.assertEqual(drop['reason'],'provider_reconnect')
+                self.assertEqual(drop['audio_turn_generation'],12)
+                self.assertFalse(any('audio' in m.get('realtimeInput',{}) for m in sockets[1].sent))
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+
 class ProviderCheckpointContract(unittest.IsolatedAsyncioTestCase):
     async def test_persisted_handle_resumes_without_history_and_reports_checkpoints(self):
         reader=_QueueReader()

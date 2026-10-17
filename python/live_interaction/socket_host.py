@@ -18,7 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .session_host import LiveError, LiveSessionHost, _maybe_await
+from .session_host import LiveError, LiveSessionHost, LiveStopReason, _maybe_await
 
 SOCKET_PROTOCOL = "wl-live-v1"
 TICKET_TTL_SECONDS = 15
@@ -37,6 +37,7 @@ class _SocketState:
     generation: int = 0
     used_wss: bool = False
     damaged: bool = False
+    damaged_through_turn: int = 0
     turn_serial: int = 0
     turn_clean: bool = True
     turn_has_audio: bool = False
@@ -107,16 +108,33 @@ class LiveSocketSessionHost(LiveSessionHost):
         if state is None:
             return
         if event.get("type") == "input_timing" and (event.get("activity_end_sent_at") or event.get("audio_stream_end_sent_at")):
-            if state.boundaries:
-                _serial, clean = state.boundaries.popleft()
-                if clean and state.damaged:
+            generation = event.get("audio_turn_generation")
+            boundary = None
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                while state.boundaries and state.boundaries[0][0] <= generation:
+                    candidate = state.boundaries.popleft()
+                    if candidate[0] == generation:
+                        boundary = candidate
+            elif state.boundaries:
+                boundary = state.boundaries.popleft()
+            if boundary:
+                serial, clean = boundary
+                if clean and state.damaged and serial > state.damaged_through_turn:
                     state.damaged = False
                     self.diagnostic(session, "input_damage_recovered", connection_generation=state.generation)
-        if (event.get("type") == "input_dropped" and event.get("reason") == "provider_reconnect"
-                and (session.audio_turn_open or session.activity_open)):
-            # Relay-admitted speech never reached the provider: fence this turn.
+        if (event.get("type") == "input_dropped"
+                and event.get("input_type") in ("audio", "activity_start", "activity_end", "audio_stream_end")):
+            # Input admission and provider delivery are asynchronous: the host
+            # may already have enqueued the end (or the next turn) when loss is
+            # reported. Fence the affected turn and its pending boundary receipt.
+            generation = event.get("audio_turn_generation")
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+                generation = state.turn_serial
             state.damaged = True
-            state.turn_clean = False
+            state.damaged_through_turn = max(state.damaged_through_turn, generation)
+            if generation == state.turn_serial:
+                state.turn_clean = False
+            state.boundaries = deque((serial, clean and serial != generation) for serial, clean in state.boundaries)
             self.diagnostic(session, "provider_input_dropped", connection_generation=state.generation,
                             audio_turn_open=True)
         item = session.events[-1]
@@ -202,10 +220,11 @@ class LiveSocketSessionHost(LiveSessionHost):
                 state.boundaries.pop()
             raise
 
-    async def stop(self, *, session_id, resource_id, actor=None):
+    async def stop(self, *, session_id, resource_id, actor=None,
+                   reason: LiveStopReason = "explicit_stop"):
         if session_id not in self.sessions:
             return {"ok": True, "session_id": session_id, "already_closed": True}
-        return await super().stop(session_id=session_id, resource_id=resource_id, actor=actor)
+        return await super().stop(session_id=session_id, resource_id=resource_id, actor=actor, reason=reason)
 
     async def _discard(self, session, graceful=False):
         try:
@@ -299,6 +318,7 @@ class SocketBinding:
             self.host.diagnostic(self.session, "socket_gap", connection_generation=self.state.generation, audio_turn_open=opened)
             if opened:
                 self.state.damaged = True
+                self.state.damaged_through_turn = max(self.state.damaged_through_turn, self.state.turn_serial)
                 self.state.turn_clean = False
                 key = "activity_end" if self.session.manual_activity_detection else "audio_stream_end"
                 try:

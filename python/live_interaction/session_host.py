@@ -16,11 +16,12 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from . import provider
 
 LIVE_SESSION_MODELS = ("gemini-3.8-live", "gemini-3.8-live-extended-thinking")
+LiveStopReason = Literal["explicit_stop", "detached_reclaim"]
 
 
 class LiveError(RuntimeError):
@@ -75,6 +76,7 @@ class _Session:
     events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=320))
     next_seq: int = 1
     closed: bool = False
+    stop_reason: LiveStopReason | None = None
     cancelled: set[str] = field(default_factory=set)
     tool_results: dict[str, Any] = field(default_factory=dict)
     tool_order: deque[str] = field(default_factory=deque)
@@ -374,7 +376,15 @@ class LiveSessionHost:
             if kind == "tool_cancelled":
                 session.cancelled.update(str(v) for v in (event.get("ids") or []))
             if kind == "input_timing" and (event.get("audio_stream_end_sent_at") or event.get("activity_end_sent_at")):
-                if session.audio_end_awaiting_ack:
+                generation = event.get("audio_turn_generation")
+                if isinstance(generation, int) and not isinstance(generation, bool):
+                    # A boundary dropped on an old connection has no ACK. Match
+                    # the provider receipt to its turn rather than shifting FIFO.
+                    if generation in session.audio_end_awaiting_ack:
+                        while session.audio_end_awaiting_ack and session.audio_end_awaiting_ack[0] <= generation:
+                            session.audio_end_awaiting_ack.popleft()
+                        session.audio_end_sent_generation = max(session.audio_end_sent_generation, generation)
+                elif session.audio_end_awaiting_ack:
                     session.audio_end_sent_generation = max(
                         session.audio_end_sent_generation, session.audio_end_awaiting_ack.popleft()
                     )
@@ -771,9 +781,10 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
             if session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "Activity is already open")
-            written_at = self._write(session, {"type": "activity_start"})
+            generation = session.audio_turn_generation + 1
+            written_at = self._write(session, {"type": "activity_start", "audio_turn_generation": generation})
             session.activity_open = True
-            session.audio_turn_generation += 1
+            session.audio_turn_generation = generation
             session.audio_turn_open = True
         if "audio_base64" in message:
             audio = message.get("audio_base64")
@@ -781,14 +792,15 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Audio chunk is invalid")
             if session.manual_activity_detection and not session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "activity_start is required before buffered audio")
-            written_at = self._write(session, {"type": "audio", "data": audio})
+            generation = session.audio_turn_generation + int(not session.audio_turn_open)
+            written_at = self._write(session, {"type": "audio", "data": audio, "audio_turn_generation": generation})
             if not session.manual_activity_detection and not session.audio_turn_open:
-                session.audio_turn_generation += 1
+                session.audio_turn_generation = generation
                 session.audio_turn_open = True
         if message.get("audio_stream_end"):
             if session.manual_activity_detection:
                 raise LiveError("INVALID_ARGUMENT", "Use activity_end when manual activity is enabled")
-            self._write(session, {"type": "audio_stream_end"})
+            self._write(session, {"type": "audio_stream_end", "audio_turn_generation": session.audio_turn_generation})
             if session.audio_turn_open:
                 session.audio_end_awaiting_ack.append(session.audio_turn_generation)
                 session.audio_turn_open = False
@@ -797,7 +809,7 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
             if not session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "No activity is open")
-            self._write(session, {"type": "activity_end"})
+            self._write(session, {"type": "activity_end", "audio_turn_generation": session.audio_turn_generation})
             session.activity_open = False
             if session.audio_turn_open:
                 session.audio_end_awaiting_ack.append(session.audio_turn_generation)
@@ -837,14 +849,24 @@ class LiveSessionHost:
             "closed": session.closed and not has_more,
         }
 
-    async def stop(self, *, session_id: str, resource_id: str, actor: Any = None) -> dict[str, Any]:
+    async def stop(
+        self, *, session_id: str, resource_id: str, actor: Any = None,
+        reason: LiveStopReason = "explicit_stop",
+    ) -> dict[str, Any]:
+        if reason not in ("explicit_stop", "detached_reclaim"):
+            raise LiveError("INVALID_ARGUMENT", "Unknown Live stop reason")
         session = self._get(session_id, resource_id, actor)
+        # An explicit Stop is absorbing: a concurrent internal reclaim cannot
+        # later turn it back into a resumable termination.
+        if session.stop_reason is None or reason == "explicit_stop":
+            session.stop_reason = reason
         if not session.closed:
             try:
                 self._write(session, {"type": "stop"})
             except LiveError:
                 pass
-        if hasattr(self.adapter, "on_stopped"):            await _maybe_await(self.adapter.on_stopped(session))
+        if hasattr(self.adapter, "on_stopped"):
+            await _maybe_await(self.adapter.on_stopped(session))
         await self._discard(session, graceful=True)
         return {"ok": True, "session_id": session.id}
 

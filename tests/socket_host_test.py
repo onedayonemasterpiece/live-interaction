@@ -321,6 +321,64 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         await settle(lambda: self.host._socket_states[self.sid].damaged)
         self.assertTrue(any(r["event"] == "provider_input_dropped" for r in self.records))
 
+    async def admit_turn(self):
+        for message in ({"activity_start": True}, {"audio_base64": "AAAA"}, {"activity_end": True}):
+            await self.host.input(session_id=self.sid, resource_id="story1", actor=self.actor, message=message)
+        return self.session.audio_turn_generation
+
+    async def test_late_provider_loss_fences_already_enqueued_boundary_and_tool(self):
+        generation = await self.admit_turn()
+        self.assertFalse(self.session.activity_open)
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": generation})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 1, "audio_turn_generation": generation})
+        self.provider.events({"type": "tool_call", "calls": [{"name": "story.write", "id": "lost", "args": {}}]})
+        await settle(lambda: any(e.get("type") == "tool_result" for e in self.session.events))
+        self.assertEqual(self.adapter.called, [])
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+        later = await self.admit_turn()
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": later})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+
+    async def test_missing_end_ack_does_not_shift_later_clean_turn_receipt(self):
+        lost = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "activity_end",
+                              "audio_turn_generation": lost})
+        later = await self.admit_turn()
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": later})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+        self.assertEqual(self.session.audio_end_sent_generation, later)
+        self.assertEqual(list(self.session.audio_end_awaiting_ack), [])
+
+    async def test_old_clean_ack_cannot_clear_later_damaged_turn(self):
+        first = await self.admit_turn()
+        second = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": second})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 1, "audio_turn_generation": first})
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+
+    async def test_late_loss_does_not_damage_a_subsequent_clean_turn(self):
+        first = await self.admit_turn()
+        second = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": first})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": second})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+
+    async def test_stale_audio_loss_is_fenced_for_transition_and_budget_wait_too(self):
+        for reason in ("capability_transition", "resource_budget"):
+            generation = await self.admit_turn()
+            self.provider.events({"type": "input_dropped", "reason": reason, "input_type": "audio",
+                                  "audio_turn_generation": generation})
+            self.provider.events({"type": "input_timing", "activity_end_sent_at": 1,
+                                  "audio_turn_generation": generation})
+            self.assertTrue(self.host._socket_states[self.sid].damaged, reason)
+            clean = await self.admit_turn()
+            self.provider.events({"type": "input_timing", "activity_end_sent_at": 2,
+                                  "audio_turn_generation": clean})
+            self.assertFalse(self.host._socket_states[self.sid].damaged, reason)
+
     async def reattach(self, generation, cursor=0):
         sent = []
         async def send(frame):

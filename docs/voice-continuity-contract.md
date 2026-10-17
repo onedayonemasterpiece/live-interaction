@@ -1,6 +1,6 @@
 # Voice continuity contract (draft for wl-live-v2)
 
-Status: **draft, 16 October 2026**. Working contract for the native Android + PWA voice
+Status: **draft, 16 October 2026; clarified 17 October 2026**. Working contract for the native Android + PWA voice
 delivery (projects-hub task `docs/prompts/projects-hub-native-voice-pwa-delivery-20261016.md`).
 Numbers marked *hypothesis* are starting values for the network bench, not accepted limits.
 `wl-live-v1` remains supported; v2 is negotiated, never assumed.
@@ -9,7 +9,7 @@ Numbers marked *hypothesis* are starting values for the network bench, not accep
 
 | Entity | Owner | Lifetime |
 |---|---|---|
-| Logical conversation | product backend | until explicit Stop / product end; survives socket loss, provider renewal, backend restart |
+| Logical conversation | product backend | durable product timeline; survives socket loss, provider renewal, backend restart and capture Stop. Stop ends the current Live/capture session, not its journal or saved sources |
 | Device capture | Android native service / browser binding | user Start → Stop; independent of socket and WebView |
 | Socket binding | shared framework | one WSS connection generation; disposable |
 | Provider session | shared framework (Python host) | many provider connections; checkpoint handle and journal survive connections |
@@ -32,7 +32,7 @@ captured (volatile) → device-durable → relay-admitted → server-durable →
 | device-durable | device store | encoded chunk with stable `source_id/chunk_seq`, original capture time, hash | survives app restart / process death |
 | relay-admitted | server socket | frame passed protocol checks | transport-only; not durable |
 | server-durable | server store | compressed chunk appended and fsynced | survives backend restart |
-| provider-forwarded | provider transport | decoded PCM sent on the current provider connection | lost if the provider connection drops before forwarding; reported as `input_dropped` |
+| provider-forwarded | provider transport | decoded PCM sent on the current provider connection | provider receipt/processing can still be unknown after a send; locally dropped input is reported as `input_dropped`, and source durability is tracked separately |
 | turn-complete | provider | provider ended the turn | — |
 | semantic-outcome | product | tool receipt/readback or explicit no-action | — |
 
@@ -55,8 +55,9 @@ dormant ──speech or reattach──▶ renewing ──▶ attached
 
 - `detached`: provider session continues; output that becomes stale is not replayed as audio.
 - `dormant` (*hypothesis* after 60 s detached or N minutes idle): saves provider budget; resume
-  by checkpoint handle while valid (provider documents 2 h), otherwise journal restore with an
-  explicit `context_restored: degraded` event.
+  by checkpoint handle while valid ([provider session-management documentation](https://ai.google.dev/gemini-api/docs/live-api/session-management)
+  gives a two-hour resumption window after the last session termination), otherwise journal
+  restore with an explicit `context_restored: degraded` event.
 - Provider renewal: rolling-window budget with jittered backoff, not a lifetime count.
 - Backend restart: logical conversation and handle are persisted; the client reattaches; this is
   not a new conversation for the user.
@@ -65,7 +66,7 @@ dormant ──speech or reattach──▶ renewing ──▶ attached
 
 | Gap | Client behaviour | Server behaviour |
 |---|---|---|
-| short (*hypothesis* ≤ 5 s) | keep capturing; resend device-durable chunks after reattach in the same turn | dedupe by `chunk_seq`; turn stays clean if no chunk is missing |
+| short (*hypothesis* ≤ 5 s) | keep capturing; deliver identified device-durable chunks after reattach under a recovery source/epoch | dedupe by `chunk_seq`; preserve the gap's mutation fence until a later clean provider boundary |
 | medium (*hypothesis* ≤ 2 min) | audible + visible "saving, will deliver": counter of undelivered seconds | logical session detached, provider kept or dormant |
 | long | recording continues as a source; Live returns after delivery and processing | deferred portions processed in order with original timestamps |
 
@@ -75,10 +76,19 @@ Rules:
 - Deferred speech carries its original capture time to the model. The model (not a phrase list)
   judges freshness and cancellation; externally visible or irreversible actions from deferred
   speech require current confirmation. Deterministic code enforces state, idempotency and fences.
-- A turn is **damaged** only when audio is actually missing (device loss before durability,
-  `input_dropped`, missing chunk); a damaged turn cannot execute mutations.
-- Live speech after recovery is queued behind deferred portions unless the user explicitly
-  skips them ("save as note").
+- A transport gap during an open speech turn fences that turn's mutations. Missing audio,
+  `input_dropped` and missing chunks also damage their correlated turn, including a loss reported
+  after its end was enqueued. Only a later clean turn actually reaching the provider boundary
+  can lift this fence; source completeness does not retroactively authorize the old command.
+- Complete recovered chunks retain their source identity, original timestamps and recovery
+  epoch. Their integrity and the authority to execute a deferred instruction are independent.
+- Local Stop bypasses every delivery/analysis queue and stops hardware immediately; saved source
+  bytes remain available. Fresh speech is captured on its own timeline and is not trapped behind
+  the whole deferred backlog. At a bounded processing boundary it takes priority over further
+  deferred semantic processing, with pending-source context visible to the same central Mira.
+- New speech detection may reversibly pause replay/playback. Mira decides the meaning of an
+  interruption, cancellation or skip; no phrase list or second conversational agent does so.
+  Resuming or disposing of a saved source is explicit and does not replay accepted mutations.
 
 ## 5. Wire v2 additions (negotiated)
 
@@ -119,3 +129,4 @@ reconnect, store-and-forward mechanics and interruption mechanics stay in this f
 
 Tracked in the projects-hub delivery PR; numeric values above are not accepted until the
 network bench and handset runs measure them.
+
