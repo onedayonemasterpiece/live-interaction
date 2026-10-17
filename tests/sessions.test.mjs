@@ -5,6 +5,22 @@ import {PassThrough} from 'node:stream';
 import {createLiveSessionHost,withLiveToolParts} from '../node/sessions.mjs';
 const tick=()=>new Promise(r=>setImmediate(r));
 function worker(){const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>c.emit('close',0);c.stdin.on('data',b=>{if(JSON.parse(b).type==='start')queueMicrotask(()=>c.stdout.write('{"type":"ready"}\n'));});return c;}
+test('private provider checkpoints never enter browser polling or WSS push',async()=>{
+ const c=worker(),pushed=[];
+ const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({
+  initialize:()=>({state:{},context:{},configuration:{functions:[]}}),executeTool:async()=>({})
+ })});
+ const actor={subject:'a',tenant_id:'t'},started=await host.start({resourceId:'checkpoint-secret',actor});
+ const base={resourceId:'checkpoint-secret',sessionId:started.session_id,actor};
+ const binding=host.openSocket({sessionId:started.session_id,ticket:started.socket_ticket});
+ binding.subscribe(event=>pushed.push(event));
+ c.stdout.write(JSON.stringify({type:'resumption_checkpoint',handle:'fixture-private-checkpoint'})+'\n');
+ await tick();
+ assert.equal(JSON.stringify(host.events(base)).includes('fixture-private-checkpoint'),false);
+ assert.equal(JSON.stringify(pushed).includes('fixture-private-checkpoint'),false);
+ assert.equal(pushed.some(event=>event.type==='resumption_checkpoint'),false);
+ await host.stop(base);
+});
 test('trusted event observer receives worker failures without browser polling',async()=>{
  const c=worker(),observed=[];
  const host=createLiveSessionHost({createWorker:()=>c,adapterFactory:()=>({

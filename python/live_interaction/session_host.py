@@ -7,6 +7,7 @@ authorization and mutations.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -16,11 +17,12 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from . import provider
 
 LIVE_SESSION_MODELS = ("gemini-3.8-live", "gemini-3.8-live-extended-thinking")
+LiveStopReason = Literal["explicit_stop", "detached_reclaim"]
 
 
 class LiveError(RuntimeError):
@@ -75,10 +77,15 @@ class _Session:
     events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=320))
     next_seq: int = 1
     closed: bool = False
+    stop_reason: LiveStopReason | None = None
     cancelled: set[str] = field(default_factory=set)
     tool_results: dict[str, Any] = field(default_factory=dict)
     tool_order: deque[str] = field(default_factory=deque)
     tool_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    non_blocking_tools: frozenset[str] = field(default_factory=frozenset)
+    tool_feedback_generation: int = 0
+    tool_progress_task: asyncio.Task | None = None
+    tool_progress_call_id: str | None = None
     task: asyncio.Task | None = None
     ready: asyncio.Future | None = None
     awaiting_audio: bool = False
@@ -96,6 +103,11 @@ class _Session:
     audio_end_sent_generation: int = 0
     audio_end_awaiting_ack: deque[int] = field(default_factory=deque)
     audio_end_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Output audio belongs to one model response. A reattach replays audio only
+    # of the still-open response; finished or interrupted answers never replay.
+    response_seq: int = 0
+    response_open: bool = False
+    response_audio_us: int = 0
 
 
 def _now_ms() -> int:
@@ -104,6 +116,15 @@ def _now_ms() -> int:
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+def _non_blocking_tools(configuration: dict[str, Any]) -> frozenset[str]:
+    functions = configuration.get("functions")
+    return frozenset(
+        item["name"] for item in (functions if isinstance(functions, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+        and item.get("behavior") == "NON_BLOCKING"
+    )
 
 
 def _configuration_meta(configuration: dict[str, Any] | None) -> dict[str, Any]:
@@ -164,6 +185,7 @@ class LiveSessionHost:
         reconfigure_timeout_ms: int = 30_000,
         max_sessions: int = 2,
         client_liveness_timeout_ms: int = 60_000,
+        tool_progress_delay_ms: int = 2_500,
     ):
         self.models = tuple(models)
         self.ready_timeout_ms = ready_timeout_ms
@@ -173,6 +195,7 @@ class LiveSessionHost:
         self.managed_runner = managed_runner
         self.key_resolver = key_resolver or (lambda _resource_id, _actor: provider.default_key())
         self.client_liveness_timeout_ms = max(1_000, int(client_liveness_timeout_ms))
+        self.tool_progress_delay_ms = max(1, min(60_000, int(tool_progress_delay_ms)))
         self.sessions: dict[str, _Session] = {}
         self._start_lock = asyncio.Lock()
         self._starting_sessions = 0
@@ -184,6 +207,21 @@ class LiveSessionHost:
         )
 
     def _emit(self, session: _Session, event: dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "audio":
+            if not session.response_open:
+                session.response_seq += 1
+                session.response_open = True
+                session.response_audio_us = 0
+            event = {**event, "response_id": session.response_seq, "audio_start_us": session.response_audio_us}
+            rate_match = re.search(r"rate=(\d+)", str(event.get("mime_type") or ""))
+            rate = int(rate_match[1]) if rate_match else 24000
+            encoded = event.get("data")
+            if isinstance(encoded, str) and 8000 <= rate <= 96000:
+                size = len(encoded.rstrip("=")) * 3 // 4
+                session.response_audio_us += round((size // 2) * 1_000_000 / rate)
+        elif kind in ("turn_complete", "interrupted"):
+            session.response_open = False
         item = {"seq": session.next_seq, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **event}
         session.next_seq += 1
         session.events.append(item)
@@ -268,6 +306,8 @@ class LiveSessionHost:
             )
             if not isinstance(initialized, dict):
                 raise LiveError("LIVE_ADAPTER_ERROR", "Live adapter initialize() returned invalid state")
+            if getattr(self, "_host_close_task", None) is not None:
+                raise LiveError("LIVE_HOST_CLOSED", "The Live host closed during session initialization")
         finally:
             async with self._start_lock:
                 self._starting_sessions -= 1
@@ -289,6 +329,7 @@ class LiveSessionHost:
             last_client_at_ms=_now_ms(),
             capability=str(initialized.get("capability") or initial_state.get("capability") or "core"),
             configuration_digest=initial_meta["configuration_digest"],
+            non_blocking_tools=_non_blocking_tools(configuration),
             manual_activity_detection=bool(configuration.get("manual_activity_detection")),
         )
         self.sessions[session_id] = session
@@ -308,6 +349,18 @@ class LiveSessionHost:
             # Transcript text is user-visible conversational source, not a
             # diagnostic preview. Keep it lossless end-to-end.
             projected = event
+            if kind == "resumption_checkpoint":
+                # Provider checkpoint handles are host secrets: never pushed to clients.
+                handle = event.get("handle")
+                saver = getattr(self.adapter, "on_checkpoint", None)
+                if isinstance(handle, str) and callable(saver):
+                    try:
+                        saved = saver(session, handle)
+                        if inspect.isawaitable(saved):
+                            asyncio.create_task(saved)
+                    except Exception:
+                        self._emit(session, {"type": "checkpoint_persist_failed"})
+                return
             if kind == "capability_ready":
                 self._emit(session, projected)
                 if (
@@ -349,8 +402,18 @@ class LiveSessionHost:
                 return
             if kind == "tool_cancelled":
                 session.cancelled.update(str(v) for v in (event.get("ids") or []))
+                if session.tool_progress_call_id in session.cancelled:
+                    self._cancel_tool_progress(session)
             if kind == "input_timing" and (event.get("audio_stream_end_sent_at") or event.get("activity_end_sent_at")):
-                if session.audio_end_awaiting_ack:
+                generation = event.get("audio_turn_generation")
+                if isinstance(generation, int) and not isinstance(generation, bool):
+                    # A boundary dropped on an old connection has no ACK. Match
+                    # the provider receipt to its turn rather than shifting FIFO.
+                    if generation in session.audio_end_awaiting_ack:
+                        while session.audio_end_awaiting_ack and session.audio_end_awaiting_ack[0] <= generation:
+                            session.audio_end_awaiting_ack.popleft()
+                        session.audio_end_sent_generation = max(session.audio_end_sent_generation, generation)
+                elif session.audio_end_awaiting_ack:
                     session.audio_end_sent_generation = max(
                         session.audio_end_sent_generation, session.audio_end_awaiting_ack.popleft()
                     )
@@ -370,7 +433,9 @@ class LiveSessionHost:
                         "calls": [{"name": c.get("name"), "id": c.get("id")} for c in calls],
                     },
                 )
-                asyncio.create_task(self._handle_tool_calls(session, calls))
+                asyncio.create_task(self._handle_tool_calls(
+                    session, calls, feedback_generation=session.tool_feedback_generation,
+                ))
                 return
             self._emit(session, projected)
 
@@ -395,6 +460,7 @@ class LiveSessionHost:
                     session.ready.set_exception(failure)
             finally:
                 session.closed = True
+                self._cancel_tool_progress(session)
                 reader.close()
                 if session.pending_transition and not session.pending_transition.done():
                     session.pending_transition.set_exception(
@@ -422,6 +488,8 @@ class LiveSessionHost:
                 "configuration": initialized.get("configuration") or {},
                 "context": initialized.get("context") or {},
                 "history": filtered_history,
+                **({"resume_handle": initialized["resume_handle"]}
+                   if isinstance(initialized.get("resume_handle"), str) else {}),
             },
         )
         try:
@@ -463,13 +531,72 @@ class LiveSessionHost:
             old = session.tool_order.popleft()
             session.tool_results.pop(old, None)
 
-    def _send_tool_responses(self, session: _Session, responses: list[dict[str, Any]]) -> None:
-        if responses and not session.closed:
-            session.tool_response_at = self._write(
+    def _send_tool_responses(self, session: _Session, responses: list[dict[str, Any]]) -> bool:
+        if responses and not session.closed and session.stop_reason is None:
+            written_at = self._write(
                 session, {"type": "tool_response", "responses": responses}
             )
-            session.awaiting_audio = True
+            if any(item.get("scheduling") != "SILENT" for item in responses):
+                session.tool_response_at = written_at
+                session.awaiting_audio = True
             self._emit(session, {"type": "timing", "stage": "tool_response_written"})
+            return True
+        return False
+
+    def _cancel_tool_progress(self, session: _Session) -> None:
+        task = session.tool_progress_task
+        if task and not task.done():
+            task.cancel()
+
+    def _advance_tool_feedback(self, session: _Session) -> None:
+        # Text and speech invalidate voice feedback independently of the audio
+        # transport generation used by damaged-turn and provider-end receipts.
+        session.tool_feedback_generation += 1
+        self._cancel_tool_progress(session)
+
+    async def _tool_progress_after_delay(
+        self, session: _Session, *, name: str, call_id: str,
+        feedback_generation: int, started: float,
+    ) -> None:
+        await asyncio.sleep(self.tool_progress_delay_ms / 1000)
+        if (session.closed or session.stop_reason is not None
+                or call_id in session.cancelled
+                or feedback_generation != session.tool_feedback_generation):
+            return
+        elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
+        try:
+            sent = self._send_tool_responses(session, [{
+                "name": name, "id": call_id,
+                "response": {"status": "pending", "elapsed_ms": elapsed_ms},
+                "willContinue": True, "scheduling": "WHEN_IDLE",
+            }])
+        except LiveError as exc:
+            # An optional announcement cannot cancel an already accepted write.
+            self._emit(session, {"type": "tool_progress_skipped", "id": call_id, "code": exc.code})
+            return
+        if sent:
+            self._emit(session, {
+                "type": "tool_progress", "name": name, "id": call_id,
+                "status": "pending", "elapsed_ms": elapsed_ms,
+            })
+
+    def _send_tool_completions(
+        self, session: _Session, responses: list[dict[str, Any]], feedback_generation: int,
+    ) -> None:
+        outgoing = []
+        for response in responses:
+            if response.get("id") in session.cancelled:
+                continue
+            if response.get("name") in session.non_blocking_tools:
+                response = {
+                    **response, "willContinue": False,
+                    # Finish the same generator after new input without asking
+                    # the model to announce a result for the superseded turn.
+                    "scheduling": ("WHEN_IDLE" if feedback_generation == session.tool_feedback_generation
+                                   else "SILENT"),
+                }
+            outgoing.append(response)
+        self._send_tool_responses(session, outgoing)
 
     async def _transition_capability(
         self, session: _Session, call: dict[str, Any], spec: Any
@@ -535,6 +662,7 @@ class LiveSessionHost:
             await asyncio.wait_for(asyncio.shield(future), timeout=self.reconfigure_timeout_ms / 1000)
             session.capability = resolved["capability"]
             session.configuration_digest = resolved["configuration_digest"]
+            session.non_blocking_tools = _non_blocking_tools(resolved["configuration"])
             session.manual_activity_detection = bool(
                 resolved["configuration"].get("manual_activity_detection")
             )
@@ -573,19 +701,23 @@ class LiveSessionHost:
                 session.pending_transition_id = None
                 session.pending_transition = None
 
-    async def _handle_tool_calls(self, session: _Session, calls: list[dict[str, Any]]) -> None:
+    async def _handle_tool_calls(
+        self, session: _Session, calls: list[dict[str, Any]], *, feedback_generation: int | None = None,
+    ) -> None:
+        if feedback_generation is None:
+            feedback_generation = session.tool_feedback_generation
         async with session.tool_lock:
             calls = calls if isinstance(calls, list) else []
-            if not calls or session.closed:
+            if not calls or session.closed or session.stop_reason is not None:
                 return
             if len(calls) == 1:
                 call_id = str(calls[0].get("id") or "")
                 if call_id and call_id in session.tool_results:
-                    self._send_tool_responses(session, [{
+                    self._send_tool_completions(session, [{
                         "name": str(calls[0].get("name") or "unknown"),
                         "id": call_id,
                         "response": {"result": session.tool_results[call_id]},
-                    }])
+                    }], feedback_generation)
                     return
             resolver = getattr(self.adapter, "resolve_capability", None)
             if callable(resolver):
@@ -675,18 +807,29 @@ class LiveSessionHost:
                     return
             responses: list[dict[str, Any]] = []
             for call in calls:
-                if session.closed:
+                if session.closed or session.stop_reason is not None:
                     return
                 call_id = str(call.get("id") or "")
                 name = str(call.get("name") or "unknown")
                 if call_id in session.cancelled:
                     continue
                 started = _now_ms()
+                progress_task = None
                 try:
                     if call_id and call_id in session.tool_results:
                         result = session.tool_results[call_id]
                     else:
+                        if (call_id and name in session.non_blocking_tools
+                                and feedback_generation == session.tool_feedback_generation):
+                            progress_task = asyncio.create_task(self._tool_progress_after_delay(
+                                session, name=name, call_id=call_id,
+                                feedback_generation=feedback_generation, started=time.monotonic(),
+                            ), name=f"live-tool-progress-{session.id}")
+                            session.tool_progress_task = progress_task
+                            session.tool_progress_call_id = call_id
                         result = await _maybe_await(self.adapter.execute_tool(session, call))
+                        # Cancellation of voice feedback cannot erase the real
+                        # mutation receipt or cause a duplicate to execute again.
                         self._remember_tool_result(session, call_id, result)
                     self._emit(
                         session,
@@ -722,7 +865,14 @@ class LiveSessionHost:
                             "response": {"error": {"code": code, "message": str(exc)[:500]}},
                         }
                     )
-            self._send_tool_responses(session, responses)
+                finally:
+                    if progress_task:
+                        progress_task.cancel()
+                        await asyncio.gather(progress_task, return_exceptions=True)
+                        if session.tool_progress_task is progress_task:
+                            session.tool_progress_task = None
+                            session.tool_progress_call_id = None
+            self._send_tool_completions(session, responses, feedback_generation)
 
     async def input(
         self,
@@ -732,11 +882,28 @@ class LiveSessionHost:
         message: dict[str, Any],
         actor: Any = None,
         received_at: int | None = None,
+        _audio_projection=None,
+        _delivery_guard=None,
     ) -> dict[str, Any]:
         session = self._get(session_id, resource_id, actor)
         self._touch(session)
-        if hasattr(self.adapter, "input"):
+        if _delivery_guard:
+            _delivery_guard()
+        if _audio_projection is not None:
+            # The socket's server commit path constructs this object. It is not
+            # a client message flag and never enters the provider JSON bridge.
+            from .audio_v2 import DurablePCMProjection
+            if (not isinstance(_audio_projection, DurablePCMProjection)
+                    or message != {"audio_base64": base64.b64encode(_audio_projection.pcm16).decode("ascii")}):
+                raise LiveError("LIVE_AUDIO_PROJECTION", "Invalid durable PCM projection")
+            if hasattr(self.adapter, "input_audio"):
+                admitted = await _maybe_await(self.adapter.input_audio(session, _audio_projection))
+                if admitted is False:
+                    return {"ok": True, "session_id": session.id, "already_projected": True}
+        elif hasattr(self.adapter, "input"):
             await _maybe_await(self.adapter.input(session, message))
+        if _delivery_guard:
+            _delivery_guard()
         received_at = received_at or _now_ms()
         written_at = None
 
@@ -745,24 +912,28 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
             if session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "Activity is already open")
-            written_at = self._write(session, {"type": "activity_start"})
+            generation = session.audio_turn_generation + 1
+            written_at = self._write(session, {"type": "activity_start", "audio_turn_generation": generation})
             session.activity_open = True
-            session.audio_turn_generation += 1
+            session.audio_turn_generation = generation
             session.audio_turn_open = True
+            self._advance_tool_feedback(session)
         if "audio_base64" in message:
             audio = message.get("audio_base64")
             if not isinstance(audio, str) or len(audio) > 16_000:
                 raise LiveError("INVALID_ARGUMENT", "Audio chunk is invalid")
             if session.manual_activity_detection and not session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "activity_start is required before buffered audio")
-            written_at = self._write(session, {"type": "audio", "data": audio})
+            generation = session.audio_turn_generation + int(not session.audio_turn_open)
+            written_at = self._write(session, {"type": "audio", "data": audio, "audio_turn_generation": generation})
             if not session.manual_activity_detection and not session.audio_turn_open:
-                session.audio_turn_generation += 1
+                session.audio_turn_generation = generation
                 session.audio_turn_open = True
+                self._advance_tool_feedback(session)
         if message.get("audio_stream_end"):
             if session.manual_activity_detection:
                 raise LiveError("INVALID_ARGUMENT", "Use activity_end when manual activity is enabled")
-            self._write(session, {"type": "audio_stream_end"})
+            self._write(session, {"type": "audio_stream_end", "audio_turn_generation": session.audio_turn_generation})
             if session.audio_turn_open:
                 session.audio_end_awaiting_ack.append(session.audio_turn_generation)
                 session.audio_turn_open = False
@@ -771,7 +942,7 @@ class LiveSessionHost:
                 raise LiveError("INVALID_ARGUMENT", "Manual activity is not enabled")
             if not session.activity_open:
                 raise LiveError("INVALID_ARGUMENT", "No activity is open")
-            self._write(session, {"type": "activity_end"})
+            self._write(session, {"type": "activity_end", "audio_turn_generation": session.audio_turn_generation})
             session.activity_open = False
             if session.audio_turn_open:
                 session.audio_end_awaiting_ack.append(session.audio_turn_generation)
@@ -781,11 +952,21 @@ class LiveSessionHost:
             if not isinstance(text, str) or not text.strip() or len(text) > 4_000:
                 raise LiveError("INVALID_ARGUMENT", "Text turn is invalid")
             self._write(session, {"type": "text", "text": text.strip()})
+            self._advance_tool_feedback(session)
         return {
             "ok": True,
             "session_id": session.id,
             "timing": {"received_at": received_at, "provider_input_at": written_at, "handled_at": _now_ms()},
         }
+
+    async def input_pcm(self, *, session_id, resource_id, projection, actor=None, received_at=None, **transport):
+        from .audio_v2 import DurablePCMProjection
+        if not isinstance(projection, DurablePCMProjection):
+            raise LiveError("LIVE_AUDIO_PROJECTION", "A server durable PCM projection is required")
+        return await self.input(session_id=session_id, resource_id=resource_id, actor=actor,
+                                received_at=received_at, _audio_projection=projection,
+                                message={"audio_base64": base64.b64encode(projection.pcm16).decode("ascii")},
+                                **transport)
 
     def events(
         self,
@@ -811,19 +992,31 @@ class LiveSessionHost:
             "closed": session.closed and not has_more,
         }
 
-    async def stop(self, *, session_id: str, resource_id: str, actor: Any = None) -> dict[str, Any]:
+    async def stop(
+        self, *, session_id: str, resource_id: str, actor: Any = None,
+        reason: LiveStopReason = "explicit_stop",
+    ) -> dict[str, Any]:
+        if reason not in ("explicit_stop", "detached_reclaim"):
+            raise LiveError("INVALID_ARGUMENT", "Unknown Live stop reason")
         session = self._get(session_id, resource_id, actor)
+        # An explicit Stop is absorbing: a concurrent internal reclaim cannot
+        # later turn it back into a resumable termination.
+        if session.stop_reason is None or reason == "explicit_stop":
+            session.stop_reason = reason
+        self._cancel_tool_progress(session)
         if not session.closed:
             try:
                 self._write(session, {"type": "stop"})
             except LiveError:
                 pass
-        if hasattr(self.adapter, "on_stopped"):            await _maybe_await(self.adapter.on_stopped(session))
+        if hasattr(self.adapter, "on_stopped"):
+            await _maybe_await(self.adapter.on_stopped(session))
         await self._discard(session, graceful=True)
         return {"ok": True, "session_id": session.id}
 
     async def _discard(self, session: _Session, graceful: bool = False) -> None:
         session.closed = True
+        self._cancel_tool_progress(session)
         session.audio_end_event.set()
         if session.pending_transition and not session.pending_transition.done():
             session.pending_transition.set_exception(

@@ -11,6 +11,11 @@ import time
 from urllib.parse import quote
 from websockets.exceptions import ConnectionClosed
 
+try:
+    from .reconnect import ReconnectBudget
+except ImportError:  # executed as a standalone stdin/stdout provider process
+    from reconnect import ReconnectBudget
+
 ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent'
 MODELS = {'gemini-3.8-live', 'gemini-3.8-live-extended-thinking'}
 FRESH_HANDLE_WAIT_SECONDS = 8
@@ -107,18 +112,23 @@ def _guard_check(resource_guard):
         resource_guard.check()
 
 
-async def _guarded_send(ws, payload, resource_guard=None):
+async def _guarded_send(ws, payload, resource_guard=None, *, before_write=None):
     _guard_check(resource_guard)
     if resource_guard is not None:
         pending = resource_guard.before_send(payload)
         if inspect.isawaitable(pending):
             await pending
         _guard_check(resource_guard)
+    if before_write is not None and not before_write():
+        return False
     await ws.send(json.dumps(payload))
     _guard_check(resource_guard)
+    return True
 
 
-async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False, deadline_seconds=SEND_BUDGET_DEADLINE_SECONDS):
+async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False,
+                                 deadline_seconds=SEND_BUDGET_DEADLINE_SECONDS, deadline_at=None,
+                                 connection_is_current=None):
     """Retry admission for one unsent control message; never rerun a product tool.
 
     A frame is optional and can be dropped. Live PCM cannot safely wait behind a
@@ -127,12 +137,30 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + deadline_seconds
+    if deadline_at is not None:
+        deadline = min(deadline, deadline_at)
+    current = connection_is_current or (lambda: state['ws'] is ws)
     retries = 0
+    pending_error = None
+    def ready_to_write():
+        # Admission itself may await an RPC. Check both before it and immediately
+        # before writing; bootstrap history has no public ready socket to close.
+        if state['stopped'] or not current():
+            return False
+        if loop.time() >= deadline:
+            if pending_error is not None:
+                raise pending_error
+            raise TimeoutError('Live message admission deadline')
+        return True
     while True:
+        if not ready_to_write():
+            return False
         try:
-            await _guarded_send(ws, payload, resource_guard)
+            if not await _guarded_send(ws, payload, resource_guard, before_write=ready_to_write):
+                return False
             if retries:
                 state['drop_inputs_before'] = round(time.time() * 1000)
+                state['drop_inputs_reason'] = 'resource_budget'
                 emit({'type':'resource_budget_ready','input_type':kind,'retries':retries})
             return True
         except Exception as exc:
@@ -141,16 +169,25 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
             if kind == 'snapshot' and optional:
                 emit({'type':'input_dropped','reason':'resource_budget','input_type':kind})
                 return False
-            if kind not in ('tool_response','text','audio_stream_end','activity_end','activity_start'):
+            if kind not in ('tool_response','text','history_restore',
+                            'audio_stream_end','activity_end','activity_start'):
                 raise
+            pending_error = exc
             remaining = deadline - loop.time()
-            if remaining <= 0 or state['stopped'] or state['ws'] is not ws:
+            if remaining <= 0 or state['stopped'] or not current():
                 raise
             retries += 1
             state['drop_inputs_before'] = round(time.time() * 1000)
+            state['drop_inputs_reason'] = 'resource_budget'
             wait_seconds = min(remaining, max(.05, min(5, getattr(exc,'retry_after_ms',3000) / 1000 or 3)))
             emit({'type':'resource_budget_wait','input_type':kind,'retry':retries,'wait_ms':round(wait_seconds*1000)})
-            await asyncio.sleep(wait_seconds)
+            if state.get('stop_event') is None:
+                await asyncio.sleep(wait_seconds)
+            else:
+                try:
+                    await asyncio.wait_for(state['stop_event'].wait(), timeout=wait_seconds)
+                except TimeoutError:
+                    pass
 
 
 async def _guarded_recv(ws, resource_guard=None):
@@ -176,6 +213,10 @@ def _application_search_function(configuration, functions):
     if not name:
         return None
     return name if any(str(item.get('name') or '') == name for item in functions if isinstance(item, dict)) else None
+
+
+def _resume_handle(value):
+    return value if isinstance(value, str) and 0 < len(value) <= 4096 else None
 
 
 def setup_config(model, context, history=None, *, configuration=None, search=False, handle=None):
@@ -311,7 +352,7 @@ def handle_server_message(obj, emit=emit):
         emit({'type': 'turn_complete'})
 
 
-async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None):
+async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None, reconnect_budget=None):
     from websockets import connect
     emit = on_event
     loop = asyncio.get_running_loop()
@@ -333,22 +374,30 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
     state = {
         'ws': None,
         'stopped': False,
-        'handle': None,
+        'stop_event': asyncio.Event(),
+        'handle': _resume_handle(start.get('resume_handle')),
+        'resume_requested': bool(_resume_handle(start.get('resume_handle'))),
         'handle_event': asyncio.Event(),
         'handle_generation': 0,
         'transition_handle_event': asyncio.Event(),
         'transition_started_event': asyncio.Event(),
         'transition_wait': None,
         'drop_inputs_before': 0,
+        'drop_inputs_reason': 'capability_transition',
         'context': start.get('context') or {},
         'configuration': start.get('configuration', {}) or {},
         'reconnects': 0,
+        'connected_once': False,
+        'go_away': False,
+        'outage_drop_reported': False,
+        'outage_drop_turn': None,
         'connection_generation': 0,
         'resource_error': None,
         'transition': None,
         'search_disabled_by_quota': False,
     }
     dialogue = DialogueHistory(start.get('history'))
+    budget = reconnect_budget or ReconnectBudget()
     def emit_observed(event):
         if event.get('type') == 'input_transcript':
             dialogue.transcript('user', event.get('text'))
@@ -363,6 +412,19 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
     if not search and not application_search:
         emit({"type":"capability_unavailable","capability":"internet_search","code":"NOT_CONFIGURED","message":"Интернет-поиск не настроен приложением."})
 
+    def report_dropped_input(message):
+        kind = message.get('type')
+        if kind not in ('audio', 'audio_stream_end', 'activity_start', 'activity_end', 'text'):
+            return
+        generation = message.get('audio_turn_generation')
+        if (not state['outage_drop_reported'] or generation != state['outage_drop_turn']
+                or kind in ('audio_stream_end', 'activity_end')):
+            state['outage_drop_reported'] = True
+            state['outage_drop_turn'] = generation
+            emit({'type': 'input_dropped', 'reason': 'provider_reconnect', 'input_type': kind,
+                  **({'audio_turn_generation': generation}
+                     if isinstance(generation, int) and not isinstance(generation, bool) else {})})
+
     async def sender():
         audio_chunks = 0
         max_stdin_delay_ms = max_ws_send_ms = 0
@@ -370,6 +432,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
             message = await read_line(reader)
             if message is None or message.get('type') == 'stop':
                 state['stopped'] = True
+                state['stop_event'].set()
                 if state['ws']:
                     await state['ws'].close()
                 return
@@ -437,15 +500,21 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                                        'attempts':0}
                 state['transition_started_event'].set()
                 state['drop_inputs_before'] = round(time.time() * 1000)
+                state['drop_inputs_reason'] = 'capability_transition'
                 emit({'type':'capability_transition_started','transition_id':transition_id,'capability':capability})
                 await ws.close()
                 continue
             ws = state['ws']
-            # Drop capture during an outage. Never queue or replay old speech.
+            # Drop capture during an outage. Never queue or replay old speech, but
+            # make the loss observable so the host can fence the open turn.
             if not ws:
+                report_dropped_input(message)
                 continue
             if kind in ('audio','audio_stream_end','activity_start','activity_end','text','snapshot') and message.get('queued_at', 0) <= state['drop_inputs_before']:
-                emit({'type':'input_dropped','reason':'capability_transition','input_type':kind})
+                generation = message.get('audio_turn_generation')
+                emit({'type':'input_dropped','reason':state['drop_inputs_reason'],'input_type':kind,
+                      **({'audio_turn_generation':generation}
+                         if isinstance(generation,int) and not isinstance(generation,bool) else {})})
                 continue
             if kind == 'audio':
                 if audio_chunks == 0:
@@ -475,6 +544,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     audio_chunks += int(kind == 'audio')
                 sent = await _send_with_budget_wait(ws,payload,resource_guard,emit,kind,state,optional=message.get('optional') is True)
                 if not sent:
+                    if not state['stopped']:
+                        report_dropped_input(message)
                     continue
                 if kind == 'text':
                     dialogue.transcript('user', message.get('text'))
@@ -485,25 +556,36 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     emit({'type': 'input_timing', 'text_sent_at': round(time.time() * 1000)})
                 if kind in ('audio_stream_end', 'activity_end'):
                     timing = {'type': 'input_timing', 'audio_chunks': audio_chunks, 'max_stdin_delay_ms': max_stdin_delay_ms, 'max_ws_send_ms': max_ws_send_ms}
+                    generation = message.get('audio_turn_generation')
+                    if isinstance(generation, int) and not isinstance(generation, bool):
+                        timing['audio_turn_generation'] = generation
                     timing['audio_stream_end_sent_at' if kind == 'audio_stream_end' else 'activity_end_sent_at'] = round(time.time() * 1000)
                     emit(timing)
                     audio_chunks = 0
                     max_stdin_delay_ms = max_ws_send_ms = 0
             except Exception as exc:
-                state['ws'] = None
+                if state['ws'] is ws:
+                    state['ws'] = None
                 if _is_resource_failure(exc):
                     state['resource_error'] = exc
                     state['stopped'] = True
+                    state['stop_event'].set()
                     try:
                         await ws.close()
                     except Exception:
                         pass
                     raise
                 # Receiver owns bounded reconnect; sender remains alive to accept Stop.
+                report_dropped_input(message)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
     sender_task = asyncio.create_task(sender())
     try:
         while not state['stopped']:
+            setup_sent = False
             try:
                 _guard_check(resource_guard)
                 transition = state.get('transition')
@@ -528,6 +610,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     history = [] if state['handle'] else dialogue.snapshot()
                     setup = setup_config(model, state['context'], history, configuration=configuration, search=search, handle=state['handle'])
                     await _guarded_send(ws, setup, resource_guard)
+                    setup_sent = True
                     remaining = max(.001, transition['deadline']-loop.time()) if transition else 20
                     async with asyncio.timeout(min(20,remaining)):
                         while True:
@@ -541,13 +624,28 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     if transition and loop.time() >= transition['deadline']:
                         raise TimeoutError('capability transition setup deadline')
                     if history:
-                        await _guarded_send(ws, {'clientContent': {'turns': [
+                        restored = await _send_with_budget_wait(ws, {'clientContent': {'turns': [
                             {'role': item['role'], 'parts': [{'text': item['text']}]}
                             for item in history
-                        ], 'turnComplete': True}}, resource_guard)
+                        ], 'turnComplete': True}}, resource_guard, emit, 'history_restore', state,
+                            deadline_at=transition['deadline'] if transition else None,
+                            connection_is_current=lambda generation=state['connection_generation']:
+                                state['connection_generation'] == generation)
+                        if not restored:
+                            return
                         emit({'type':'history_restored', **dialogue.metrics(),
                               'connection_generation':state['connection_generation']})
+                    if state['connected_once']:
+                        # The reader may still contain frames admitted during the
+                        # outage. A ready replacement socket must not replay them.
+                        state['drop_inputs_before'] = round(time.time() * 1000)
+                        state['drop_inputs_reason'] = 'capability_transition' if transition else 'provider_reconnect'
                     state['ws'] = ws
+                    state['connected_once'] = True
+                    state['go_away'] = False
+                    state['outage_drop_reported'] = False
+                    state['outage_drop_turn'] = None
+                    budget.succeeded()
                     transition = state.get('transition')
                     if transition:
                         emit({'type':'resumed','model':model,'voice':'Aoede','search_available':search,
@@ -569,9 +667,12 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             emit({'type':'capability_continuation_sent','capability':transition['capability']})
                         if transition.get('budget_retries'):
                             state['drop_inputs_before'] = round(time.time() * 1000)
+                            state['drop_inputs_reason'] = 'resource_budget'
                             emit({'type':'resource_budget_ready','input_type':'setup','retries':transition['budget_retries']})
                     else:
-                        emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search})
+                        emit({'type': 'resumed' if state['reconnects'] else 'ready', 'model': model, 'voice': 'Aoede', 'search_available': search,
+                              **({'resumption_mode': 'checkpoint' if setup['setup']['sessionResumption'].get('handle') else 'history_restore',
+                                  'connection_generation': state['connection_generation']} if state['reconnects'] or state['resume_requested'] else {})})
                     while not state['stopped']:
                         raw = await _guarded_recv(ws, resource_guard)
                         obj = json.loads(raw)
@@ -580,6 +681,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                         if update is not None:
                             state['handle'] = update.get('newHandle') if update.get('resumable') else None
                             if state['handle']:
+                                # Host-only: lets a product persist the checkpoint so a
+                                # backend restart resumes the same provider conversation.
+                                emit({'type': 'resumption_checkpoint', 'handle': state['handle']})
                                 state['handle_generation'] += 1
                                 state['handle_event'].set()
                                 wait = state.get('transition_wait')
@@ -589,6 +693,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                                 state['handle_event'].clear()
                             emit({'type': 'resumption_state', 'resumable': bool(state['handle'])})
                         if obj.get('goAway'):
+                            state['go_away'] = True
                             emit({'type': 'go_away', 'time_left': obj['goAway'].get('timeLeft')})
                             break
                         handle_server_message(obj, emit=emit_observed)
@@ -606,7 +711,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     # A denied setup grant commits no tokens. During a tool-bundle
                     # switch the previous socket is already closed, so wait for a
                     # short rolling-budget refill within the existing deadline.
-                    if (transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
+                    if (not setup_sent and transition and getattr(exc, 'code', None) == 'RESOURCE_TOKEN_BUDGET'
                             and transition.get('budget_retries', 0) < MAX_TRANSITION_BUDGET_RETRIES
                             and transition['deadline'] - loop.time() > TRANSITION_BUDGET_RETRY_SECONDS + 1):
                         transition['budget_retries'] = transition.get('budget_retries', 0) + 1
@@ -648,11 +753,28 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     continue
                 if state['stopped']:
                     break
-                if not state['handle'] or state['reconnects'] >= 3 or any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota']):
+                # Long conversations renew the provider connection many times.
+                # Bound attempts per rolling window, never per session lifetime;
+                # auth/quota failures and a setup that never succeeded stay fatal.
+                auth_failure = any(x in message.lower() for x in ['permission', 'unauthorized', 'api key', 'quota'])
+                if not state['connected_once'] and state['resume_requested'] and not auth_failure:
+                    # A persisted checkpoint may have expired or belong to another
+                    # provider binding: fall back once to bounded history restore.
+                    state['resume_requested'] = False
+                    state['handle'] = None
+                    emit({'type': 'resumption_rejected', 'reason': type(exc).__name__})
+                    continue
+                if not state['connected_once'] or auth_failure or not budget.allow():
                     raise
+                planned = state['go_away']
+                if not planned:
+                    budget.failed()
+                state['go_away'] = False
                 state['reconnects'] += 1
-                emit({'type': 'reconnecting', 'attempt': state['reconnects']})
-                await asyncio.sleep(min(2, state['reconnects'] * .5))
+                emit({'type': 'reconnecting', 'attempt': state['reconnects'], 'planned': planned,
+                      'resumption_mode': 'checkpoint' if state['handle'] else 'history_restore',
+                      'recent_attempts': budget.recent_attempts()})
+                await asyncio.sleep(budget.delay())
     except Exception as exc:
         if _is_resource_failure(exc):
             raise
@@ -660,6 +782,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
         emit({'type': 'error', 'code': type(exc).__name__, 'message': re.sub(r'AIza[A-Za-z0-9_-]{20,}', '[REDACTED]', message)[:500]})
     finally:
         state['stopped'] = True
+        state['stop_event'].set()
         sender_task.cancel()
         await asyncio.gather(sender_task, return_exceptions=True)
 
