@@ -2,9 +2,21 @@ package org.onedayonemasterpiece.live.platform;
 
 import org.junit.Test;
 import java.util.Map;
+import java.util.Set;
 import static org.junit.Assert.*;
 
 public class OutputResumeQueueTest {
+    @Test public void completedAudioDuringSocketOutageOwesAReplaySafePlayheadReceipt() {
+        Map<String, Long> positions = OutputResumeQueue.completedPlayheads(
+            Set.of("out_offline", "out_incomplete", "out_zero"),
+            Map.of("out_offline", 1854321L, "out_incomplete", 100000L, "out_zero", 0L,
+                   "out_unrelated", 920000L));
+        assertEquals(Map.of("out_offline", 1854L, "out_incomplete", 100L), positions);
+        // Resending the same monotone position after another reconnect is idempotent.
+        assertEquals(positions, OutputResumeQueue.completedPlayheads(
+            Set.of("out_offline", "out_incomplete", "out_zero"),
+            Map.of("out_offline", 1854321L, "out_incomplete", 100000L, "out_zero", 0L)));
+    }
     @Test public void receivedSourceDoesNotBecomePlayedOrStartEveryReplayAtOnce() {
         OutputResumeQueue queue = new OutputResumeQueue();
         queue.offer("out_first", 100000, 900000, true, false);

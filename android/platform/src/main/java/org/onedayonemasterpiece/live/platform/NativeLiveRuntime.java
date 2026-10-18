@@ -409,6 +409,14 @@ public final class NativeLiveRuntime implements AutoCloseable {
                             run.connected = true; run.connectPending = false; run.reconnectCount = 0; run.error = null;
                             run.bindings.clear(); run.submitted.clear(); run.opening.clear(); run.registering.clear(); run.epochs.clear(); run.sealing.clear(); run.sealed.clear(); run.unbinding.clear();
                             run.liveSourceId = null; run.serverSourceId = null; run.rotation.incrementAndGet();
+                            // Playback can finish locally while WSS is down. Its
+                            // output source is then no longer eligible for audio
+                            // recovery, but its last hardware cursor still needs
+                            // an idempotent monotone server-side receipt. Replay
+                            // the completed-source positions on every new socket
+                            // before asking for another output manifest.
+                            for (var completed : OutputResumeQueue.completedPlayheads(run.completedOutputs, run.playedPositions).entrySet())
+                                transport.playbackPosition(completed.getKey(), completed.getValue());
                             run.state = "delayed"; publish(run); requestNextOutput(run); pump(run, connectionGeneration);
                         }));
                 });
