@@ -13,10 +13,37 @@ domain agents, permissions and product tools remain in consumer adapters.
   compression/resumption, same-model bounded recovery, provider event translation.
 - `python/live_interaction/session_host.py`: in-process Python session host with
   resource/actor binding, bounded NDJSON input, event cursors and ordered/deduplicated tools.
+- `android/` contracts and `android/platform/`: native v2 AudioRecord, VAD,
+  MediaCodec, AudioTrack and WSS. The product supplies authorization, SessionApi,
+  durable stores, foreground service, permission flow and UI.
 - Product adapter: authentication, resource authorization, function declarations,
   instructions, tools, mutation/readback, images, UI and credential resolution.
 
-Use versioned releases (current package release `0.3.11`; the native WSS binding documented in `docs/native-wss.md` remains an explicitly separate `0.3.7-rc.1` candidate). Release 0.3.11 aligns the steady-state PCM byte watermark with the existing 2.5-second queue-age and WSS-ACK budgets, so a healthy ~1.5-second in-flight backlog no longer trips an earlier 48 kB fuse; queues beyond 2.5 seconds still fail closed. Release 0.3.10 adds an opt-in reverse microphone handoff: a consumer that originally handed Live an existing browser stream can call `stop({returnMicrophoneHandoff:true})`, detach Live capture without ending the track, and immediately return that same stream to its local recognizer without another `getUserMedia` request. Ordinary Stop keeps owning and ending its microphone as before. Release 0.3.9 adds one-turn provider response suppression for deterministic local controls sharing the Live stream. Release 0.3.8 adds optional browser `captureTap(pcm,rms)` after playback-echo suppression, so a product can feed the already-owned PCM16/16 kHz stream into a bounded local control sidecar without opening a second microphone or delaying provider transport. Release 0.3.6 serializes Gemini Live `mediaResolution` as the scalar enum string required by the Live setup schema; object-wrapping this field is invalid. Release 0.3.5 Release 0.3.5 lets each consumer capability set the provider Live media resolution explicitly, so visual verification can use low-resolution vision while dedicated image inspection can request high resolution. Release 0.3.4 paces browser WSS input by server audio acknowledgements, so a valid startup handoff cannot fill WebSocket.bufferedAmount faster than the relay accepts it. Socket backpressure errors carry bounded queue metrics. Release 0.3.3 keeps steady-state PCM byte/age bounds authoritative over render-quantum object count, retains a large fragmentation fuse, assigns stable sender failure codes, and reports safe output PCM/WebAudio playback facts for diagnostics. Release 0.3.2 keeps the
+## Release status — 18 October 2026
+
+The published stable release is [0.3.28](docs/release-0.3.28.md). This source
+checkpoint is **0.4.0-rc.2**, whose prerelease tag/archive is not yet published.
+Existing stable consumers remain pinned. Record exact candidate commit/tree and
+acceptance receipts; consume the versioned archive with its digest when published.
+GitHub prerelease publication and stable promotion are separate decisions.
+
+Native v2 uses compressed originals in both directions, separate durable/forwarded/
+played receipts, and recovery that does not execute old speech again. Follow the
+[integration contract](docs/integration.md), [voice continuity contract](docs/voice-continuity-contract.md),
+[Android platform binding](android/platform/README.md) and
+[RC2 contract](docs/native-voice-rc2-20261018.md). `wl-live-v1`/PCM remains an explicit
+legacy path; it does not establish native v2 acceptance.
+
+Native captions are optional and default to an `unverified` clock. Missing verified
+source/utterance alignment gives explicit caption degradation while primary voice
+continues. Diagnostics are opt-in; primary audio acceptance and caption qualification
+have separate results. Record real-provider and Android emulator audio evidence
+separately from physical-handset/90-minute acceptance. An explicitly labeled product
+RC may list those physical gates as open; it is not stable production qualification.
+
+## Earlier releases
+
+Release 0.3.11 aligns the steady-state PCM byte watermark with the existing 2.5-second queue-age and WSS-ACK budgets, so a healthy ~1.5-second in-flight backlog no longer trips an earlier 48 kB fuse; queues beyond 2.5 seconds still fail closed. Release 0.3.10 adds an opt-in reverse microphone handoff: a consumer that originally handed Live an existing browser stream can call `stop({returnMicrophoneHandoff:true})`, detach Live capture without ending the track, and immediately return that same stream to its local recognizer without another `getUserMedia` request. Ordinary Stop keeps owning and ending its microphone as before. Release 0.3.9 adds one-turn provider response suppression for deterministic local controls sharing the Live stream. Release 0.3.8 adds optional browser `captureTap(pcm,rms)` after playback-echo suppression, so a product can feed the already-owned PCM16/16 kHz stream into a bounded local control sidecar without opening a second microphone or delaying provider transport. Release 0.3.6 serializes Gemini Live `mediaResolution` as the scalar enum string required by the Live setup schema; object-wrapping this field is invalid. Release 0.3.5 Release 0.3.5 lets each consumer capability set the provider Live media resolution explicitly, so visual verification can use low-resolution vision while dedicated image inspection can request high resolution. Release 0.3.4 paces browser WSS input by server audio acknowledgements, so a valid startup handoff cannot fill WebSocket.bufferedAmount faster than the relay accepts it. Socket backpressure errors carry bounded queue metrics. Release 0.3.3 keeps steady-state PCM byte/age bounds authoritative over render-quantum object count, retains a large fragmentation fuse, assigns stable sender failure codes, and reports safe output PCM/WebAudio playback facts for diagnostics. Release 0.3.2 keeps the
 20-second startup handoff byte-bounded while allowing the thousands of small
 AudioWorklet quanta a real browser can accumulate during provider setup; the
 fragment-count fuse remains bounded but no longer falsely reports network lag. Release 0.3.1 hardens the
@@ -34,7 +61,7 @@ stateful 16 kHz resampler; startup/wake handoff reuses that same capture object.
 WSS is opt-in per consumer and never silently falls back to HTTP within a started
 WSS session. The legacy HTTP API remains only for older pinned consumers.
 
-Use versioned releases (previous stable release `0.2.17`). Release 0.2.17 waits on rolling resource-budget refusals for the same unsent tool response or text, pauses browser capture until admission recovers, and drops only explicitly optional frames. A bounded capability transition can wait for the same budget without rerunning product mutations. Release 0.2.16 reuses an active microphone across capability resumption, so Stop still owns its only stream. Release 0.2.15 retries a denied setup grant during a capability transition within the existing deadline and stops browser capture immediately on a terminal provider error. Release 0.2.14 closes late microphone grants after Stop and gives the bounded sender room for a short in-flight HTTP stall. Release 0.2.13 keeps quiet
+Release 0.2.17 waits on rolling resource-budget refusals for the same unsent tool response or text, pauses browser capture until admission recovers, and drops only explicitly optional frames. A bounded capability transition can wait for the same budget without rerunning product mutations. Release 0.2.16 reuses an active microphone across capability resumption, so Stop still owns its only stream. Release 0.2.15 retries a denied setup grant during a capability transition within the existing deadline and stops browser capture immediately on a terminal provider error. Release 0.2.14 closes late microphone grants after Stop and gives the bounded sender room for a short in-flight HTTP stall. Release 0.2.13 keeps quiet
 speech within an active microphone turn and waits for that turn's provider
 audio-end acknowledgement before a capability switch. Release 0.2.12 allows a
 consumer to opt into binary PCM between browser and product server and reports

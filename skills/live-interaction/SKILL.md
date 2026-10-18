@@ -6,14 +6,23 @@ description: Integrate or change interactive Live voice/video in Wonderful Lecti
 # Shared Live interaction
 
 Canonical implementation: `onedayonemasterpiece/live-interaction` (public), local
-checkout `/home/dev/projects/live-interaction`. Read `docs/live-agent-architecture.md`
-and `docs/integration.md` before integration. For native/Python WSS also read
-`docs/native-wss.md`, including the multi-project runtime decision and RC limitations.
+checkout `/home/dev/projects/live-interaction`. Read the
+[architecture](../../docs/live-agent-architecture.md) and
+[integration contract](../../docs/integration.md) before integration. For native v2,
+also read [voice continuity](../../docs/voice-continuity-contract.md), the
+[RC2 contract](../../docs/native-voice-rc2-20261018.md) and
+[Android platform binding](../../android/platform/README.md).
+[Native WSS v1](../../docs/native-wss.md) records the earlier 0.3.x candidate;
+do not apply its Stop/Start-only recovery limitation to v2.
 
 Use semantic release versions with archive digests/lockfile integrity. Never
 silently update a running product/session. Framework fixes belong here, not in
 copies of transport code inside consumers. Release candidates are not production
 acceptance. Keep existing stable consumers pinned while candidate acceptance runs.
+At this 18 October 2026 source checkpoint, published stable is `0.3.28`;
+`0.4.0-rc.2` is the native source candidate, with its prerelease publication still
+pending. Record an explicit source candidate's exact commit/tree; move to the
+versioned archive and digest when published, without relabeling it stable.
 
 Python products use `LiveSocketSessionHost` (an extension of the existing host)
 and the framework-neutral `serve_socket` relay. FastAPI/aiohttp products only
@@ -22,19 +31,30 @@ sidecar merely because the first WSS consumer was Node. Node products keep the
 existing Node binding and shared Python provider. Common protocol/conformance
 checks cover both; backend language choice is not a performance guarantee.
 
-Android products consume the native Java socket binding from the same immutable
-archive as a generated source set; never edit or copy a fork into a product.
-The app retains capture/VAD/playback/UI. Browser products use the existing shared
-AudioWorklet client and generated assets, not a product-local microphone engine.
+Consume the Android contracts and platform projects from the same immutable
+archive through the existing composite build; never edit a fork in the product.
+For native v2, shared `NativeLiveRuntime` owns AudioRecord, VAD, MediaCodec,
+AudioTrack and WSS. Supply product authorization, SessionApi, durable stores,
+foreground service, permission flow and UI in the consumer. Keep browser products
+on the shared AudioWorklet client and generated assets.
 
-WSS: authenticated HTTP bootstrap/renewal, 15-second one-use ticket in subprotocol,
-matching `wl-live-v1` hello_ack before readiness, binary PCM, pushed events/audio,
-bounded ordered sender and ACK pacing. No credential/ticket/resumption handle in
-URLs. No polling or silent HTTP-audio fallback in a migrated session. A damaged
-input turn cannot authorize tools until a later clean provider boundary is proven.
-Native RC reconnect is explicit Stop/Start with no speech replay. Python browser
-RC does not accept 20-second startup replay; disable captureDuringStart and show
-setup state until that catch-up path has independent acceptance.
+Use authenticated HTTP bootstrap/renewal and a 15-second one-use ticket in the
+subprotocol. Negotiate `wl-live-v2` and verified compressed profiles for native
+voice; preserve original source/epoch/chunk identity and separate durable,
+forwarded and played receipts. Renew the same session's socket generation without
+replaying old speech as commands; recovery of durable originals remains a separate
+lane. Preserve immediate Stop across every await boundary. Keep `wl-live-v1`/PCM
+only as an explicit legacy binding, with no silent codec/protocol/HTTP downgrade.
+Keep credentials, tickets and resumption handles out of URLs. Do not start an
+events poller in a migrated WSS session. A damaged input turn cannot authorize
+tools until a later clean provider boundary is proven.
+
+Treat native captions as an optional projection with default clock `unverified`.
+Require accepted source/utterance provenance and verified provider offsets before
+attribution; never guess from arrival order or a visible bubble. Surface unavailable
+captions without stopping primary voice or changing canonical history. Keep caption
+diagnostics opt-in and qualify them separately; a primary audio PASS does not
+qualify captions, and missing offsets must not be invented to pass a probe.
 
 Keep resource/actor authorization, product functions, immutable revision binding,
 state, prompts/persona and credential selection in product adapters. Preserve
@@ -71,11 +91,17 @@ full playback and result readback. Distinguish prepared PCM from a physical mic.
 Long-session/resumption checks and real provider receipts are required before
 claiming those properties; a unit test, setup handshake or APK build is not Live
 acceptance. Keep managed artifacts and exact source/dependency versions.
+An explicitly labeled consumer RC may retain named physical-handset and 90-minute
+acceptance gates as open. Record Android emulator audio and real-provider receipts
+separately; neither substitutes for those physical/long-session claims or promotes
+the candidate to stable. Record failures and degraded optional captions as well
+as passing gates.
 
 
 Browser socket send/ACK failures recover through bounded same-session ticket
 renewal before any full setup retry. Stop capture and drop stale PCM; never send
 provider Stop solely for a recoverable socket gap. Retain typed `RESOURCE_*`
 startup errors and `retry_after_ms` through HTTP/UI; a resource refusal is not a
-provider outage and must not trigger a transport retry loop. Native recovery
-policy is unchanged. Require real transport acceptance for lifecycle releases.
+provider outage and must not trigger a transport retry loop. Apply the linked
+source/receipt recovery contract to native v2. Require real transport acceptance
+for lifecycle releases.
