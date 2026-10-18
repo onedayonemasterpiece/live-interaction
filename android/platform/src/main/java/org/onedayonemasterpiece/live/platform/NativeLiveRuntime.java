@@ -4,6 +4,8 @@ import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceCallback;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -12,9 +14,11 @@ import android.media.AudioTimestamp;
 import android.media.MediaRecorder;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.NoiseSuppressor;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.util.Log;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -87,6 +91,8 @@ public final class NativeLiveRuntime implements AutoCloseable {
     private NoiseSuppressor noise;
     private AudioManager audioManager;
     private AudioFocusRequest focus;
+    private AudioDeviceCallback routeCallback;
+    private boolean chosenSpeaker, legacySpeakerChanged, legacySpeakerBefore;
     private int previousAudioMode;
     private CompletableFuture<Void> finalizing = CompletableFuture.completedFuture(null);
 
@@ -253,6 +259,24 @@ public final class NativeLiveRuntime implements AutoCloseable {
             int result = manager.requestAudioFocus(request);
             if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) { created.release(); throw new IllegalStateException("LIVE_NATIVE_AUDIO_FOCUS_DENIED"); }
             audioManager = manager; focus = request; previousAudioMode = manager.getMode(); manager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            // AudioTrack uses VOICE_COMMUNICATION. Many handset defaults route that
+            // usage to the quiet earpiece even when Gemini has emitted audio.
+            // Prefer loudspeaker only with no wired/Bluetooth/USB route available.
+            // The callback relinquishes our request when external audio appears.
+            routeCallback = new AudioDeviceCallback() {
+                @Override public void onAudioDevicesAdded(AudioDeviceInfo[] devices) { updateCommunicationRoute(run); }
+                @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] devices) { updateCommunicationRoute(run); }
+            };
+            try { manager.registerAudioDeviceCallback(routeCallback, callbacks); }
+            catch (RuntimeException unavailable) {
+                routeCallback = null;
+                Log.w("LiveNativeAudioRoute", "device_callback_unavailable");
+            }
+            try { updateCommunicationRouteLocked(run, manager); }
+            catch (RuntimeException unavailable) {
+                Log.w("LiveNativeAudioRoute", "speaker_route_query_failed");
+                nativeTiming(run, "speaker_route_query_failed");
+            }
             recorder = created;
             if (AcousticEchoCanceler.isAvailable()) { echo = AcousticEchoCanceler.create(created.getAudioSessionId()); if (echo != null) echo.setEnabled(true); }
             if (NoiseSuppressor.isAvailable()) { noise = NoiseSuppressor.create(created.getAudioSessionId()); if (noise != null) noise.setEnabled(true); }
@@ -700,10 +724,15 @@ public final class NativeLiveRuntime implements AutoCloseable {
         return finalizing;
     }
     private void releaseCapture() {
-        AudioRecord selected; AcousticEchoCanceler oldEcho; NoiseSuppressor oldNoise; AudioManager manager; AudioFocusRequest request; int mode;
+        AudioRecord selected; AcousticEchoCanceler oldEcho; NoiseSuppressor oldNoise; AudioManager manager; AudioFocusRequest request; AudioDeviceCallback callback;
+        boolean restoreLegacy, originalLegacy, clearRoute; int mode;
         synchronized (hardware) {
             selected = recorder; recorder = null; oldEcho = echo; echo = null; oldNoise = noise; noise = null;
             manager = audioManager; audioManager = null; request = focus; focus = null; mode = previousAudioMode;
+            callback = routeCallback; routeCallback = null;
+            restoreLegacy = legacySpeakerChanged; originalLegacy = legacySpeakerBefore;
+            clearRoute = chosenSpeaker;
+            legacySpeakerChanged = chosenSpeaker = false;
         }
         if (selected != null) {
             try { selected.stop(); } catch (RuntimeException ignored) { }
@@ -711,8 +740,73 @@ public final class NativeLiveRuntime implements AutoCloseable {
         }
         if (oldEcho != null) oldEcho.release(); if (oldNoise != null) oldNoise.release();
         if (manager != null) {
+            if (callback != null) manager.unregisterAudioDeviceCallback(callback);
+            if (Build.VERSION.SDK_INT >= 31 && clearRoute) manager.clearCommunicationDevice();
+            if (Build.VERSION.SDK_INT < 31 && restoreLegacy) manager.setSpeakerphoneOn(originalLegacy);
             if (request != null) manager.abandonAudioFocusRequest(request);
             manager.setMode(mode);
+        }
+    }
+    /** Route selection is a platform lifecycle decision, never a second audio engine. */
+    private void updateCommunicationRoute(Run run) {
+        synchronized (hardware) {
+            if (active(run) && audioManager != null) {
+                try { updateCommunicationRouteLocked(run, audioManager); }
+                catch (RuntimeException unavailable) {
+                    Log.w("LiveNativeAudioRoute", "route_change_failed");
+                    nativeTiming(run, "route_change_failed");
+                }
+            }
+        }
+    }
+    private void updateCommunicationRouteLocked(Run run, AudioManager manager) {
+        List<AudioDeviceInfo> devices;
+        if (Build.VERSION.SDK_INT >= 31) devices = manager.getAvailableCommunicationDevices();
+        else devices = List.of(manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS));
+        List<Integer> types = new ArrayList<>(devices.size());
+        AudioDeviceInfo speaker = null;
+        for (AudioDeviceInfo d : devices) {
+            if (!d.isSink()) continue;
+            types.add(d.getType());
+            if (d.getType() == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) speaker = d;
+        }
+        int current = 0;
+        if (Build.VERSION.SDK_INT >= 31) {
+            AudioDeviceInfo selected = manager.getCommunicationDevice();
+            if (selected != null) current = selected.getType();
+        } else current = manager.isSpeakerphoneOn()
+                ? AudioDeviceInfo.TYPE_BUILTIN_SPEAKER : AudioDeviceInfo.TYPE_BUILTIN_EARPIECE;
+        boolean external = types.stream().anyMatch(CommunicationRoutePolicy::isExternal);
+        String decision = "system_default";
+        if (external && chosenSpeaker) {
+            if (Build.VERSION.SDK_INT >= 31) manager.clearCommunicationDevice();
+            else if (legacySpeakerChanged) manager.setSpeakerphoneOn(legacySpeakerBefore);
+            chosenSpeaker = legacySpeakerChanged = false;
+            decision = "released_to_external";
+        } else if (CommunicationRoutePolicy.preferSpeaker(current, types)) {
+            if (Build.VERSION.SDK_INT >= 31) {
+                if (speaker != null && manager.setCommunicationDevice(speaker)) {
+                    chosenSpeaker = true;
+                    decision = "speaker_selected";
+                } else decision = "speaker_unavailable";
+            } else {
+                legacySpeakerBefore = manager.isSpeakerphoneOn();
+                manager.setSpeakerphoneOn(true);
+                chosenSpeaker = legacySpeakerChanged = !legacySpeakerBefore;
+                decision = "speaker_selected_legacy";
+            }
+        } else if (chosenSpeaker && current == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+            decision = "speaker_retained";
+        }
+        AudioDeviceInfo actual = Build.VERSION.SDK_INT >= 31 ? manager.getCommunicationDevice() : null;
+        int observed = actual == null ? current : actual.getType();
+        Log.i("LiveNativeAudioRoute", "decision=" + decision + " device_type=" + observed);
+        if (active(run)) {
+            JsonObject event = new JsonObject();
+            event.addProperty("type", "native_audio_route");
+            event.addProperty("decision", decision);
+            event.addProperty("device_type", observed);
+            dispatch(() -> { if (active(run)) listener.onEvent(event.toString()); });
         }
     }
     private void fail(Run run, String code, boolean recoverable) {
