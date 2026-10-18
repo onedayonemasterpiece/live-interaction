@@ -24,6 +24,7 @@ from .provider import (
     read_line,
 )
 from .reconnect import ReconnectBudget
+from .caption_provenance import CaptionAudioLedger
 
 MODEL = "gemini-3.5-transcribe-live"
 MAX_VOCABULARY = 1000
@@ -71,6 +72,10 @@ def setup_config(configuration=None):
         setup["realtimeInputConfig"] = {
             "automaticActivityDetection": {"disabled": True}
         }
+    if configuration.get("native_caption_provenance") is not None:
+        if mode != "VERBATIM":
+            raise ValueError("native_caption_timestamps_require_verbatim")
+        setup.setdefault("realtimeInputConfig", {})["interimTranscriptTimestampEnabled"] = True
     return {"setup": setup}
 
 
@@ -101,16 +106,17 @@ def input_payload(message):
     return None
 
 
-def handle_server_message(obj, emit):
+def handle_server_message(obj, emit, *, caption_ledger=None):
     if "error" in obj:
         raise RuntimeError(json.dumps(obj["error"], ensure_ascii=False))
     content = obj.get("serverContent") or {}
-    interim = (content.get("interimInputTranscription") or {}).get("text")
-    if isinstance(interim, str) and interim.strip():
-        emit({"type": "interim_input_transcript", "text": interim})
-    final = (content.get("inputTranscription") or {}).get("text")
-    if isinstance(final, str) and final.strip():
-        emit({"type": "input_transcript", "text": final})
+    for field, kind in (("interimInputTranscription", "interim_input_transcript"),
+                        ("inputTranscription", "input_transcript")):
+        transcription = content.get(field) or {}
+        text = transcription.get("text") if isinstance(transcription, dict) else None
+        if isinstance(text, str) and text.strip():
+            emit(caption_ledger.transcript(kind, transcription) if caption_ledger is not None
+                 else {"type": kind, "text": text})
     if obj.get("usageMetadata"):
         emit({"type": "usage", "metadata": obj["usageMetadata"]})
     if content.get("turnComplete"):
@@ -147,6 +153,22 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
         raise ValueError("missing_start")
     if start.get("model") != MODEL:
         raise ValueError("invalid_model")
+
+    provenance = (start.get("configuration") or {}).get("native_caption_provenance")
+    caption_ledger = None
+    if provenance is not None:
+        if not isinstance(provenance, dict):
+            raise ValueError("invalid_native_caption_provenance")
+        caption_ledger = CaptionAudioLedger(
+            offset_clock=provenance.get("offset_clock", "unverified"),
+            diagnostics=provenance.get("diagnostics", False),
+        )
+
+    def record_sent(message):
+        if caption_ledger is not None:
+            event = caption_ledger.sent(message)
+            if event is not None and caption_ledger.diagnostics:
+                emit(event)
 
     _guard_check(resource_guard)
     key = resource_guard.key() if resource_guard is not None else load_key()
@@ -192,10 +214,10 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
             if not connected_once:
                 # Preserve the old useful startup buffering while continuing to
                 # read Stop. The first connection drains this prefix only once.
-                size = len(json.dumps(payload).encode("utf-8"))
+                size = len(json.dumps(payload).encode("utf-8")) + len(json.dumps(message).encode("utf-8"))
                 if startup_bytes + size > MAX_STARTUP_INPUT_BYTES:
                     raise ValueError("caption_startup_backpressure")
-                startup_inputs.append((payload, size))
+                startup_inputs.append((payload, size, message))
                 startup_bytes += size
                 if kind == "activity_start":
                     activity_open = True
@@ -219,6 +241,8 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
                                                before_write=lambda: not stopped and current_ws is ws)
                     if not sent:
                         dropped(kind)
+                    else:
+                        record_sent(message)
                 except Exception as exc:
                     if _is_resource_failure(exc):
                         raise
@@ -238,6 +262,8 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
                     close_timeout=2,
                     max_size=4 * 1024 * 1024,
                 ) as ws:
+                    if caption_ledger is not None:
+                        caption_ledger.connected()
                     await _guarded_send(
                         ws,
                         setup_config(start.get("configuration")),
@@ -249,7 +275,7 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
                             obj = json.loads(await _guarded_recv(ws, resource_guard))
                             if "setupComplete" in obj:
                                 break
-                            handle_server_message(obj, emit)
+                            handle_server_message(obj, emit, caption_ledger=caption_ledger)
                     if stopped:
                         return
                     budget.succeeded()
@@ -258,11 +284,12 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
                         # while admission or network writes await. No other task
                         # can write audio until this initial ordered prefix drains.
                         while startup_inputs and not stopped:
-                            payload, size = startup_inputs.popleft()
+                            payload, size, message = startup_inputs.popleft()
                             startup_bytes -= size
                             if not await _guarded_send(ws, payload, resource_guard,
                                                        before_write=lambda: not stopped):
                                 return
+                            record_sent(message)
                     async with send_lock:
                         if connected_once and activity_open:
                             # Only reopen the current activity; old PCM stays dropped.
@@ -286,7 +313,11 @@ async def run(*, load_key=default_key, reader=None, on_event=None, resource_guar
                                     "time_left": (obj.get("goAway") or {}).get("timeLeft"),
                                 })
                                 break
-                            handle_server_message(obj, emit)
+                            # A response may race the completion of its audio
+                            # write. Read the ledger only after that write records
+                            # a successful send, never from queued/failed audio.
+                            async with send_lock:
+                                handle_server_message(obj, emit, caption_ledger=caption_ledger)
                     finally:
                         current_ws = None
                 if stopped:

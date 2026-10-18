@@ -112,18 +112,21 @@ def _guard_check(resource_guard):
         resource_guard.check()
 
 
-async def _guarded_send(ws, payload, resource_guard=None, *, before_write=None):
-    _guard_check(resource_guard)
-    if resource_guard is not None:
-        pending = resource_guard.before_send(payload)
-        if inspect.isawaitable(pending):
-            await pending
+async def _guarded_send(ws, payload, resource_guard=None, *, before_write=None, deadline=None):
+    async with asyncio.timeout_at(deadline):
         _guard_check(resource_guard)
-    if before_write is not None and not before_write():
-        return False
-    await ws.send(json.dumps(payload))
-    _guard_check(resource_guard)
-    return True
+        if resource_guard is not None:
+            pending = resource_guard.before_send(payload)
+            if inspect.isawaitable(pending):
+                await pending
+            _guard_check(resource_guard)
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError('Live send admission deadline')
+        if before_write is not None and not before_write():
+            return False
+        await ws.send(json.dumps(payload))
+        _guard_check(resource_guard)
+        return True
 
 
 async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False,
@@ -156,7 +159,7 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
         if not ready_to_write():
             return False
         try:
-            if not await _guarded_send(ws, payload, resource_guard, before_write=ready_to_write):
+            if not await _guarded_send(ws, payload, resource_guard, before_write=ready_to_write, deadline=deadline):
                 return False
             if retries:
                 state['drop_inputs_before'] = round(time.time() * 1000)
@@ -164,6 +167,9 @@ async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state,
                 emit({'type':'resource_budget_ready','input_type':kind,'retries':retries})
             return True
         except Exception as exc:
+            # A deadline may cancel an admission whose authority receipt was
+            # lost after commit. Keep that unknown result distinct from an
+            # earlier definitive budget denial; only the latter permits retry.
             if not (_is_resource_failure(exc) and getattr(exc,'code',None)=='RESOURCE_TOKEN_BUDGET'):
                 raise
             if kind == 'snapshot' and optional:
@@ -466,6 +472,19 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if not ws:
                     emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RESUMPTION_UNAVAILABLE'})
                     continue
+                requested_deadline = message.get('deadline_at_ms')
+                if requested_deadline is not None and (type(requested_deadline) is not int or not 0 < requested_deadline < 2**53):
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_RECONFIGURE_INVALID'})
+                    continue
+                remaining = TRANSITION_DEADLINE_SECONDS if requested_deadline is None else min(
+                    TRANSITION_DEADLINE_SECONDS, max(0, (requested_deadline - round(time.time() * 1000)) / 1000))
+                deadline = loop.time() + remaining
+                if remaining <= 0:
+                    emit({'type':'capability_transition_error','transition_id':transition_id,'capability':capability,'code':'LIVE_CAPABILITY_TIMEOUT'})
+                    state['stopped'] = True
+                    state['stop_event'].set()
+                    await ws.close()
+                    return
                 wait = {'baseline':state['handle_generation'],'router_response_sent':False}
                 state['transition_wait'] = wait
                 state['transition_handle_event'].clear()
@@ -473,10 +492,10 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 state['handle'] = None
                 state['handle_event'].clear()
                 try:
-                    await _guarded_send(ws, {'toolResponse': {'functionResponses': [router_response]}}, resource_guard)
+                    await _guarded_send(ws, {'toolResponse': {'functionResponses': [router_response]}}, resource_guard, deadline=deadline)
                     wait['router_response_sent'] = True
                     emit({'type':'capability_transition_acknowledged','transition_id':transition_id,'capability':capability})
-                    await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=FRESH_HANDLE_WAIT_SECONDS)
+                    await asyncio.wait_for(state['transition_handle_event'].wait(), timeout=min(FRESH_HANDLE_WAIT_SECONDS, max(0, deadline - loop.time())))
                     if wait.get('connection_closed'):
                         raise ConnectionError('router connection closed before fresh checkpoint')
                 except (TimeoutError, ConnectionClosed, ConnectionError) as exc:
@@ -496,7 +515,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     state['context'] = context
                 state['transition'] = {'transition_id':transition_id,'capability':capability,
                                        'continuation':continuation.strip(),
-                                       'deadline':loop.time()+TRANSITION_DEADLINE_SECONDS,
+                                       'deadline':deadline,
                                        'attempts':0}
                 state['transition_started_event'].set()
                 state['drop_inputs_before'] = round(time.time() * 1000)
@@ -609,7 +628,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 async with connect(ENDPOINT + '?key=' + quote(key, safe=''), open_timeout=min(15,remaining), close_timeout=2, max_size=8 * 1024 * 1024) as ws:
                     history = [] if state['handle'] else dialogue.snapshot()
                     setup = setup_config(model, state['context'], history, configuration=configuration, search=search, handle=state['handle'])
-                    await _guarded_send(ws, setup, resource_guard)
+                    await _guarded_send(ws, setup, resource_guard, deadline=transition['deadline'] if transition else None)
                     setup_sent = True
                     remaining = max(.001, transition['deadline']-loop.time()) if transition else 20
                     async with asyncio.timeout(min(20,remaining)):

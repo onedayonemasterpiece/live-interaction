@@ -326,6 +326,82 @@ class CapabilityProvider:
 
 
 class CapabilityHostContract(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_handoff_cancels_provider_and_fences_late_ready_and_output(self):
+        class SlowProvider(CapabilityProvider):
+            def __init__(self):
+                super().__init__()
+                self.cancelled = asyncio.Event()
+                self.transition = None
+
+            async def run(self, *, session, reader, on_event):
+                self.events = on_event
+                self.messages.append(await reader.readline())
+                on_event({"type": "ready", "model": session.model})
+                try:
+                    while True:
+                        line = await reader.readline()
+                        if not line:
+                            return
+                        self.messages.append(line)
+                        message = __import__("json").loads(line)
+                        if message.get("type") == "reconfigure":
+                            self.transition = message
+                except asyncio.CancelledError:
+                    # Callbacks can race cleanup after the old owner expires.
+                    for kind in ("resumed", "capability_ready"):
+                        on_event({"type": kind, "transition_id": self.transition["transition_id"],
+                            "capability": self.transition["capability"]})
+                    on_event({"type": "output_transcript", "text": "late superseded output"})
+                    self.cancelled.set()
+                    raise
+
+        adapter = CapabilityAdapter()
+        provider = SlowProvider()
+        host = LiveSessionHost(adapter_factory=lambda **_kw: adapter,
+            managed_runner=provider.run, ready_timeout_ms=500, reconfigure_timeout_ms=30)
+        actor = {"subject": "a", "tenant_id": "t"}
+        started = await host.start(resource_id="story1", actor=actor)
+        session = host.sessions[started["session_id"]]
+        call = {"name": "activate_capability", "id": "route-timeout",
+            "args": {"capability": "dataset", "intent": "read dataset"}}
+        await host._transition_capability(session, call, await adapter.resolve_capability(session, call))
+        self.assertTrue(provider.cancelled.is_set())
+        self.assertTrue(session.closed)
+        self.assertTrue(session.task.done())
+        self.assertEqual(session.capability, "core")
+        self.assertIsInstance(provider.transition["deadline_at_ms"], int)
+        self.assertIsNone(session.pending_transition)
+        polled = host.events(resource_id="story1", session_id=session.id, actor=actor)
+        self.assertTrue(polled["closed"])
+        self.assertTrue(any(e.get("type") == "error" and e.get("code") == "LIVE_CAPABILITY_TIMEOUT"
+            for e in polled["events"]))
+        self.assertFalse(any(e.get("type") in ("resumed", "capability_ready", "output_transcript")
+            for e in polled["events"]))
+        self.assertFalse(any(item[1] in ("resumed", "capability_ready", "output_transcript")
+            for item in adapter.observed))
+        await host.stop(resource_id="story1", session_id=session.id, actor=actor)
+
+    async def test_explicit_stop_still_drains_accepted_final_transcript(self):
+        class EndingProvider(CapabilityProvider):
+            async def run(self, *, session, reader, on_event):
+                await reader.readline()
+                on_event({"type": "ready", "model": session.model})
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        return
+                    if __import__("json").loads(line).get("type") == "stop":
+                        on_event({"type": "input_transcript", "text": "accepted final words"})
+                        return
+
+        adapter = CapabilityAdapter()
+        host = LiveSessionHost(adapter_factory=lambda **_kw: adapter,
+            managed_runner=EndingProvider().run, ready_timeout_ms=500)
+        actor = {"subject": "a", "tenant_id": "t"}
+        started = await host.start(resource_id="story1", actor=actor)
+        await host.stop(resource_id="story1", session_id=started["session_id"], actor=actor)
+        self.assertIn(("story1", "input_transcript", "accepted final words"), adapter.observed)
+
     async def test_capability_router_waits_for_audio_end_at_provider(self):
         provider = CapabilityProvider()
         host = LiveSessionHost(

@@ -302,7 +302,13 @@ then resumes the same model/key/session with the new bundle. If Gemini does not 
 must not send a duplicate FunctionResponse. Transition failure is emitted as
 structured transition/tool metadata and closes the provider session so a late
 ready cannot change the active allowlist; it is never silently converted into a
-successful fresh conversation. `onEvent(session,event)` is a trusted optional
+successful fresh conversation. The Python host passes its single existing
+reconfigure deadline as `deadline_at_ms`; acknowledgement, fresh checkpoint and
+target setup admission all share that deadline. Expiry cancels the same provider
+runner and fences late callbacks before adapter side effects. Terminal events
+remain readable by HTTP polling until Stop/reclaim; restarting Live is explicit
+and does not replay a mutation. Normal explicit Stop still drains accepted final
+transcripts. `onEvent(session,event)` is a trusted optional
 adapter observer invoked when an event is emitted, even without browser polling;
 do not persist raw conversation text, media, handles or tool arguments from it.
 
@@ -440,3 +446,10 @@ must preserve these fields in their `error` or FastAPI `detail` envelope. A
 `RESOURCE_*` refusal is not provider unavailability. Resource admission during
 ticket renewal is terminal and is not retried as a transport failure. None of
 these paths change quota accounting, switch provider/key or replay speech/tools.
+
+## Native 0.4.0-rc.2 candidate
+
+The Python capability handoff uses one host-owned absolute deadline. Optional
+native captions require accepted-audio provenance and an explicitly verified
+provider offset clock; consumers must not infer ownership from event arrival
+order. See [the candidate contract and acceptance requirements](native-voice-rc2-20261018.md).

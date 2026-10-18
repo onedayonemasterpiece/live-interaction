@@ -77,6 +77,7 @@ class _Session:
     events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=320))
     next_seq: int = 1
     closed: bool = False
+    provider_events_fenced: bool = False
     stop_reason: LiveStopReason | None = None
     cancelled: set[str] = field(default_factory=set)
     tool_results: dict[str, Any] = field(default_factory=dict)
@@ -96,6 +97,7 @@ class _Session:
     configuration_digest: str = ""
     pending_transition_id: str | None = None
     pending_transition: asyncio.Future | None = None
+    pending_transition_deadline_ms: int | None = None
     manual_activity_detection: bool = False
     activity_open: bool = False
     audio_turn_generation: int = 0
@@ -341,7 +343,15 @@ class LiveSessionHost:
                 raise LiveError("LIVE_UNAVAILABLE", "application_google_binding_missing")
 
         def on_event(event: dict[str, Any]) -> None:
+            if session.provider_events_fenced or self.sessions.get(session.id) is not session:
+                return
             kind = event.get("type")
+            if kind in ("capability_ready", "resumed") and event.get("transition_id"):
+                if (session.pending_transition_id != event.get("transition_id")
+                        or session.pending_transition is None or session.pending_transition.done()
+                        or session.pending_transition_deadline_ms is None
+                        or _now_ms() >= session.pending_transition_deadline_ms):
+                    return
             if hasattr(self.adapter, "on_event"):
                 observed = self.adapter.on_event(session, event)
                 if inspect.isawaitable(observed):
@@ -468,6 +478,7 @@ class LiveSessionHost:
                     )
                 session.pending_transition = None
                 session.pending_transition_id = None
+                session.pending_transition_deadline_ms = None
                 if session.ready and not session.ready.done():
                     session.ready.set_exception(
                         LiveError("LIVE_PROVIDER_CLOSED", "Live provider closed during setup")
@@ -621,6 +632,8 @@ class LiveSessionHost:
         future = loop.create_future()
         session.pending_transition_id = transition_id
         session.pending_transition = future
+        deadline_ms = _now_ms() + self.reconfigure_timeout_ms
+        session.pending_transition_deadline_ms = deadline_ms
         self._emit(
             session,
             {
@@ -646,6 +659,7 @@ class LiveSessionHost:
                 {
                     "type": "reconfigure",
                     "transition_id": transition_id,
+                    "deadline_at_ms": deadline_ms,
                     "capability": resolved["capability"],
                     "configuration": resolved["configuration"],
                     "context": resolved.get("context") or {},
@@ -659,7 +673,9 @@ class LiveSessionHost:
                     },
                 },
             )
-            await asyncio.wait_for(asyncio.shield(future), timeout=self.reconfigure_timeout_ms / 1000)
+            await asyncio.wait_for(asyncio.shield(future), timeout=max(0, (deadline_ms - _now_ms()) / 1000))
+            if session.closed or _now_ms() >= deadline_ms:
+                raise LiveError("LIVE_CAPABILITY_TIMEOUT", "Capability transition deadline expired")
             session.capability = resolved["capability"]
             session.configuration_digest = resolved["configuration_digest"]
             session.non_blocking_tools = _non_blocking_tools(resolved["configuration"])
@@ -681,7 +697,7 @@ class LiveSessionHost:
                 "capability": session.capability,
             })
         except Exception as exc:
-            code = getattr(exc, "code", "LIVE_CAPABILITY_ERROR")
+            code = "LIVE_CAPABILITY_TIMEOUT" if isinstance(exc, TimeoutError) else getattr(exc, "code", "LIVE_CAPABILITY_ERROR")
             self._emit(session, {
                 "type": "capability_transition_failed",
                 "transition_id": transition_id,
@@ -696,10 +712,26 @@ class LiveSessionHost:
                 "status": "error",
                 "code": code,
             })
+            # The provider may already have changed tools. A failed handoff
+            # cannot leave its new socket paired with the host's old allowlist.
+            # Fence immediately, cancel the same runner (and its lease cleanup),
+            # and retain terminal events for polling consumers until normal Stop.
+            if not session.closed:
+                self._emit(session, {"type": "error", "code": code,
+                    "message": "Capability transition failed; restart Live explicitly"})
+                session.provider_events_fenced = True
+                session.closed = True
+                self._cancel_tool_progress(session)
+                if not future.done():
+                    future.cancel()
+                if session.task and not session.task.done():
+                    session.task.cancel()
+                    await asyncio.gather(session.task, return_exceptions=True)
         finally:
             if session.pending_transition_id == transition_id:
                 session.pending_transition_id = None
                 session.pending_transition = None
+                session.pending_transition_deadline_ms = None
 
     async def _handle_tool_calls(
         self, session: _Session, calls: list[dict[str, Any]], *, feedback_generation: int | None = None,
@@ -1024,6 +1056,7 @@ class LiveSessionHost:
             )
         session.pending_transition = None
         session.pending_transition_id = None
+        session.pending_transition_deadline_ms = None
         current = asyncio.current_task()
         if session.watchdog_task and session.watchdog_task is not current and not session.watchdog_task.done():
             session.watchdog_task.cancel()
