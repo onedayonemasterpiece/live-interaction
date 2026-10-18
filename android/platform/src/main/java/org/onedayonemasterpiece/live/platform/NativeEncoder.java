@@ -31,10 +31,10 @@ final class NativeEncoder implements AutoCloseable {
     private CodecEpoch epoch;
     private CompressedAudio.OggMux ogg;
     private CodecTimeline timeline;
-    private Packet pending;
+    private Packet pending, terminalPending;
     private byte[] prefix = new byte[0];
-    private long capturedSamples, validSamples, chunkSeq, lastPts = Long.MIN_VALUE;
-    private boolean eos, closed, activeInput, activePublished, waitForQuiet;
+    private long capturedSamples, submittedSamples, validSamples, chunkSeq, lastPts = Long.MIN_VALUE;
+    private boolean eos, closed, finishing, terminalPublished, activeInput, activePublished, waitForQuiet;
     private double noise = 100;
     private long quietSamples;
     private MediaFormat outputFormat;
@@ -95,25 +95,52 @@ final class NativeEncoder implements AutoCloseable {
             if (b == null || b.capacity() < 2) throw CompressedAudio.invalid("INPUT_BUFFER");
             b.clear(); b.order(ByteOrder.LITTLE_ENDIAN); int n = Math.min(count - offset, b.remaining() / 2);
             for (int i = 0; i < n; i++) b.putShort(pcm[offset + i]);
-            long pts = samplesUs(capturedSamples);
+            long pts = samplesUs(submittedSamples);
             capturedSamples += n;
+            submittedSamples += n;
             codec.queueInputBuffer(index, 0, n * 2, pts, 0); offset += n; drain(false);
         }
     }
     void finish() throws IOException {
         if (closed || eos) return;
-        long deadline = System.nanoTime() + 2000000000L; boolean submitted = false;
+        // An empty captured source has no original span and must never gain a
+        // synthetic terminal frame from codec-only padding.
+        if (capturedSamples == 0) throw CompressedAudio.invalid("EMPTY_SOURCE");
+        // Encoder delay plus a partial final AudioRecord read can leave the last
+        // original samples unrepresented at EOS. Queue codec-only silence, never
+        // count it as captured or persist it as an original source sample.
+        finishing = true;
+        long deadline = System.nanoTime() + 3500000000L;
+        // Bounded padding covers the largest supported encoder delay AND a
+        // complete codec packet even when the last AudioRecord read is partial.
+        int pad = OPUS_PROFILE.equals(choice.profile()) ? 11520 : choice.rate() * 16 / 100 + 1024;
+        while (pad > 0 && System.nanoTime() < deadline) {
+            int index = codec.dequeueInputBuffer(10000);
+            if (index < 0) { drain(true); continue; }
+            ByteBuffer b = codec.getInputBuffer(index);
+            if (b == null || b.capacity() < 2) throw CompressedAudio.invalid("INPUT_BUFFER");
+            b.clear(); b.order(ByteOrder.LITTLE_ENDIAN);
+            int n = Math.min(pad, b.remaining() / 2);
+            for (int i = 0; i < n; i++) b.putShort((short) 0);
+            codec.queueInputBuffer(index, 0, n * 2, samplesUs(submittedSamples), 0);
+            submittedSamples += n; pad -= n;
+            drain(false);
+        }
+        if (pad > 0) throw CompressedAudio.invalid("ENCODER_PADDING_TIMEOUT");
+        boolean submitted = false;
         while (!eos && System.nanoTime() < deadline) {
             if (!submitted) {
                 int index = codec.dequeueInputBuffer(10000);
                 if (index >= 0) {
-                    codec.queueInputBuffer(index, 0, 0, samplesUs(capturedSamples), MediaCodec.BUFFER_FLAG_END_OF_STREAM); submitted = true;
+                    codec.queueInputBuffer(index, 0, 0, samplesUs(submittedSamples), MediaCodec.BUFFER_FLAG_END_OF_STREAM); submitted = true;
                 }
             }
             drain(true);
         }
         if (!eos) throw CompressedAudio.invalid("ENCODER_EOS_TIMEOUT");
-        if (capturedSamples > 0 && (epoch == null || validSamples != capturedSamples)) throw CompressedAudio.invalid("CAPTURE_SPAN_MISMATCH");
+        if (capturedSamples > 0 && (epoch == null || validSamples < capturedSamples))
+            throw CompressedAudio.invalid("ENCODER_TAIL_SHORT");
+        if (validSamples > capturedSamples) throw CompressedAudio.invalid("ENCODER_TAIL_OVERRUN");
     }
     private void drain(boolean waiting) throws IOException {
         while (!eos) {
@@ -138,14 +165,25 @@ final class NativeEncoder implements AutoCloseable {
                 if (epoch == null) throw CompressedAudio.invalid("DELAY_METADATA_UNAVAILABLE");
                 if (lastPts != Long.MIN_VALUE && pts < lastPts) throw CompressedAudio.invalid("OUTPUT_TIMESTAMP");
                 lastPts = pts;
-                if (pending != null) emit(pending, false);
+                if (pending != null && terminalPending == null) {
+                    // A covering packet is retained, not persisted: codec-only
+                    // padding must complete successfully through actual EOS before
+                    // the terminal frame can become durable and wire-visible.
+                    if (finishing && timeline.covers(pending.samples(), capturedSamples))
+                        terminalPending = pending;
+                    else emit(pending, false);
+                }
                 int samples = OPUS_PROFILE.equals(choice.profile()) ? CompressedAudio.opusSamples(data) : 1024;
-                pending = new Packet(data, samples, pts);
+                pending = terminalPending == null ? new Packet(data, samples, pts) : null;
             }
             if ((flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                 eos = true;
-                if (pending != null) { emit(pending, true); pending = null; }
-                else if (capturedSamples > 0) throw CompressedAudio.invalid("EMPTY_EOS");
+                Packet lastOriginal = terminalPending != null ? terminalPending : pending;
+                if (lastOriginal == null) throw CompressedAudio.invalid("EMPTY_EOS");
+                if (!timeline.covers(lastOriginal.samples(), capturedSamples))
+                    throw CompressedAudio.invalid("ENCODER_TAIL_SHORT");
+                emit(lastOriginal, true); // no terminal write before actual codec EOS
+                terminalPending = pending = null; terminalPublished = true;
             }
         }
     }

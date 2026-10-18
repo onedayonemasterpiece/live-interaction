@@ -43,4 +43,17 @@ final class OutputResumeQueue {
         }
     }
     synchronized String selected() { return selected; }
+
+    /** An output finished during a network outage still owes its played cursor.
+     * Emit positions on every new transport, never re-enqueue already heard audio.
+     * IDs are scoped to this native Run; server receipts remain monotone/idempotent.
+     */
+    static Map<String, Long> completedPlayheads(Set<String> completed, Map<String, Long> playedUs) {
+        Map<String, Long> result = new LinkedHashMap<>();
+        for (String sourceId : completed) {
+            Long position = playedUs.get(sourceId);
+            if (position != null && position > 0) result.put(sourceId, position / 1000);
+        }
+        return result;
+    }
 }

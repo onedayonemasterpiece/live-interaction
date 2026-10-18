@@ -115,6 +115,65 @@ public class CompressedAudioTest {
         assertEquals(4000, tail.durationUs()); assertEquals(960, tail.endTrimSamples());
         assertEquals(4096, timeline.validSamples());
     }
+    @Test public void finalCodecPaddingIsTrimmedAtTheFirstPacketCoveringOriginalAudio() {
+        // Includes partial reads, an exact frame boundary and a 60-second source.
+        for (int[] format : new int[][] {{48000, 312, 960}, {16000, 2112, 1024}}) {
+            int rate = format[0], delay = format[1], packet = format[2];
+            for (long captured : new long[] {1, 311, 312, 313, 647, 648, 649, 959, 960,
+                    packet * 8L, packet * 8L + 649, rate * 60L + 311}) {
+                CodecTimeline timeline = new CodecTimeline(rate, delay);
+                long previousGranule = 0;
+                boolean completed = false;
+                for (int i = 0; i < (captured + delay) / packet + 4; i++) {
+                    boolean finalPacket = timeline.covers(packet, captured);
+                    CodecTimeline.Span span = timeline.advance(packet, captured, finalPacket);
+                    assertTrue("monotone sample clock", span.granule() >= previousGranule);
+                    previousGranule = span.granule();
+                    if (finalPacket) {
+                        assertEquals("exact original sample count", captured, timeline.validSamples());
+                        assertEquals("original plus immutable encoder delay", captured + delay, span.granule());
+                        assertTrue("codec-only samples trimmed", span.endTrimSamples() >= 0);
+                        assertTrue("terminal trim cannot exceed frame", span.endTrimSamples() < packet);
+                        completed = true;
+                        break;
+                    }
+                    assertTrue("never claim unrecorded samples", timeline.validSamples() < captured);
+                }
+                assertTrue("padded packet must cover original", completed);
+            }
+        }
+    }
+    @Test public void terminalPacketOnlyAfterFullOriginalCoverage() {
+        for (int[] format : new int[][] {{48000, 312, 960}, {16000, 2112, 1024}}) {
+            int rate = format[0], delay = format[1], packet = format[2];
+            int padding = rate == 48000 ? 11520 : rate * 16 / 100 + 1024;
+            assertTrue("padding covers maximal delay and a packet", padding >= delay + packet - 1);
+            for (long captured : new long[] {1, packet - 1L, packet, packet + 1L, rate * 60L + 1}) {
+                CodecTimeline timeline = new CodecTimeline(rate, delay);
+                long coded = 0;
+                // The codec-only region must not advance the original sample count.
+                long inputCount = captured + padding;
+                while (!timeline.covers(packet, captured)) {
+                    assertTrue("encoded samples bounded by submitted audio", coded < inputCount);
+                    timeline.advance(packet, captured, false);
+                    coded += packet;
+                }
+                CodecTimeline.Span last = timeline.advance(packet, captured, true);
+                assertEquals(captured, timeline.validSamples());
+                assertEquals(captured + delay, last.granule());
+                assertTrue(last.durationUs() > 0);
+            }
+        }
+    }
+    @Test public void aheadAndRegressionAreDistinctFromAnUnderproducedTail() {
+        CodecTimeline ahead = new CodecTimeline(48000, 312);
+        assertEquals("LIVE_CODEC_TIMELINE_AHEAD", assertThrows(IllegalArgumentException.class,
+                () -> ahead.advance(960, 100, false)).getMessage());
+        CodecTimeline past = new CodecTimeline(48000, 0);
+        past.advance(960, 960, false);
+        assertEquals("LIVE_CODEC_TIMELINE_REGRESS", assertThrows(IllegalArgumentException.class,
+                () -> past.advance(960, 0, true)).getMessage());
+    }
     @Test public void nonterminalPaddingOrReorderedCaptureIsAnError() {
         CodecTimeline timeline = new CodecTimeline(48000, 312);
         assertThrows(IllegalArgumentException.class, () -> timeline.advance(960, 100, false));
