@@ -44,6 +44,7 @@ final class NativePlayer implements AutoCloseable {
     private String trackResponse;
     private long trackOriginUs, writtenSamples, lastHead, headWrap, lastReportMs;
     private int trackRate;
+    private boolean trackStarted; // guarded by hardware: queued PCM is not yet physically playing
     private long queuedDuration;
     private int queuedBytes, queuedItems;
     private Decoder decoder;
@@ -107,7 +108,7 @@ final class NativePlayer implements AutoCloseable {
     void reportPosition() {
         String response; long position; boolean pending;
         synchronized (hardware) {
-            if (track == null) return;
+            if (track == null || !trackStarted) return; // Never mark prefilling PCM as played.
             try {
                 long head = track.getPlaybackHeadPosition() & 0xffffffffL;
                 if (head < lastHead) headWrap += 1L << 32;
@@ -191,6 +192,11 @@ final class NativePlayer implements AutoCloseable {
         listener.completed(item.response(), complete);
     }
     private void awaitPlayed(long expectedVersion) throws InterruptedException {
+        // Very short replies never reach the 200-ms startup threshold. Their
+        // terminal decoder event still starts precisely the PCM already queued.
+        AudioTrack pending;
+        synchronized (hardware) { pending = track; }
+        if (pending != null) startBufferedTrack(pending, expectedVersion, true);
         long deadline = System.nanoTime() + 35000000000L;
         while (!closed && expectedVersion == version.get()) {
             reportPosition();
@@ -215,30 +221,56 @@ final class NativePlayer implements AutoCloseable {
             AudioTrack created = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(minimum, rate * 2 / 5)).build();
+                .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(minimum, rate * 4 / 5)).build(); // >=400 ms
             synchronized (hardware) {
                 if (closed || expectedVersion != version.get()) { created.release(); return; }
                 track = selected = created; trackResponse = response; trackOriginUs = startUs + skip * 1000000L / rate;
-                trackRate = rate; writtenSamples = lastHead = headWrap = 0; created.play();
+                trackRate = rate; writtenSamples = lastHead = headWrap = 0; trackStarted = false;
             }
-            setPlaying(true); listener.timing("audio_scheduled");
+            // Do not call play() on an empty AudioTrack. Queue 200 ms first;
+            // the output device can otherwise underrun before codec data arrives.
         }
         while (offset < pcm.length && !closed && expectedVersion == version.get()) {
+            int writeBytes;
+            synchronized (hardware) {
+                if (track != selected) return;
+                writeBytes = trackStarted ? pcm.length - offset :
+                    PlaybackStartupPolicy.nextWriteBytes(rate, writtenSamples, pcm.length - offset);
+            }
             int count;
-            try { count = selected.write(pcm, offset, pcm.length - offset, AudioTrack.WRITE_BLOCKING); }
+            try { count = selected.write(pcm, offset, writeBytes, AudioTrack.WRITE_BLOCKING); }
             catch (IllegalStateException error) { if (closed || expectedVersion != version.get()) return; throw error; }
             if (count <= 0 || count % 2 != 0) {
                 if (closed || expectedVersion != version.get()) return;
                 throw CompressedAudio.invalid("OUTPUT_WRITE");
             }
             offset += count;
-            synchronized (hardware) { if (track == selected) writtenSamples += count / 2; }
+            synchronized (hardware) {
+                if (track != selected) return;
+                writtenSamples += count / 2;
+            }
+            startBufferedTrack(selected, expectedVersion, false);
             reportPosition();
+        }
+    }
+    private void startBufferedTrack(AudioTrack selected, long expectedVersion, boolean finalAudio) {
+        boolean started = false;
+        synchronized (hardware) {
+            if (track == selected && !trackStarted && !closed && expectedVersion == version.get()
+                    && PlaybackStartupPolicy.canStart(trackRate, writtenSamples, finalAudio)) {
+                selected.play();
+                trackStarted = true;
+                started = true;
+            }
+        }
+        if (started && !closed && expectedVersion == version.get()) {
+            setPlaying(true);
+            listener.timing("audio_scheduled");
         }
     }
     private void releaseTrack() {
         AudioTrack selected;
-        synchronized (hardware) { selected = track; track = null; }
+        synchronized (hardware) { selected = track; track = null; trackStarted = false; }
         if (selected != null) {
             try { selected.pause(); } catch (RuntimeException ignored) { }
             try { selected.flush(); } catch (RuntimeException ignored) { }
