@@ -224,7 +224,11 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed[-1][0], 1000)
         self.assertEqual(self.host.size(), 0)
 
-    async def test_relay_output_overflow_fails_instead_of_dropping_audio(self):
+    async def hello(self, inbound, generation=1, cursor=0):
+        await inbound.put(json.dumps({"type": "hello", "protocol": SOCKET_PROTOCOL,
+            "attempt_id": "attempt_test", "connection_generation": generation, "cursor": cursor}))
+
+    async def test_relay_output_overflow_detaches_socket_but_keeps_session(self):
         binding = self.open()
         inbound = asyncio.Queue()
         sent, closed = [], []
@@ -233,13 +237,197 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         async def close(code, reason):
             closed.append((code, reason))
         task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close, max_output_bytes=1024))
-        await inbound.put(json.dumps({"type": "hello", "protocol": SOCKET_PROTOCOL,
-            "attempt_id": "attempt_test", "connection_generation": 1, "cursor": 0}))
+        await self.hello(inbound)
         await settle(lambda: sent)
         self.provider.events({"type": "audio", "data": base64.b64encode(b"\0" * 2048).decode(), "mime_type": "audio/pcm;rate=24000"})
         await asyncio.wait_for(task, 2)
         self.assertEqual(closed[-1][1], "LIVE_SOCKET_EGRESS_BACKPRESSURE")
+        # Slow downlink is a transport condition: the logical conversation survives.
+        self.assertEqual(self.host.size(), 1)
+        self.assertFalse(self.session.closed)
+        self.assertTrue(any(r["event"] == "socket_detached" for r in self.records))
+        # Reattach replays text state but never the stale oversized audio.
+        sent2, closed2 = [], []
+        async def send2(frame):
+            sent2.append(frame)
+        async def close2(code, reason):
+            closed2.append((code, reason))
+        inbound2 = asyncio.Queue()
+        task2 = asyncio.create_task(serve_socket(self.open(self.renew()), receive=inbound2.get, send=send2, close=close2, max_output_bytes=1024))
+        await self.hello(inbound2, generation=2)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_STALE_OUTPUT_SKIPPED" for x in sent2))
+        self.assertFalse(any(isinstance(x, bytes) for x in sent2))
+        await inbound2.put('{"type":"stop"}')
+        await asyncio.wait_for(task2, 2)
         self.assertEqual(self.host.size(), 0)
+
+    async def test_last_frame_ack_send_failure_detaches_and_fences_without_further_input(self):
+        binding = self.open()
+        inbound = asyncio.Queue()
+        closed = []
+        async def send(frame):
+            if isinstance(frame, str) and json.loads(frame).get("type") == "audio_ack":
+                raise ConnectionResetError("client went away mid-ack")
+        async def close(code, reason):
+            closed.append((code, reason))
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound)
+        await settle(lambda: binding.connected)
+        await inbound.put(json.dumps({"type": "input", "message": {"activity_start": True}}))
+        frame = struct.pack("!III", 0x574C4131, 1, 10) + b"\0\0" * 160
+        await inbound.put(frame)
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(closed[-1], (1011, "LIVE_SOCKET_IO"))
+        self.assertEqual(self.host.size(), 1)
+        # The open speech turn is still fenced: reconnect cannot make it clean.
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+
+    async def test_hello_timeout_is_transient(self):
+        binding = self.open()
+        closed = []
+        async def never():
+            await asyncio.sleep(10)
+        async def send(frame):
+            pass
+        async def close(code, reason):
+            closed.append((code, reason))
+        await asyncio.wait_for(serve_socket(binding, receive=never, send=send, close=close, hello_timeout=0.05), 2)
+        self.assertEqual(closed[-1], (1011, "LIVE_SOCKET_IO"))
+        self.assertEqual(self.host.size(), 1)
+        self.open(self.renew())
+
+    async def test_reattach_with_trimmed_event_ring_reports_gap_and_continues(self):
+        for index in range(400):
+            self.host._emit(self.session, {"type": "output_transcript", "text": f"t{index}"})
+        binding = self.open()
+        inbound = asyncio.Queue()
+        sent = []
+        async def send(frame):
+            sent.append(frame)
+        async def close(code, reason):
+            pass
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound, cursor=1)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_EVENT_GAP" for x in sent))
+        ack = next(json.loads(x) for x in sent if isinstance(x, str) and json.loads(x).get("type") == "hello_ack")
+        self.assertTrue(ack["event_gap"])
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_provider_drop_during_open_turn_blocks_mutations(self):
+        await self.host.input(session_id=self.sid, resource_id="story1", actor=self.actor,
+                              message={"activity_start": True})
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio"})
+        await settle(lambda: self.host._socket_states[self.sid].damaged)
+        self.assertTrue(any(r["event"] == "provider_input_dropped" for r in self.records))
+
+    async def admit_turn(self):
+        for message in ({"activity_start": True}, {"audio_base64": "AAAA"}, {"activity_end": True}):
+            await self.host.input(session_id=self.sid, resource_id="story1", actor=self.actor, message=message)
+        return self.session.audio_turn_generation
+
+    async def test_late_provider_loss_fences_already_enqueued_boundary_and_tool(self):
+        generation = await self.admit_turn()
+        self.assertFalse(self.session.activity_open)
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": generation})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 1, "audio_turn_generation": generation})
+        self.provider.events({"type": "tool_call", "calls": [{"name": "story.write", "id": "lost", "args": {}}]})
+        await settle(lambda: any(e.get("type") == "tool_result" for e in self.session.events))
+        self.assertEqual(self.adapter.called, [])
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+        later = await self.admit_turn()
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": later})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+
+    async def test_missing_end_ack_does_not_shift_later_clean_turn_receipt(self):
+        lost = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "activity_end",
+                              "audio_turn_generation": lost})
+        later = await self.admit_turn()
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": later})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+        self.assertEqual(self.session.audio_end_sent_generation, later)
+        self.assertEqual(list(self.session.audio_end_awaiting_ack), [])
+
+    async def test_old_clean_ack_cannot_clear_later_damaged_turn(self):
+        first = await self.admit_turn()
+        second = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": second})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 1, "audio_turn_generation": first})
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+
+    async def test_late_loss_does_not_damage_a_subsequent_clean_turn(self):
+        first = await self.admit_turn()
+        second = await self.admit_turn()
+        self.provider.events({"type": "input_dropped", "reason": "provider_reconnect", "input_type": "audio",
+                              "audio_turn_generation": first})
+        self.provider.events({"type": "input_timing", "activity_end_sent_at": 2, "audio_turn_generation": second})
+        self.assertFalse(self.host._socket_states[self.sid].damaged)
+
+    async def test_stale_audio_loss_is_fenced_for_transition_and_budget_wait_too(self):
+        for reason in ("capability_transition", "resource_budget"):
+            generation = await self.admit_turn()
+            self.provider.events({"type": "input_dropped", "reason": reason, "input_type": "audio",
+                                  "audio_turn_generation": generation})
+            self.provider.events({"type": "input_timing", "activity_end_sent_at": 1,
+                                  "audio_turn_generation": generation})
+            self.assertTrue(self.host._socket_states[self.sid].damaged, reason)
+            clean = await self.admit_turn()
+            self.provider.events({"type": "input_timing", "activity_end_sent_at": 2,
+                                  "audio_turn_generation": clean})
+            self.assertFalse(self.host._socket_states[self.sid].damaged, reason)
+
+    async def reattach(self, generation, cursor=0):
+        sent = []
+        async def send(frame):
+            sent.append(frame)
+        async def close(code, reason):
+            pass
+        inbound = asyncio.Queue()
+        task = asyncio.create_task(serve_socket(self.open(self.renew()), receive=inbound.get, send=send, close=close))
+        await self.hello(inbound, generation=generation, cursor=cursor)
+        await settle(lambda: any(isinstance(x, str) and json.loads(x).get("type") == "hello_ack" for x in sent))
+        await asyncio.sleep(0.02)
+        return task, inbound, sent
+
+    async def test_small_audio_of_finished_response_is_never_replayed_after_reattach(self):
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\1\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        self.provider.events({"type": "turn_complete"})
+        task, inbound, sent = await self.reattach(generation=2)
+        self.assertFalse(any(isinstance(x, bytes) for x in sent))
+        self.assertTrue(any(isinstance(x, str) and json.loads(x).get("code") == "LIVE_SOCKET_STALE_OUTPUT_SKIPPED" for x in sent))
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_audio_of_still_open_response_is_delivered_after_reattach(self):
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\1\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        self.provider.events({"type": "turn_complete"})
+        self.provider.events({"type": "audio", "data": base64.b64encode(b"\2\0" * 4).decode(), "mime_type": "audio/pcm;rate=24000"})
+        task, inbound, sent = await self.reattach(generation=2)
+        audio = [x for x in sent if isinstance(x, bytes)]
+        self.assertEqual([x[12:] for x in audio], [b"\2\0" * 4])
+        await inbound.put('{"type":"stop"}')
+        await asyncio.wait_for(task, 2)
+
+    async def test_eof_right_after_last_frame_fences_open_turn(self):
+        binding = self.open()
+        inbound = asyncio.Queue()
+        async def send(frame):
+            pass
+        async def close(code, reason):
+            pass
+        task = asyncio.create_task(serve_socket(binding, receive=inbound.get, send=send, close=close))
+        await self.hello(inbound)
+        await settle(lambda: binding.connected)
+        await inbound.put(json.dumps({"type": "input", "message": {"activity_start": True}}))
+        await inbound.put(struct.pack("!III", 0x574C4131, 1, 10) + b"\0\0" * 160)
+        await inbound.put(None)  # client vanished after its last frame, no further input
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(self.host.size(), 1)
+        self.assertTrue(self.host._socket_states[self.sid].damaged)
+        self.assertTrue(any(r["event"] == "socket_gap" and r.get("audio_turn_open") for r in self.records))
 
     async def test_wrong_hello_and_json_audio_are_rejected_without_provider_input(self):
         for bad in ({"type": "hello", "protocol": "other"}, {"type": "hello", "protocol": SOCKET_PROTOCOL,
@@ -285,3 +473,4 @@ class SocketWireContract(unittest.TestCase):
         self.assertTrue(same_origin("https://example.test", "example.test"))
         for origin in (None, "https://evil.test", "https://example.test.evil", "https://user@example.test", "https://example.test?token=x"):
             self.assertFalse(same_origin(origin, "example.test"))
+

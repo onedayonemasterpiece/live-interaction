@@ -4,9 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "live-interaction"
-version = "0.3.28"
+version = "0.4.0-rc.3"
 requires-python = ">=3.11"
 dependencies = ["websockets>=15,<17"]
+
+[project.optional-dependencies]
+audio = ["av==18.1.0"]
 
 [tool.setuptools.packages.find]
 where = ["python"]

@@ -6,6 +6,7 @@ from live_interaction.provider import (
     DialogueHistory,
     _guarded_recv,
     _guarded_send,
+    _AdmissionOutcomeUnknown,
     _send_with_budget_wait,
     _is_resource_failure,
     handle_server_message,
@@ -256,6 +257,143 @@ class _FakeSocket:
         self.incoming.put_nowait(self._CLOSED)
 
 class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
+    async def test_history_budget_wait_does_not_resend_accepted_setup(self):
+        for outcome in ('recovered', 'expired', 'stop'):
+            with self.subTest(outcome=outcome):
+                reader=_QueueReader()
+                reader.feed({'type':'start','model':'gemini-3.8-live',
+                    'history':[{'role':'user','text':'preserve the current selection'}],
+                    'configuration':{'system_instruction':'core','functions':[{'name':'activate_capability'}]}})
+                class ClosingAfterAck(_FakeSocket):
+                    async def send(self,payload):
+                        await super().send(payload)
+                        if 'toolResponse' in json.loads(payload):
+                            self.incoming.put_nowait(self._CLOSED)
+                class BudgetFailure(_ResourceFailure):
+                    code='RESOURCE_TOKEN_BUDGET'
+                    retry_after_ms=3000 if outcome=='stop' else 1
+                class Guard(_Guard):
+                    setups=0
+                    history_attempts=0
+                    async def before_send(self,payload):
+                        if 'setup' in payload:
+                            self.setups+=1
+                        elif self.setups==2 and 'clientContent' in payload and 'LIVE_CONTINUATION' not in str(payload):
+                            self.history_attempts+=1
+                            if outcome!='recovered' or self.history_attempts==1:
+                                raise BudgetFailure('history not admitted')
+                        self.payloads.append(payload)
+                guard=Guard()
+                first=ClosingAfterAck([{'setupComplete':{}}])
+                second=_FakeSocket([{'setupComplete':{}}])
+                sockets=[first,second]
+                events=[]
+                with patch('websockets.connect',side_effect=lambda *_a,**_k:sockets.pop(0)), \
+                     patch('live_interaction.provider.FRESH_HANDLE_WAIT_SECONDS',.001), \
+                     patch('live_interaction.provider.TRANSITION_DEADLINE_SECONDS',.2):
+                    task=asyncio.create_task(run(reader=reader,on_event=events.append,resource_guard=guard))
+                    for _ in range(100):
+                        if any(e.get('type')=='ready' for e in events):break
+                        await asyncio.sleep(.001)
+                    reader.feed({'type':'reconfigure','transition_id':'history-budget','capability':'editor',
+                        'configuration':{'system_instruction':'edit','functions':[{'name':'select_facts'}]},
+                        'continuation':'change only the selection',
+                        'router_response':{'name':'activate_capability','id':'route',
+                            'response':{'result':{'accepted':True}},'scheduling':'SILENT','willContinue':False}})
+                    for _ in range(300):
+                        if any(e.get('type')=='resource_budget_wait' and e.get('input_type')=='history_restore' for e in events):break
+                        await asyncio.sleep(.001)
+                    self.assertTrue(any(e.get('input_type')=='history_restore' for e in events))
+                    if outcome=='expired':
+                        with self.assertRaises(BudgetFailure):
+                            await asyncio.wait_for(task,1)
+                    else:
+                        if outcome=='recovered':
+                            for _ in range(300):
+                                if any(e.get('type')=='capability_continuation_sent' for e in events):break
+                                await asyncio.sleep(.001)
+                            self.assertTrue(any(e.get('type')=='capability_continuation_sent' for e in events))
+                            self.assertEqual(len([p for p in second.sent if 'clientContent' in p]),2)
+                        reader.feed({'type':'stop'})
+                        # Stop interrupts even a requested three-second wait.
+                        await asyncio.wait_for(task,.5)
+                    self.assertEqual(guard.setups,2)  # Initial + target setup, once each.
+                    self.assertEqual(len([p for p in second.sent if 'setup' in p]),1)
+                    self.assertEqual(len(sockets),0)
+                    self.assertFalse(any(e.get('input_type')=='setup' for e in events))
+                    if outcome!='recovered':
+                        self.assertFalse(any('clientContent' in p for p in second.sent))
+
+    async def test_budget_wait_does_not_retry_unknown_socket_send(self):
+        class BrokenSocket(_Ws):
+            async def send(self,payload):
+                await super().send(payload)
+                raise ConnectionError('unknown send result')
+        socket=BrokenSocket()
+        guard=_Guard()
+        with self.assertRaises(ConnectionError):
+            await _send_with_budget_wait(socket,{'clientContent':{'turns':[]}},guard,
+                lambda _event:None,'history_restore',{'ws':None,'stopped':False},
+                connection_is_current=lambda:True)
+        self.assertEqual(len(socket.sent),1)
+        self.assertEqual(len(guard.payloads),1)
+
+    async def test_history_checks_stop_and_deadline_after_in_flight_admission(self):
+        for outcome in ('stop', 'expired'):
+            with self.subTest(outcome=outcome):
+                socket=_Ws()
+                state={'ws':None,'stopped':False}
+                class Guard(_Guard):
+                    async def before_send(self,payload):
+                        if outcome=='stop':
+                            state['stopped']=True
+                        else:
+                            await asyncio.sleep(.02)
+                        self.payloads.append(payload)
+                guard=Guard()
+                call=_send_with_budget_wait(socket,{'clientContent':{'turns':[]}},guard,
+                    lambda _event:None,'history_restore',state,connection_is_current=lambda:True,
+                    deadline_at=asyncio.get_running_loop().time()+.01)
+                if outcome=='stop':
+                    self.assertFalse(await call)
+                else:
+                    with self.assertRaises(TimeoutError):
+                        await call
+                self.assertEqual(socket.sent,[])
+                # An expired in-flight admission is cancelled before completion.
+                self.assertEqual(len(guard.payloads), 1 if outcome == 'stop' else 0)
+
+    async def test_lost_grant_receipt_after_denial_remains_unknown_at_deadline(self):
+        class BudgetFailure(_ResourceFailure):
+            code = 'RESOURCE_TOKEN_BUDGET'
+            retry_after_ms = 1
+        class CommittedButUnanswered(_Guard):
+            attempts = 0
+            reserved_units = 0
+            cancelled = False
+            async def before_send(self, payload):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise BudgetFailure('definitively denied')
+                self.reserved_units += 64
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+        socket = _Ws(); guard = CommittedButUnanswered(); events = []
+        with self.assertRaises(_AdmissionOutcomeUnknown) as raised:
+            await _send_with_budget_wait(socket, {'clientContent': {'turns': []}},
+                guard, events.append, 'history_restore', {'ws': socket, 'stopped': False},
+                deadline_seconds=.12)
+        self.assertTrue(_is_resource_failure(raised.exception))
+        self.assertEqual(raised.exception.code, 'RESOURCE_ADMISSION_UNKNOWN')
+        self.assertEqual(guard.attempts, 2)
+        self.assertEqual(guard.reserved_units, 64)
+        self.assertTrue(guard.cancelled)
+        self.assertEqual(socket.sent, [])
+        self.assertEqual([event['type'] for event in events], ['resource_budget_wait'])
+
     async def test_transition_retries_denied_setup_grant_before_aborting(self):
         reader=_QueueReader()
         reader.feed({'type':'start','model':'gemini-3.8-live',
@@ -579,6 +717,228 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,1)
 
 class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_tool_response_admission_stops_without_reconnect_or_replay(self):
+        from live_interaction.reconnect import ReconnectBudget
+        class BudgetFailure(_ResourceFailure):
+            code = 'RESOURCE_TOKEN_BUDGET'
+            retry_after_ms = 1
+        class LostReceipt(_Guard):
+            attempts = 0
+            cancelled = False
+            async def before_send(self, payload):
+                if 'toolResponse' in payload:
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        raise BudgetFailure('definitively denied')
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.cancelled = True
+                        raise
+                self.payloads.append(payload)
+        reader = _QueueReader()
+        reader.feed({'type': 'start', 'model': 'gemini-3.8-live', 'configuration': {}})
+        socket = _FakeSocket([{'setupComplete': {}}])
+        events = []
+        guard = LostReceipt()
+        completed = {'name': 'apply', 'id': 'one', 'response': {'result': {'revision': 19}}}
+        budget = ReconnectBudget(max_attempts=1)
+        budget.delay = lambda: 0
+        async def bounded_send(*args, **kwargs):
+            return await _send_with_budget_wait(*args, **kwargs, deadline_seconds=.08)
+        with patch('websockets.connect', return_value=socket) as connect, \
+                patch('live_interaction.provider._send_with_budget_wait', side_effect=bounded_send):
+            task = asyncio.create_task(run(reader=reader, on_event=events.append,
+                resource_guard=guard, reconnect_budget=budget))
+            for _ in range(100):
+                if any(event.get('type') == 'ready' for event in events):
+                    break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(event.get('type') == 'ready' for event in events))
+            reader.feed({'type': 'tool_response', 'responses': [completed]})
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(connect.call_count, 1)
+        self.assertTrue(socket.closed)
+        self.assertTrue(guard.cancelled)
+        self.assertEqual(guard.attempts, 2)
+        self.assertFalse(any('toolResponse' in payload for payload in socket.sent))
+        self.assertEqual(completed, {'name': 'apply', 'id': 'one',
+            'response': {'result': {'revision': 19}}})
+        self.assertFalse(any(event.get('type') in ('reconnecting', 'resumed', 'resource_budget_ready')
+            for event in events))
+        self.assertEqual([event['code'] for event in events if event.get('type') == 'error'],
+            ['RESOURCE_ADMISSION_UNKNOWN'])
+
+    async def test_reconfigure_admission_failure_wakes_receiver_without_replacement(self):
+        import time
+        class AuthorityFailure(_ResourceFailure):
+            code = 'RESOURCE_CONTROL_UNAVAILABLE'
+        for outcome in ('unknown', 'typed'):
+            with self.subTest(outcome=outcome):
+                class Guard(_Guard):
+                    async def before_send(self, payload):
+                        if 'toolResponse' in payload:
+                            if outcome == 'typed':
+                                raise AuthorityFailure('authority unavailable')
+                            await asyncio.Event().wait()
+                        self.payloads.append(payload)
+                reader = _QueueReader()
+                reader.feed({'type': 'start', 'model': 'gemini-3.8-live', 'configuration': {}})
+                socket = _FakeSocket([{'setupComplete': {}}])
+                events = []
+                with patch('websockets.connect', return_value=socket) as connect:
+                    task = asyncio.create_task(run(reader=reader, on_event=events.append,
+                        resource_guard=Guard()))
+                    for _ in range(100):
+                        if any(event.get('type') == 'ready' for event in events):
+                            break
+                        await asyncio.sleep(.001)
+                    self.assertTrue(any(event.get('type') == 'ready' for event in events))
+                    reader.feed({'type': 'reconfigure', 'transition_id': 'unknown-route',
+                        'capability': 'dataset', 'deadline_at_ms': round(time.time() * 1000) + 30,
+                        'configuration': {}, 'continuation': 'read dataset',
+                        'router_response': {'name': 'activate_capability', 'id': 'route-one',
+                            'response': {'result': {'accepted': True}}}})
+                    if outcome == 'typed':
+                        with self.assertRaises(AuthorityFailure):
+                            await asyncio.wait_for(task, 1)
+                    else:
+                        await asyncio.wait_for(task, 1)
+                self.assertEqual(connect.call_count, 1)
+                self.assertTrue(socket.closed)
+                self.assertFalse(any('toolResponse' in payload for payload in socket.sent))
+                self.assertFalse(any(event.get('type') in ('capability_transition_started',
+                    'capability_transition_recovered', 'capability_ready', 'reconnecting', 'resumed')
+                    for event in events))
+                if outcome == 'unknown':
+                    self.assertTrue(any(event.get('type') == 'capability_transition_error'
+                        and event.get('transition_id') == 'unknown-route'
+                        and event.get('code') == 'RESOURCE_ADMISSION_UNKNOWN' for event in events))
+
+    async def test_socket_write_timeout_is_not_an_unknown_admission(self):
+        class PendingWrite(_Ws):
+            async def send(self, payload):
+                await asyncio.Event().wait()
+        guard = _Guard()
+        with self.assertRaises(TimeoutError) as raised:
+            await _guarded_send(PendingWrite(), {'clientContent': {}}, guard,
+                deadline=asyncio.get_running_loop().time() + .02)
+        self.assertFalse(_is_resource_failure(raised.exception))
+        self.assertEqual(len(guard.payloads), 1)
+
+    async def test_already_expired_deadline_does_not_request_admission(self):
+        guard = _Guard()
+        socket = _Ws()
+        with self.assertRaises(TimeoutError) as raised:
+            await _guarded_send(socket, {'clientContent': {}}, guard,
+                deadline=asyncio.get_running_loop().time() - .01)
+        self.assertFalse(_is_resource_failure(raised.exception))
+        self.assertEqual(guard.payloads, [])
+        self.assertEqual(socket.sent, [])
+
+    async def test_send_deadline_cancels_pending_admission_before_socket_write(self):
+        class PendingGuard(_Guard):
+            def __init__(self):
+                super().__init__()
+                self.cancelled = False
+            async def before_send(self, payload):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+        guard = PendingGuard()
+        socket = _Ws()
+        with self.assertRaises(TimeoutError):
+            await _guarded_send(socket, {'clientContent': {'turns': []}}, guard,
+                deadline=asyncio.get_running_loop().time() + .02)
+        self.assertTrue(guard.cancelled)
+        self.assertEqual(socket.sent, [])
+
+    async def test_expired_host_handoff_does_not_open_another_provider(self):
+        import time
+        reader = _QueueReader()
+        reader.feed({'type': 'start', 'model': 'gemini-3.8-live',
+            'configuration': {'functions': [{'name': 'activate_capability'}]}})
+        first = _FakeSocket([{'setupComplete': {}}])
+        events = []
+        with patch('websockets.connect', return_value=first) as connect:
+            task = asyncio.create_task(run(reader=reader, on_event=events.append, resource_guard=_Guard()))
+            for _ in range(100):
+                if any(e.get('type') == 'ready' for e in events):
+                    break
+                await asyncio.sleep(.001)
+            reader.feed({'type': 'reconfigure', 'transition_id': 'expired-host', 'capability': 'dataset',
+                'deadline_at_ms': round(time.time() * 1000) - 1,
+                'configuration': {'functions': [{'name': 'dataset.find'}]},
+                'continuation': 'read dataset',
+                'router_response': {'name': 'activate_capability', 'id': 'route-expired',
+                    'response': {'result': {'accepted': True}}, 'scheduling': 'SILENT', 'willContinue': False}})
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(connect.call_count, 1)
+        self.assertTrue(first.closed)
+        self.assertFalse(any('toolResponse' in item for item in first.sent))
+        self.assertTrue(any(e.get('type') == 'capability_transition_error'
+            and e.get('code') == 'LIVE_CAPABILITY_TIMEOUT' for e in events))
+
+    async def test_host_deadline_cancels_target_setup_admission_without_late_ready(self):
+        import time
+        class ClosingAfterAck(_FakeSocket):
+            async def send(self, payload):
+                await super().send(payload)
+                if 'toolResponse' in json.loads(payload):
+                    await self.close()
+        class ClosingOnExit(_FakeSocket):
+            async def __aexit__(self, *_args):
+                await self.close()
+                return False
+        class PendingSetup(_Guard):
+            def __init__(self):
+                super().__init__()
+                self.setups = 0
+                self.started = asyncio.Event()
+                self.cancelled = False
+            async def before_send(self, payload):
+                if 'setup' in payload:
+                    self.setups += 1
+                    if self.setups == 2:
+                        self.started.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            self.cancelled = True
+                            raise
+                self.payloads.append(payload)
+        reader = _QueueReader()
+        reader.feed({'type': 'start', 'model': 'gemini-3.8-live',
+            'configuration': {'functions': [{'name': 'activate_capability'}]}})
+        first = ClosingAfterAck([{'setupComplete': {}}])
+        target = ClosingOnExit([{'setupComplete': {}}])
+        sockets = [first, target]
+        events = []
+        guard = PendingSetup()
+        with patch('websockets.connect', side_effect=lambda *_args, **_kw: sockets.pop(0)), \
+                patch('live_interaction.provider.FRESH_HANDLE_WAIT_SECONDS', .01):
+            task = asyncio.create_task(run(reader=reader, on_event=events.append, resource_guard=guard))
+            for _ in range(100):
+                if any(e.get('type') == 'ready' for e in events):
+                    break
+                await asyncio.sleep(.001)
+            reader.feed({'type': 'reconfigure', 'transition_id': 'bounded-host', 'capability': 'dataset',
+                'deadline_at_ms': round(time.time() * 1000) + 150,
+                'configuration': {'functions': [{'name': 'dataset.find'}]},
+                'continuation': 'read dataset',
+                'router_response': {'name': 'activate_capability', 'id': 'route-bounded',
+                    'response': {'result': {'accepted': True}}, 'scheduling': 'SILENT', 'willContinue': False}})
+            await asyncio.wait_for(guard.started.wait(), 1)
+            await asyncio.wait_for(task, 1)
+        self.assertTrue(guard.cancelled)
+        self.assertTrue(target.closed)
+        self.assertEqual(target.sent, [])
+        self.assertFalse(any(e.get('type') in ('resumed', 'capability_ready') for e in events))
+        self.assertTrue(any(e.get('type') == 'capability_transition_error'
+            and e.get('transition_id') == 'bounded-host' for e in events))
+
     async def test_optional_frame_budget_denial_does_not_close_session(self):
         class BudgetFailure(_ResourceFailure):
             code='RESOURCE_TOKEN_BUDGET'
@@ -644,3 +1004,227 @@ class VersionMetadataTest(unittest.TestCase):
         expected = pyproject["project"]["version"]
         self.assertEqual(package["version"], expected)
         self.assertIn(f'__version__ = "{expected}"', init_text)
+
+
+class ProviderLongSessionContract(unittest.IsolatedAsyncioTestCase):
+    """A 90-minute conversation renews its provider connection many times."""
+
+    def start_reader(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'}})
+        return reader
+
+    async def wait_for(self, events, predicate, timeout=2):
+        async with asyncio.timeout(timeout):
+            while not predicate(events):
+                await asyncio.sleep(.001)
+
+    async def test_repeated_planned_go_away_renewals_do_not_end_the_session(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*_args,**_kwargs):
+            index=len(sockets)
+            incoming=[{'setupComplete':{}},{'sessionResumptionUpdate':{'newHandle':f'h{index}','resumable':True}}]
+            if index<5:
+                incoming.append({'goAway':{'timeLeft':'1s'}})
+            sockets.append(_FakeSocket(incoming))
+            return sockets[-1]
+        budget=ReconnectBudget(max_attempts=10,window_seconds=60)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            await self.wait_for(events,lambda ev:sum(e.get('type')=='resumed' for e in ev)>=5)
+            # Five renewals exceed the old lifetime cap of three; all resume by checkpoint.
+            resumed=[e for e in events if e.get('type')=='resumed']
+            self.assertTrue(all(e.get('resumption_mode')=='checkpoint' for e in resumed))
+            self.assertTrue(all(e.get('planned') for e in events if e.get('type')=='reconnecting'))
+            self.assertEqual(sockets[-1].sent[0]['setup']['sessionResumption'],{'handle':'h4'})
+            self.assertFalse(any(e.get('type')=='error' for e in events))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_unplanned_drop_before_checkpoint_restores_history_instead_of_ending(self):
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*_args,**_kwargs):
+            sockets.append(_FakeSocket([{'setupComplete':{}}]+([] if sockets else [_FakeSocket._CLOSED])))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+            resumed=next(e for e in events if e.get('type')=='resumed')
+            self.assertEqual(resumed['resumption_mode'],'history_restore')
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_reconnect_storm_is_bounded_by_rolling_window(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; calls=0
+        def connect(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            return _FakeSocket([{'setupComplete':{}},_FakeSocket._CLOSED])
+        budget=ReconnectBudget(max_attempts=3,window_seconds=60,base_delay=0.001,max_delay=0.002)
+        with patch('websockets.connect',side_effect=connect):
+            await asyncio.wait_for(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget),2)
+        self.assertEqual(calls,4)  # first connection + three budgeted attempts
+        self.assertTrue(any(e.get('type')=='error' for e in events))
+
+    async def test_authorization_failure_is_never_retried(self):
+        reader=self.start_reader(); events=[]; calls=0
+        def connect(*_args,**_kwargs):
+            nonlocal calls
+            calls+=1
+            return _FakeSocket([{'setupComplete':{}},{'error':{'message':'API key not valid'}}])
+        with patch('websockets.connect',side_effect=connect):
+            await asyncio.wait_for(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append),2)
+        self.assertEqual(calls,1)
+        self.assertTrue(any(e.get('type')=='error' for e in events))
+
+    async def test_audio_dropped_during_provider_outage_is_reported_once(self):
+        reader=self.start_reader(); events=[]; sockets=[]; release=asyncio.Event()
+        def connect(*_args,**_kwargs):
+            if sockets:
+                async def delayed():
+                    await release.wait()
+                    return _FakeSocket([{'setupComplete':{}}])
+                return _Delayed(delayed)
+            sockets.append(_FakeSocket([{'setupComplete':{}},_FakeSocket._CLOSED]))
+            return sockets[-1]
+        class _Delayed:
+            def __init__(self,factory):
+                self.factory=factory
+            async def __aenter__(self):
+                self.socket=await self.factory()
+                return self.socket
+            async def __aexit__(self,*_args):
+                return False
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            await self.wait_for(events,lambda ev:any(e.get('type')=='reconnecting' for e in ev))
+            for _ in range(3):
+                reader.feed({'type':'audio','data':'AAAA','queued_at':10**13})
+            await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+            await asyncio.sleep(.01)
+            self.assertEqual(sum(e.get('type')=='input_dropped' for e in events),1)
+            release.set()
+            await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+
+    async def test_failed_last_audio_send_reports_its_turn_without_waiting_for_more_input(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        class FailingAudio(_FakeSocket):
+            async def send(self, payload):
+                if 'audio' in json.loads(payload).get('realtimeInput', {}):
+                    raise ConnectionError('last frame write failed')
+                await super().send(payload)
+        def connect(*args, **kwargs):
+            socket = FailingAudio([{'setupComplete':{}}]) if not sockets else _FakeSocket([{'setupComplete':{}}])
+            sockets.append(socket)
+            return socket
+        budget=ReconnectBudget(base_delay=.001,max_delay=.002)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                reader.feed({'type':'audio','data':'AAAA','queued_at':10**13,'audio_turn_generation':7})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+                drop=next(e for e in events if e.get('type')=='input_dropped')
+                self.assertEqual(drop['audio_turn_generation'],7)
+                self.assertEqual(drop['input_type'],'audio')
+                await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+                self.assertFalse(any('audio' in m.get('realtimeInput',{}) for m in sockets[1].sent))
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_provider_boundary_receipt_identifies_its_host_turn(self):
+        reader=self.start_reader(); events=[]
+        with patch('websockets.connect',return_value=_FakeSocket([{'setupComplete':{}}])):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                reader.feed({'type':'activity_end','queued_at':10**13,'audio_turn_generation':9})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_timing' for e in ev))
+                receipt=next(e for e in events if e.get('type')=='input_timing')
+                self.assertEqual(receipt['audio_turn_generation'],9)
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+    async def test_old_queued_pcm_seen_after_resume_is_dropped_with_its_turn(self):
+        from live_interaction.reconnect import ReconnectBudget
+        reader=self.start_reader(); events=[]; sockets=[]
+        def connect(*args, **kwargs):
+            socket = _FakeSocket([{'setupComplete':{}}])
+            sockets.append(socket)
+            return socket
+        budget=ReconnectBudget(base_delay=.001,max_delay=.002)
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append,reconnect_budget=budget))
+            try:
+                await self.wait_for(events,lambda ev:any(e.get('type')=='ready' for e in ev))
+                sockets[0].incoming.put_nowait(_FakeSocket._CLOSED)
+                await self.wait_for(events,lambda ev:any(e.get('type')=='resumed' for e in ev))
+                # The old frame is only consumed after a replacement ws is ready.
+                reader.feed({'type':'audio','data':'AAAA','queued_at':1,'audio_turn_generation':12})
+                await self.wait_for(events,lambda ev:any(e.get('type')=='input_dropped' for e in ev))
+                drop=next(e for e in events if e.get('type')=='input_dropped')
+                self.assertEqual(drop['reason'],'provider_reconnect')
+                self.assertEqual(drop['audio_turn_generation'],12)
+                self.assertFalse(any('audio' in m.get('realtimeInput',{}) for m in sockets[1].sent))
+                reader.feed({'type':'stop'})
+                await asyncio.wait_for(task,1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+
+
+class ProviderCheckpointContract(unittest.IsolatedAsyncioTestCase):
+    async def test_persisted_handle_resumes_without_history_and_reports_checkpoints(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'},
+                     'history':[{'role':'user','text':'old'}],'resume_handle':'persisted-h'})
+        events=[]; sockets=[]
+        def connect(*_a,**_k):
+            sockets.append(_FakeSocket([{'setupComplete':{}},{'sessionResumptionUpdate':{'newHandle':'fresh-h','resumable':True}}]))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            async with asyncio.timeout(2):
+                while not any(e.get('type')=='resumption_checkpoint' for e in events):
+                    await asyncio.sleep(.001)
+            self.assertEqual(sockets[0].sent[0]['setup']['sessionResumption'],{'handle':'persisted-h'})
+            self.assertFalse(any('clientContent' in m for m in sockets[0].sent))
+            ready=next(e for e in events if e.get('type')=='ready')
+            self.assertEqual(ready['resumption_mode'],'checkpoint')
+            self.assertEqual(next(e for e in events if e.get('type')=='resumption_checkpoint')['handle'],'fresh-h')
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
+
+    async def test_rejected_persisted_handle_falls_back_once_to_history(self):
+        reader=_QueueReader()
+        reader.feed({'type':'start','model':'gemini-3.8-live','configuration':{'system_instruction':'core'},
+                     'history':[{'role':'user','text':'remember the blue folder'}],'resume_handle':'expired-h'})
+        events=[]; sockets=[]
+        def connect(*_a,**_k):
+            if not sockets:
+                sockets.append(_FakeSocket([{'error':{'message':'session not found'}}]))
+            else:
+                sockets.append(_FakeSocket([{'setupComplete':{}}]))
+            return sockets[-1]
+        with patch('websockets.connect',side_effect=connect):
+            task=asyncio.create_task(run(load_key=lambda:'fixture-key',reader=reader,on_event=events.append))
+            async with asyncio.timeout(2):
+                while not any(e.get('type')=='ready' for e in events):
+                    await asyncio.sleep(.001)
+            self.assertTrue(any(e.get('type')=='resumption_rejected' for e in events))
+            self.assertEqual(sockets[1].sent[0]['setup']['sessionResumption'],{})
+            self.assertTrue(any('clientContent' in m for m in sockets[1].sent))
+            reader.feed({'type':'stop'})
+            await asyncio.wait_for(task,1)
