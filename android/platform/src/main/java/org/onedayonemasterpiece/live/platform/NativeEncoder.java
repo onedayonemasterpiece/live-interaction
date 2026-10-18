@@ -31,7 +31,7 @@ final class NativeEncoder implements AutoCloseable {
     private CodecEpoch epoch;
     private CompressedAudio.OggMux ogg;
     private CodecTimeline timeline;
-    private Packet pending;
+    private Packet pending, terminalPending;
     private byte[] prefix = new byte[0];
     private long capturedSamples, submittedSamples, validSamples, chunkSeq, lastPts = Long.MIN_VALUE;
     private boolean eos, closed, finishing, terminalPublished, activeInput, activePublished, waitForQuiet;
@@ -103,12 +103,17 @@ final class NativeEncoder implements AutoCloseable {
     }
     void finish() throws IOException {
         if (closed || eos) return;
+        // An empty captured source has no original span and must never gain a
+        // synthetic terminal frame from codec-only padding.
+        if (capturedSamples == 0) throw CompressedAudio.invalid("EMPTY_SOURCE");
         // Encoder delay plus a partial final AudioRecord read can leave the last
         // original samples unrepresented at EOS. Queue codec-only silence, never
         // count it as captured or persist it as an original source sample.
         finishing = true;
         long deadline = System.nanoTime() + 3500000000L;
-        int pad = choice.rate() / 3; // bounded 333 ms: AAC delay <=160 ms, Opus pre-skip <=120 ms
+        // Bounded padding covers the largest supported encoder delay AND a
+        // complete codec packet even when the last AudioRecord read is partial.
+        int pad = OPUS_PROFILE.equals(choice.profile()) ? 11520 : choice.rate() * 16 / 100 + 1024;
         while (pad > 0 && System.nanoTime() < deadline) {
             int index = codec.dequeueInputBuffer(10000);
             if (index < 0) { drain(true); continue; }
@@ -160,21 +165,25 @@ final class NativeEncoder implements AutoCloseable {
                 if (epoch == null) throw CompressedAudio.invalid("DELAY_METADATA_UNAVAILABLE");
                 if (lastPts != Long.MIN_VALUE && pts < lastPts) throw CompressedAudio.invalid("OUTPUT_TIMESTAMP");
                 lastPts = pts;
-                if (pending != null && !terminalPublished) {
-                    // Once padding begins, close the stream at the first packet
-                    // covering all captured samples. Remaining codec-only packets
-                    // are drained but never published as a new speech portion.
-                    boolean lastOriginal = finishing && timeline.covers(pending.samples(), capturedSamples);
-                    emit(pending, lastOriginal);
-                    if (lastOriginal) terminalPublished = true;
+                if (pending != null && terminalPending == null) {
+                    // A covering packet is retained, not persisted: codec-only
+                    // padding must complete successfully through actual EOS before
+                    // the terminal frame can become durable and wire-visible.
+                    if (finishing && timeline.covers(pending.samples(), capturedSamples))
+                        terminalPending = pending;
+                    else emit(pending, false);
                 }
                 int samples = OPUS_PROFILE.equals(choice.profile()) ? CompressedAudio.opusSamples(data) : 1024;
-                pending = terminalPublished ? null : new Packet(data, samples, pts);
+                pending = terminalPending == null ? new Packet(data, samples, pts) : null;
             }
             if ((flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                 eos = true;
-                if (!terminalPublished && pending != null) { emit(pending, true); pending = null; terminalPublished = true; }
-                else if (!terminalPublished && capturedSamples > 0) throw CompressedAudio.invalid("EMPTY_EOS");
+                Packet lastOriginal = terminalPending != null ? terminalPending : pending;
+                if (lastOriginal == null) throw CompressedAudio.invalid("EMPTY_EOS");
+                if (!timeline.covers(lastOriginal.samples(), capturedSamples))
+                    throw CompressedAudio.invalid("ENCODER_TAIL_SHORT");
+                emit(lastOriginal, true); // no terminal write before actual codec EOS
+                terminalPending = pending = null; terminalPublished = true;
             }
         }
     }
