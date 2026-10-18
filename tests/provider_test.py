@@ -6,6 +6,7 @@ from live_interaction.provider import (
     DialogueHistory,
     _guarded_recv,
     _guarded_send,
+    _AdmissionOutcomeUnknown,
     _send_with_budget_wait,
     _is_resource_failure,
     handle_server_message,
@@ -381,10 +382,12 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
                     self.cancelled = True
                     raise
         socket = _Ws(); guard = CommittedButUnanswered(); events = []
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(_AdmissionOutcomeUnknown) as raised:
             await _send_with_budget_wait(socket, {'clientContent': {'turns': []}},
                 guard, events.append, 'history_restore', {'ws': socket, 'stopped': False},
                 deadline_seconds=.12)
+        self.assertTrue(_is_resource_failure(raised.exception))
+        self.assertEqual(raised.exception.code, 'RESOURCE_ADMISSION_UNKNOWN')
         self.assertEqual(guard.attempts, 2)
         self.assertEqual(guard.reserved_units, 64)
         self.assertTrue(guard.cancelled)
@@ -714,6 +717,125 @@ class ProviderReconfigureContract(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task,1)
 
 class ProviderResourceGuardContract(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_tool_response_admission_stops_without_reconnect_or_replay(self):
+        from live_interaction.reconnect import ReconnectBudget
+        class BudgetFailure(_ResourceFailure):
+            code = 'RESOURCE_TOKEN_BUDGET'
+            retry_after_ms = 1
+        class LostReceipt(_Guard):
+            attempts = 0
+            cancelled = False
+            async def before_send(self, payload):
+                if 'toolResponse' in payload:
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        raise BudgetFailure('definitively denied')
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.cancelled = True
+                        raise
+                self.payloads.append(payload)
+        reader = _QueueReader()
+        reader.feed({'type': 'start', 'model': 'gemini-3.8-live', 'configuration': {}})
+        socket = _FakeSocket([{'setupComplete': {}}])
+        events = []
+        guard = LostReceipt()
+        completed = {'name': 'apply', 'id': 'one', 'response': {'result': {'revision': 19}}}
+        budget = ReconnectBudget(max_attempts=1)
+        budget.delay = lambda: 0
+        async def bounded_send(*args, **kwargs):
+            return await _send_with_budget_wait(*args, **kwargs, deadline_seconds=.08)
+        with patch('websockets.connect', return_value=socket) as connect, \
+                patch('live_interaction.provider._send_with_budget_wait', side_effect=bounded_send):
+            task = asyncio.create_task(run(reader=reader, on_event=events.append,
+                resource_guard=guard, reconnect_budget=budget))
+            for _ in range(100):
+                if any(event.get('type') == 'ready' for event in events):
+                    break
+                await asyncio.sleep(.001)
+            self.assertTrue(any(event.get('type') == 'ready' for event in events))
+            reader.feed({'type': 'tool_response', 'responses': [completed]})
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(connect.call_count, 1)
+        self.assertTrue(socket.closed)
+        self.assertTrue(guard.cancelled)
+        self.assertEqual(guard.attempts, 2)
+        self.assertFalse(any('toolResponse' in payload for payload in socket.sent))
+        self.assertEqual(completed, {'name': 'apply', 'id': 'one',
+            'response': {'result': {'revision': 19}}})
+        self.assertFalse(any(event.get('type') in ('reconnecting', 'resumed', 'resource_budget_ready')
+            for event in events))
+        self.assertEqual([event['code'] for event in events if event.get('type') == 'error'],
+            ['RESOURCE_ADMISSION_UNKNOWN'])
+
+    async def test_reconfigure_admission_failure_wakes_receiver_without_replacement(self):
+        import time
+        class AuthorityFailure(_ResourceFailure):
+            code = 'RESOURCE_CONTROL_UNAVAILABLE'
+        for outcome in ('unknown', 'typed'):
+            with self.subTest(outcome=outcome):
+                class Guard(_Guard):
+                    async def before_send(self, payload):
+                        if 'toolResponse' in payload:
+                            if outcome == 'typed':
+                                raise AuthorityFailure('authority unavailable')
+                            await asyncio.Event().wait()
+                        self.payloads.append(payload)
+                reader = _QueueReader()
+                reader.feed({'type': 'start', 'model': 'gemini-3.8-live', 'configuration': {}})
+                socket = _FakeSocket([{'setupComplete': {}}])
+                events = []
+                with patch('websockets.connect', return_value=socket) as connect:
+                    task = asyncio.create_task(run(reader=reader, on_event=events.append,
+                        resource_guard=Guard()))
+                    for _ in range(100):
+                        if any(event.get('type') == 'ready' for event in events):
+                            break
+                        await asyncio.sleep(.001)
+                    self.assertTrue(any(event.get('type') == 'ready' for event in events))
+                    reader.feed({'type': 'reconfigure', 'transition_id': 'unknown-route',
+                        'capability': 'dataset', 'deadline_at_ms': round(time.time() * 1000) + 30,
+                        'configuration': {}, 'continuation': 'read dataset',
+                        'router_response': {'name': 'activate_capability', 'id': 'route-one',
+                            'response': {'result': {'accepted': True}}}})
+                    if outcome == 'typed':
+                        with self.assertRaises(AuthorityFailure):
+                            await asyncio.wait_for(task, 1)
+                    else:
+                        await asyncio.wait_for(task, 1)
+                self.assertEqual(connect.call_count, 1)
+                self.assertTrue(socket.closed)
+                self.assertFalse(any('toolResponse' in payload for payload in socket.sent))
+                self.assertFalse(any(event.get('type') in ('capability_transition_started',
+                    'capability_transition_recovered', 'capability_ready', 'reconnecting', 'resumed')
+                    for event in events))
+                if outcome == 'unknown':
+                    self.assertTrue(any(event.get('type') == 'capability_transition_error'
+                        and event.get('transition_id') == 'unknown-route'
+                        and event.get('code') == 'RESOURCE_ADMISSION_UNKNOWN' for event in events))
+
+    async def test_socket_write_timeout_is_not_an_unknown_admission(self):
+        class PendingWrite(_Ws):
+            async def send(self, payload):
+                await asyncio.Event().wait()
+        guard = _Guard()
+        with self.assertRaises(TimeoutError) as raised:
+            await _guarded_send(PendingWrite(), {'clientContent': {}}, guard,
+                deadline=asyncio.get_running_loop().time() + .02)
+        self.assertFalse(_is_resource_failure(raised.exception))
+        self.assertEqual(len(guard.payloads), 1)
+
+    async def test_already_expired_deadline_does_not_request_admission(self):
+        guard = _Guard()
+        socket = _Ws()
+        with self.assertRaises(TimeoutError) as raised:
+            await _guarded_send(socket, {'clientContent': {}}, guard,
+                deadline=asyncio.get_running_loop().time() - .01)
+        self.assertFalse(_is_resource_failure(raised.exception))
+        self.assertEqual(guard.payloads, [])
+        self.assertEqual(socket.sent, [])
+
     async def test_send_deadline_cancels_pending_admission_before_socket_write(self):
         class PendingGuard(_Guard):
             def __init__(self):

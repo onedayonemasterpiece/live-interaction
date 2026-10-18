@@ -112,21 +112,40 @@ def _guard_check(resource_guard):
         resource_guard.check()
 
 
+class _AdmissionOutcomeUnknown(TimeoutError):
+    """The authority may have committed; this is not a transport retry."""
+    resource_failure = True
+    code = 'RESOURCE_ADMISSION_UNKNOWN'
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
 async def _guarded_send(ws, payload, resource_guard=None, *, before_write=None, deadline=None):
-    async with asyncio.timeout_at(deadline):
-        _guard_check(resource_guard)
-        if resource_guard is not None:
-            pending = resource_guard.before_send(payload)
-            if inspect.isawaitable(pending):
-                await pending
+    admission_pending = False
+    try:
+        async with asyncio.timeout_at(deadline):
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError('Live send admission deadline')
             _guard_check(resource_guard)
-        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError('Live send admission deadline')
-        if before_write is not None and not before_write():
-            return False
-        await ws.send(json.dumps(payload))
-        _guard_check(resource_guard)
-        return True
+            if resource_guard is not None:
+                admission_pending = True
+                pending = resource_guard.before_send(payload)
+                if inspect.isawaitable(pending):
+                    await pending
+                admission_pending = False
+                _guard_check(resource_guard)
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError('Live send admission deadline')
+            if before_write is not None and not before_write():
+                return False
+            await ws.send(json.dumps(payload))
+            _guard_check(resource_guard)
+            return True
+    except TimeoutError as exc:
+        if admission_pending and not _is_resource_failure(exc):
+            raise _AdmissionOutcomeUnknown() from exc
+        raise
 
 
 async def _send_with_budget_wait(ws, payload, resource_guard, emit, kind, state, *, optional=False,
@@ -431,7 +450,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                   **({'audio_turn_generation': generation}
                      if isinstance(generation, int) and not isinstance(generation, bool) else {})})
 
-    async def sender():
+    async def send_inputs():
         audio_chunks = 0
         max_stdin_delay_ms = max_ws_send_ms = 0
         while not state['stopped']:
@@ -485,7 +504,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     state['stop_event'].set()
                     await ws.close()
                     return
-                wait = {'baseline':state['handle_generation'],'router_response_sent':False}
+                wait = {'baseline':state['handle_generation'],'router_response_sent':False,
+                        'transition_id':transition_id,'capability':capability}
                 state['transition_wait'] = wait
                 state['transition_handle_event'].clear()
                 state['transition_started_event'].clear()
@@ -583,23 +603,36 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                     audio_chunks = 0
                     max_stdin_delay_ms = max_ws_send_ms = 0
             except Exception as exc:
+                if _is_resource_failure(exc):
+                    raise
                 if state['ws'] is ws:
                     state['ws'] = None
-                if _is_resource_failure(exc):
-                    state['resource_error'] = exc
-                    state['stopped'] = True
-                    state['stop_event'].set()
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    raise
                 # Receiver owns bounded reconnect; sender remains alive to accept Stop.
                 report_dropped_input(message)
                 try:
                     await ws.close()
                 except Exception:
                     pass
+
+    async def sender():
+        try:
+            await send_inputs()
+        except Exception as exc:
+            if _is_resource_failure(exc):
+                # Reconfigure admission also belongs to this terminal boundary.
+                # Wake the receiver rather than leave it waiting or reconnecting
+                # after the sender has lost an authority receipt.
+                ws = state['ws']
+                state['resource_error'] = exc
+                state['stopped'] = True
+                state['stop_event'].set()
+                state['ws'] = None
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+            raise
 
     sender_task = asyncio.create_task(sender())
     try:
@@ -716,6 +749,8 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             emit({'type': 'go_away', 'time_left': obj['goAway'].get('timeLeft')})
                             break
                         handle_server_message(obj, emit=emit_observed)
+                if state.get('resource_error') is not None:
+                    raise state['resource_error']
                 if state['stopped']:
                     break
                 if state.get('transition'):
@@ -794,6 +829,16 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                       'resumption_mode': 'checkpoint' if state['handle'] else 'history_restore',
                       'recent_attempts': budget.recent_attempts()})
                 await asyncio.sleep(budget.delay())
+    except _AdmissionOutcomeUnknown as exc:
+        transition = state.get('transition') or state.get('transition_wait')
+        if transition:
+            emit({'type': 'capability_transition_error',
+                  'transition_id': transition['transition_id'],
+                  'capability': transition['capability'], 'code': exc.code})
+        # This runner owns the timeout, not the SDK's ResourceError class. Emit
+        # its bounded terminal code and let the managed runner release the same
+        # lease normally, without classifying it as a provider outage.
+        emit({'type': 'error', 'code': exc.code, 'message': exc.code})
     except Exception as exc:
         if _is_resource_failure(exc):
             raise
