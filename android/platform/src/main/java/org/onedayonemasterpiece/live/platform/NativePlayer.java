@@ -109,8 +109,10 @@ final class NativePlayer implements AutoCloseable {
     void stopImmediately() { reportPosition(); closed = true; interrupt(); }
     void reportPosition() {
         String response; long position; boolean pending;
+        AudioTrack observed;
         synchronized (hardware) {
-            if (track == null || !trackStarted) return; // Never mark prefilling PCM as played.
+            observed = track;
+            if (observed == null || !trackStarted) return; // Never mark prefilling PCM as played.
             try {
                 long head = track.getPlaybackHeadPosition() & 0xffffffffL;
                 if (head < lastHead) headWrap += 1L << 32;
@@ -120,7 +122,10 @@ final class NativePlayer implements AutoCloseable {
                 pending = samples < writtenSamples;
             } catch (RuntimeException ignored) { return; }
         }
-        setPlaying(pending);
+        // Ignore a position callback from a track already interrupted/released.
+        synchronized (hardware) {
+            if (track == observed && trackStarted) setPlaying(pending);
+        }
         playedPositions.merge(response, position, Math::max);
         synchronized (receiptsLock) {
             Long end = pendingEnds.get(response);
@@ -282,33 +287,41 @@ final class NativePlayer implements AutoCloseable {
     private void startBufferedTrack(AudioTrack selected, long expectedVersion, boolean finalAudio) {
         boolean started = false;
         synchronized (hardware) {
-            if (track == selected && !trackStarted && !closed && expectedVersion == version.get()
-                    && PlaybackStartupPolicy.canStart(trackRate, writtenSamples, finalAudio, trackPrefillFrames)) {
-                if (Build.VERSION.SDK_INT >= 31 && finalAudio && writtenSamples < trackPrefillFrames) {
-                    // Every queued short-response sample is original, but there
-                    // are fewer than the normal start threshold. Lower Android's
-                    // native threshold too; changing only Java policy stalls.
+            if (track == selected && !closed && expectedVersion == version.get()) {
+                // A route change can raise the actual platform threshold after
+                // creating the track. Check the *live* value at terminal even
+                // when play() was already requested for this response.
+                if (Build.VERSION.SDK_INT >= 31 && finalAudio && writtenSamples > 0
+                        && selected.getStartThresholdInFrames() > writtenSamples) {
                     int actual = selected.setStartThresholdInFrames((int) writtenSamples);
-                    if (actual > writtenSamples || actual < 1)
+                    if (actual < 1 || actual > writtenSamples)
                         throw CompressedAudio.invalid("OUTPUT_SHORT_START_THRESHOLD");
                 }
-                selected.play();
-                trackStarted = true;
-                setPlaying(true); // ordered with Stop under hardware, no stale true after release
-                started = true;
+                if (!trackStarted && PlaybackStartupPolicy.canStart(
+                        trackRate, writtenSamples, finalAudio, trackPrefillFrames)) {
+                    selected.play();
+                    trackStarted = true;
+                    setPlaying(true); // same hardware lock as interrupt and release
+                    started = true;
+                }
             }
         }
-        if (started) listener.timing("audio_scheduled");
+        if (started) synchronized (hardware) {
+            if (track == selected && trackStarted && !closed && expectedVersion == version.get())
+                listener.timing("audio_scheduled");
+        }
     }
     private void releaseTrack() {
         AudioTrack selected;
-        synchronized (hardware) { selected = track; track = null; trackStarted = false; trackPrefillFrames = 0; }
+        synchronized (hardware) {
+            selected = track; track = null; trackStarted = false; trackPrefillFrames = 0;
+            setPlaying(false);
+        }
         if (selected != null) {
             try { selected.pause(); } catch (RuntimeException ignored) { }
             try { selected.flush(); } catch (RuntimeException ignored) { }
             selected.release();
         }
-        setPlaying(false);
     }
     private void setPlaying(boolean next) { if (playing != next) { playing = next; listener.playing(next); } }
     private void closeDecoder() { if (decoder != null) { decoder.close(); decoder = null; } }
