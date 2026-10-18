@@ -226,6 +226,9 @@ export function createLiveSessionHost({adapterFactory,createWorker,models=LIVE_S
       let event;
       try{event=JSON.parse(line);}catch{return;}
       if(session.closed)return;
+      // Checkpoints are host secrets. Legacy Node consumers do not persist them;
+      // never project the shared worker's private event into polling or WSS.
+      if(event.type==='resumption_checkpoint')return;
       if(event.type==='capability_ready'){
         emit(session,event);
         if(session.pendingTransition?.id===event.transition_id)session.pendingTransition.resolve(event);
