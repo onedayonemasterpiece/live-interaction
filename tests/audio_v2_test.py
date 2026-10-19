@@ -473,6 +473,46 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         await self.json({"type": "stop"})
         await settle(lambda: self.binding.stopped, timeout=.2)
 
+    async def test_durable_v2_backlog_does_not_retain_provider_pcm_in_relay(self):
+        # Hold the real device-durable ACK while the independent archive fsyncs
+        # six seconds of provider output. Its compressed originals fit easily;
+        # keeping the redundant base64 PCM in the relay exceeds 256 KiB.
+        archive = self.binding.state.output_archive
+        source_id = f"out_{self.session.id}_1"
+        pcm = b"\x01\x00" * 2400
+        for _ in range(60):
+            seq = self.session.next_seq
+            self.provider.events({"type": "audio", "data": base64.b64encode(pcm).decode(),
+                                  "mime_type": "audio/pcm;rate=24000"})
+            await settle(lambda: archive.processed_seq >= seq or self.task.done(), timeout=2)
+            self.assertFalse(self.task.done(), self.closes)
+        self.provider.events({"type": "turn_complete"})
+        await settle(lambda: source_id in self.store.seals)
+        self.assertEqual(self.store.seals[source_id][1], 6_000_000)
+        before = [AudioFrame.decode(v) for v in self.sent if isinstance(v, bytes)]
+        self.assertLessEqual(sum(f.duration_us for f in before), 960000)
+        self.assertFalse(self.task.done(), self.closes)
+        # Drain only after actual ACK, and verify each wire payload equals its
+        # durable original. No replay, invented progress or relaxed window.
+        acknowledged = 0
+        for _ in range(100):
+            frames = [AudioFrame.decode(v) for v in self.sent if isinstance(v, bytes)]
+            if frames and frames[-1].flags & EPOCH_END:
+                break
+            if frames and frames[-1].chunk_seq > acknowledged:
+                acknowledged = frames[-1].chunk_seq
+                await self.json({"type": "output_ack", "source_id": source_id,
+                                 "stage": "device_durable", "chunk_seq": acknowledged})
+            await asyncio.sleep(.01)
+        self.assertTrue(frames and frames[-1].flags & EPOCH_END, self.closes)
+        self.assertEqual(sum(f.duration_us for f in frames), 6_000_000)
+        self.assertEqual([f.chunk_seq for f in frames], list(range(1, len(frames) + 1)))
+        for frame in frames:
+            self.assertEqual(frame.payload, self.store.chunks[(source_id, frame.chunk_seq)].payload)
+        self.assertEqual(self.store.played.get(source_id, 0), 0,
+                         "Byte receipt must not fabricate a played cursor")
+        self.assertFalse(self.closes)
+
     async def test_finished_live_source_can_unbind_and_rotate_without_reconnecting(self):
         old = await self.source("first_live")
         for chunk in vector_chunks("first_live"):
