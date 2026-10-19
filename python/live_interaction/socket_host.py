@@ -93,7 +93,7 @@ class LiveSocketSessionHost(LiveSessionHost):
         super().__init__(adapter_factory=guarded_factory, **kwargs)
 
     def diagnostic(self, session, event: str, **fields):
-        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms", "skipped_audio_events"}
+        allowed = {"code", "connection_generation", "frame_seq", "pcm_bytes", "capture_age_ms", "audio_turn_open", "queue_bytes", "duration_ms", "skipped_audio_events", "queue_items", "event_seq", "encode_ms", "commit_ms", "archive_wait_ms", "process_ms"}
         record = {"event": event, "transport": "wss", "session_id": session.id,
                   "resource_id": session.resource_id, "model": session.model}
         state = self._socket_states.get(session.id)
@@ -104,6 +104,23 @@ class LiveSocketSessionHost(LiveSessionHost):
             self._diagnostic_callback(record)
         else:
             LOG.info("%s", json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+    async def _dispatch_provider_event(self, session, event, emit):
+        if session.closed or session.provider_events_fenced:
+            raise asyncio.CancelledError()
+        state = self._socket_states.get(session.id)
+        archive = state.output_archive if state else None
+        if archive is None:
+            emit(event)
+            return
+        for piece in archive.provider_pieces(event):
+            await archive.admit(piece)
+            if session.closed or session.provider_events_fenced:
+                raise asyncio.CancelledError()
+            # No await between admission and the guarded observation callback.
+            # Resource accounting and authoritative seq/response assignment
+            # remain on the original path, before archive enqueue and fanout.
+            emit(piece)
 
     def _emit(self, session, event):
         if event.get("type") in ("turn_complete", "interrupted", "closed") and session.response_seq:

@@ -450,6 +450,9 @@ class LiveSessionHost:
             self._emit(session, projected)
 
         async def runner() -> None:
+            dispatch = getattr(self, "_dispatch_provider_event", None)
+            dispatch_token = provider._output_dispatch.set(
+                (lambda event, emit: dispatch(session, event, emit)) if dispatch else None)
             try:
                 if self.managed_runner is not None:
                     await self.managed_runner(session=session, reader=reader, on_event=on_event)
@@ -469,6 +472,7 @@ class LiveSessionHost:
                 if session.ready and not session.ready.done():
                     session.ready.set_exception(failure)
             finally:
+                provider._output_dispatch.reset(dispatch_token)
                 session.closed = True
                 self._cancel_tool_progress(session)
                 reader.close()
