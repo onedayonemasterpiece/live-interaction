@@ -32,6 +32,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -388,7 +390,20 @@ public final class NativeLiveRuntime implements AutoCloseable {
                         if (connection != null) stopRemote(connection.sessionId(), run.stopReason); return;
                     }
                     if (connectionGeneration != run.connectionGeneration) return; // Expired attachment, not authority to stop the newer same session.
-                    if (error != null || connection == null) { disconnected(run, "LIVE_NATIVE_SESSION_UNAVAILABLE"); return; }
+                    if (error != null || connection == null) {
+                        SessionApi.ConnectFailure known = connectionFailure(error);
+                        String code = known == null ? "LIVE_NATIVE_SESSION_UNAVAILABLE" : known.code();
+                        if (known != null && !known.recoverable()) {
+                            Log.w("LiveNativeSession", "terminal_connect code=" + code
+                                    + " generation=" + connectionGeneration);
+                            fail(run, code, false); // No fresh session/token budget on terminal denial.
+                        } else {
+                            Log.w("LiveNativeSession", "retry_connect code=" + code
+                                    + " generation=" + connectionGeneration);
+                            disconnected(run, code);
+                        }
+                        return;
+                    }
                     if (connection.connectionGeneration() != connectionGeneration || connection.recoveryOnly()) {
                         stopRemote(connection.sessionId(), "invalid_connection"); fail(run, "LIVE_NATIVE_SESSION_CONFIGURATION", false); return;
                     }
@@ -481,6 +496,17 @@ public final class NativeLiveRuntime implements AutoCloseable {
                 if (!active(run) || connectionGeneration != run.connectionGeneration) return;
                 String type = event.has("type") ? event.get("type").getAsString() : "";
                 if ("interrupted".equals(type)) interruptOutput(run);
+                if ("error".equals(type) && event.has("code")) {
+                    String code = event.get("code").getAsString();
+                    if (code.matches("RESOURCE_[A-Z0-9_]+")
+                            || "LIVE_SESSION_CLOSED".equals(code)
+                            || "LIVE_SESSION_NOT_FOUND".equals(code)) {
+                        Log.w("LiveNativeSession", "terminal_socket code=" + code
+                                + " generation=" + connectionGeneration);
+                        fail(run, code, false);
+                        return;
+                    }
+                }
                 if ("output_available".equals(type) || "output_replayed".equals(type)) {
                     JsonObject copy = event.deepCopy();
                     executeNetwork(() -> { if (active(run) && connectionGeneration == run.connectionGeneration) outputEvent(run, copy, connectionGeneration); });
@@ -875,6 +901,16 @@ public final class NativeLiveRuntime implements AutoCloseable {
     }
     private void dispatch(Runnable callback) { callbacks.post(() -> { try { callback.run(); } catch (RuntimeException ignored) { } }); }
     private void executeNetwork(Runnable work) { if (!network.isShutdown()) { try { network.execute(work); } catch (RuntimeException ignored) { } } }
+    // CompletableFuture wraps the product's typed failure; do not lose its
+    // resource/quota/authorization code behind a generic reconnect symptom.
+    static SessionApi.ConnectFailure connectionFailure(Throwable failure) {
+        while (failure instanceof CompletionException || failure instanceof ExecutionException) {
+            if (failure.getCause() == null || failure.getCause() == failure) break;
+            failure = failure.getCause();
+        }
+        return failure instanceof SessionApi.ConnectFailure known ? known : null;
+    }
+
     private static String normalizedReason(String reason) { return reason != null && reason.matches("[A-Za-z][A-Za-z0-9_]{0,63}") ? reason : "explicit_stop"; }
     private static String safeCode(Exception error, String fallback) { String value = error.getMessage(); return value != null && value.matches("LIVE_[A-Z0-9_]+") ? value : fallback; }
     private static <T> CompletableFuture<T> failed(String code) { CompletableFuture<T> f = new CompletableFuture<>(); f.completeExceptionally(new IllegalStateException(code)); return f; }
