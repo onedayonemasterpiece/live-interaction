@@ -344,7 +344,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
                         public void epoch(CodecEpoch epoch) throws IOException { store.registerEpoch(descriptor.sourceId(), epoch); }
                         public void speechStarted() {
                             if (active(run) && source.connectionGeneration() == run.connectionGeneration && run.connected)
-                                interruptOutput(run);
+                                interruptOutput(run, "local_speech_started");
                         }
                         public void chunk(EncodedChunk chunk) throws IOException {
                             DurablePrefix receipt = store.append(chunk); // fsync before any local/device acknowledgement or wire submission
@@ -495,7 +495,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
             public void onEvent(JsonObject event) {
                 if (!active(run) || connectionGeneration != run.connectionGeneration) return;
                 String type = event.has("type") ? event.get("type").getAsString() : "";
-                if ("interrupted".equals(type)) interruptOutput(run);
+                if ("interrupted".equals(type)) interruptOutput(run, "provider_interrupted");
                 if ("error".equals(type) && event.has("code")) {
                     String code = event.get("code").getAsString();
                     if (code.matches("RESOURCE_[A-Z0-9_]+")
@@ -521,7 +521,12 @@ public final class NativeLiveRuntime implements AutoCloseable {
             }); }
         });
     }
-    private void interruptOutput(Run run) {
+    private void interruptOutput(Run run, String reason) {
+        NativePlayer current = run.player;
+        Log.i("LiveNativeInterrupt", "stage=interrupt reason=" + reason
+                + " connection_generation=" + run.connectionGeneration
+                + " source_id=" + (current == null ? "none" : current.activeSource())
+                + " thread=" + Thread.currentThread().getName());
         // Fence delayed encoded callbacks from the interrupted response before releasing hardware.
         for (OutputBinding binding : run.outputBindings.values()) run.suppressedOutputs.add(binding.sourceId());
         NativePlayer.PlaybackResume resume = run.playbackResume;
