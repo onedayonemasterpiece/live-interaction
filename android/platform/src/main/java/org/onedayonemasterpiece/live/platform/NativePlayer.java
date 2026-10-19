@@ -233,7 +233,7 @@ final class NativePlayer implements AutoCloseable {
             AudioTrack created = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(minimum, rate * 4 / 5)).build(); // >=400 ms
+                .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(minimum, rate * 6 / 5)).build(); // >=600 ms
             int startup;
             try {
                 startup = PlaybackStartupPolicy.boundedPrefillFrames(rate, created.getBufferSizeInFrames(), created.getBufferCapacityInFrames());
@@ -258,8 +258,10 @@ final class NativePlayer implements AutoCloseable {
                 track = selected = created; trackResponse = response; trackOriginUs = startUs + skip * 1000000L / rate;
                 trackRate = rate; trackPrefillFrames = startup; writtenSamples = lastHead = headWrap = 0; trackStarted = false;
             }
-            // Do not call play() on an empty AudioTrack. Queue 200 ms first;
-            // the output device can otherwise underrun before codec data arrives.
+            // Hold 300 ms of actual decoded PCM before live play() to tolerate
+            // ~50-ms emulator HAL gaps and compressed archive scheduling jitter.
+            // Terminal responses shorter than the prefill still start with the
+            // real remaining frames via the API31 platform threshold.
         }
         while (offset < pcm.length && !closed && expectedVersion == version.get()) {
             int writeBytes;
@@ -296,6 +298,12 @@ final class NativePlayer implements AutoCloseable {
                         trackRate, writtenSamples, finalAudio, trackPrefillFrames)) {
                     selected.play();
                     trackStarted = true;
+                    Log.i("LiveNativeAudioTrack", "stage=play_start source_id=" + trackResponse
+                            + " buffer_frames=" + selected.getBufferSizeInFrames()
+                            + " ready_frames=" + (writtenSamples - playedFramesLocked(selected))
+                            + " threshold_frames=" + (Build.VERSION.SDK_INT >= 31
+                                ? selected.getStartThresholdInFrames() : trackPrefillFrames)
+                            + " underruns=" + selected.getUnderrunCount());
                     setPlaying(true); // same hardware lock as interrupt and release
                     started = true;
                 }
@@ -327,11 +335,26 @@ final class NativePlayer implements AutoCloseable {
     }
     private void releaseTrack() {
         AudioTrack selected;
+        String source;
+        long submitted, played;
         synchronized (hardware) {
-            selected = track; track = null; trackStarted = false; trackPrefillFrames = 0;
+            selected = track;
+            source = trackResponse;
+            submitted = writtenSamples;
+            long observed = 0;
+            if (selected != null) {
+                try { observed = playedFramesLocked(selected); }
+                catch (RuntimeException ignored) { observed = Math.min(writtenSamples, headWrap + lastHead); }
+            }
+            played = observed;
+            track = null; trackStarted = false; trackPrefillFrames = 0;
             setPlaying(false);
         }
         if (selected != null) {
+            Log.i("LiveNativeAudioTrack", "stage=release source_id=" + source
+                    + " written_frames=" + submitted + " played_frames=" + played
+                    + " remaining_frames=" + (submitted - played)
+                    + " underruns=" + selected.getUnderrunCount());
             try { selected.pause(); } catch (RuntimeException ignored) { }
             try { selected.flush(); } catch (RuntimeException ignored) { }
             selected.release();

@@ -6,18 +6,19 @@ import static org.junit.Assert.*;
 /** Silence-at-start and short-response prebuffer invariants; device waveform is a separate gate. */
 public class PlaybackStartupPolicyTest {
     @Test public void prebufferMustBeExactlyBoundedAndRateAware() {
-        assertEquals(9600, PlaybackStartupPolicy.prefillFrames(48000));
-        assertEquals(3200, PlaybackStartupPolicy.prefillFrames(16000));
-        assertEquals(19200, PlaybackStartupPolicy.nextWriteBytes(48000, 0, 50000));
-        assertEquals(3200, PlaybackStartupPolicy.nextWriteBytes(48000, 8000, 50000));
+        assertEquals(14400, PlaybackStartupPolicy.prefillFrames(48000));
+        assertEquals(4800, PlaybackStartupPolicy.prefillFrames(16000));
+        assertEquals(28800, PlaybackStartupPolicy.nextWriteBytes(48000, 0, 50000));
+        assertEquals(12800, PlaybackStartupPolicy.nextWriteBytes(48000, 8000, 50000));
         assertEquals(200, PlaybackStartupPolicy.nextWriteBytes(48000, 8000, 200));
-        assertEquals(1024, PlaybackStartupPolicy.nextWriteBytes(48000, 9600, 1024));
-        assertFalse(PlaybackStartupPolicy.canStart(48000, 9599, false));
-        assertTrue(PlaybackStartupPolicy.canStart(48000, 9600, false));
+        assertEquals(1024, PlaybackStartupPolicy.nextWriteBytes(48000, 14400, 1024));
+        assertFalse(PlaybackStartupPolicy.canStart(48000, 14399, false));
+        assertTrue(PlaybackStartupPolicy.canStart(48000, 14400, false));
     }
     @Test public void platformStartThresholdCannotSilentlyExceedPrebufferCapacity() {
-        // 400 ms requested, 200 ms prefill; if a vendor supplies a smaller
+        // 600 ms requested, 300 ms prefill; if a vendor supplies a smaller
         // effective buffer, use at most half its actual capacity.
+        assertEquals(14400, PlaybackStartupPolicy.boundedPrefillFrames(48000, 28800, 28800));
         assertEquals(9600, PlaybackStartupPolicy.boundedPrefillFrames(48000, 19200, 19200));
         assertEquals(3600, PlaybackStartupPolicy.boundedPrefillFrames(48000, 7200, 24000));
         assertEquals(300, PlaybackStartupPolicy.boundedPrefillFrames(16000, 600, 1024));
