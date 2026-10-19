@@ -71,6 +71,7 @@ jobs:
         run: |
           npm test
           python -m pip install -e '.[audio]'
+          python -c "import av; assert av.__version__ == '18.1.0'"
           npm run test:python
           gradle --no-daemon -p android test
       - name: Publish prerelease without overwriting tags or assets

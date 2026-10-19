@@ -16,6 +16,10 @@ from .audio_v2 import (BoundSource, CodecEpoch, EncodedChunk, OutputChunk,
                        SourceDescriptor, EPOCH_END, MAX_SAFE_INTEGER, integer, invalid)
 
 
+OUTPUT_CACHE_EVENTS = 320
+OUTPUT_CACHE_BYTES = 131072
+
+
 @dataclass(frozen=True)
 class ArchivedOutput:
     source: BoundSource
@@ -96,7 +100,7 @@ class AudioOutputArchive:
                     seq = int(event["seq"])
                     self.results[seq] = outputs
                     self.result_bytes += sum(len(c.chunk.payload) for output in outputs for c in output.chunks)
-                    while len(self.results) > 320 or self.result_bytes > 131072:
+                    while len(self.results) > OUTPUT_CACHE_EVENTS or self.result_bytes > OUTPUT_CACHE_BYTES:
                         _, old = self.results.popitem(last=False)
                         self.result_bytes -= sum(len(c.chunk.payload) for output in old for c in output.chunks)
                     self.processed_seq = seq

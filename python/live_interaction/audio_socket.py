@@ -10,6 +10,7 @@ from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from .session_host import LiveError
 from .audio_v2 import (AudioFrame, BoundSource, CodecEpoch, DurablePCMProjection, EncodedChunk,
                        SourceDescriptor, MAX_SAFE_INTEGER, UPLINK_MAGIC, DOWNLINK_MAGIC,
                        RECOVERY, PORTION_START, PORTION_END, EPOCH_END, EVENT_END, SOURCE_FLAGS,
@@ -436,7 +437,26 @@ class SocketAudioV2:
         """The existing writer obtains only committed original compressed bytes."""
         kind = event.get("type")
         if kind != "interrupted":
-            for archived in await self.archive.for_event(event):
+            try:
+                outputs = await self.archive.for_event(event)
+            except LiveError as error:
+                response = event.get("response_id")
+                if (error.code != "LIVE_AUDIO_OUTPUT_HISTORY"
+                        or kind not in ("audio", "turn_complete", "closed")
+                        or not isinstance(response, int) or isinstance(response, bool) or response < 1):
+                    raise
+                # Eviction is not loss of the durable original. Reuse the
+                # bounded recovery lane and its unchanged byte/ACK/played
+                # contract instead of detaching a healthy socket. It preserves
+                # output_next, so an already sent prefix is never sent twice.
+                if not self.binding.stopped and not self.archive.is_cancelled(response):
+                    source_id = f"out_{self.binding.session.id}_{response}"
+                    if source_id not in self.output_recovering:
+                        self._request_output(source_id, 0)
+                        self.binding.host.diagnostic(self.binding.session, "socket_output_cache_recovery",
+                            code=error.code, connection_generation=self.binding.state.generation)
+                outputs = ()
+            for archived in outputs:
                 if archived.cancelled or self.archive.is_cancelled(archived.response_id):
                     continue
                 source_id = archived.source.source.source_id
