@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .session_host import LiveError, LiveSessionHost, LiveStopReason, _maybe_await
+from . import provider
 
 SOCKET_PROTOCOL = "wl-live-v1"
 TICKET_TTL_SECONDS = 15
@@ -107,7 +108,7 @@ class LiveSocketSessionHost(LiveSessionHost):
 
     async def _dispatch_provider_event(self, session, event, emit):
         if session.closed or session.provider_events_fenced:
-            raise asyncio.CancelledError()
+            raise provider.ProviderDispatchStopped()
         state = self._socket_states.get(session.id)
         archive = state.output_archive if state else None
         if archive is None:
@@ -116,7 +117,7 @@ class LiveSocketSessionHost(LiveSessionHost):
         for piece in archive.provider_pieces(event):
             await archive.admit(piece)
             if session.closed or session.provider_events_fenced:
-                raise asyncio.CancelledError()
+                raise provider.ProviderDispatchStopped()
             # No await between admission and the guarded observation callback.
             # Resource accounting and authoritative seq/response assignment
             # remain on the original path, before archive enqueue and fanout.

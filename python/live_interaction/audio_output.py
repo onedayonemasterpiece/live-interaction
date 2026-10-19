@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .provider import ProviderDispatchStopped
 from .audio_v2 import (BoundSource, CodecEpoch, EncodedChunk, OutputChunk,
                        SourceDescriptor, EPOCH_END, MAX_SAFE_INTEGER, integer, invalid)
 
@@ -49,6 +50,7 @@ class AudioOutputArchive:
         self.debug_extended = os.environ.get("LIVE_AUDIO_DIAGNOSTICS") == "extended"
         self._audio_commits = 0
         self._last_encode_ms = self._last_commit_ms = 0
+        self._stop_task = None
         self.error = None
         self.closing = False
         self.encoder = None
@@ -96,7 +98,7 @@ class AudioOutputArchive:
         synchronous, so there is no task per audio item or duplicate queue.
         """
         if self.closing:
-            raise asyncio.CancelledError()
+            raise ProviderDispatchStopped()
         size = len(event.get("data") or "") if event.get("type") == "audio" else 0
         duration = 0
         if size:
@@ -110,7 +112,7 @@ class AudioOutputArchive:
         started = time.monotonic()
         while True:
             if self.closing:
-                raise asyncio.CancelledError()
+                raise ProviderDispatchStopped()
             if self.error:
                 raise self.error
             if self.task.done():
@@ -167,8 +169,9 @@ class AudioOutputArchive:
         # No audio can be advertised as durable after storage/codec failure.
         # This task is separate from the archive worker so shutdown can join it.
         if not self.session.closed:
-            asyncio.create_task(self.host.stop(session_id=self.session.id, resource_id=self.session.resource_id,
-                                               actor=self.session.actor))
+            self._stop_task = asyncio.create_task(self.host.stop(
+                session_id=self.session.id, resource_id=self.session.resource_id,
+                actor=self.session.actor))
 
     async def _run(self):
         try:

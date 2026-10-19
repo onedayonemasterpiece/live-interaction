@@ -9,6 +9,12 @@ from contextvars import ContextVar
 # Session-scoped flow control propagates through the resource guard's child
 # provider task without changing its synchronous accounting callback.
 _output_dispatch = ContextVar("live_output_dispatch", default=None)
+
+
+class ProviderDispatchStopped(Exception):
+    """A normally fenced output receiver, not an asyncio task cancellation."""
+
+
 import os
 import re
 import sys
@@ -777,6 +783,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if state.get('transition'):
                     continue
                 raise ConnectionError('provider_connection_closed')
+            except ProviderDispatchStopped:
+                state['stopped'] = True
+                break
             except Exception as exc:
                 state['ws'] = None
                 if state.get('resource_error') is not None:

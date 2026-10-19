@@ -5,6 +5,7 @@ import struct
 import unittest
 
 from live_interaction.session_host import LiveError
+from live_interaction import provider as provider_module
 from live_interaction.socket_host import LiveSocketSessionHost, SOCKET_PROTOCOL
 from live_interaction.socket_transport import decode_audio, encode_output, same_origin, serve_socket, socket_ticket
 from session_host_test import Adapter, Provider
@@ -48,6 +49,36 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
 
     def renew(self):
         return self.host.issue_socket_ticket(session_id=self.sid, resource_id="story1", actor=self.actor)["socket_ticket"]
+
+    async def test_managed_runner_context_reaches_actual_child_provider_task(self):
+        # A production resource guard spawns its provider task after entering
+        # the session runner. Test that creation boundary (not a context
+        # manually installed by the test itself).
+        other_provider = Provider()
+        inherited = []
+        async def managed(*, session, reader, on_event):
+            async def provider_child():
+                inherited.append(provider_module._output_dispatch.get())
+                await other_provider.run(load_key=lambda: "fixture", reader=reader,
+                                         on_event=on_event)
+            await asyncio.create_task(provider_child())
+        other = LiveSocketSessionHost(
+            adapter_factory=lambda **_kw: ManualAdapter(),
+            key_resolver=lambda *_: "fixture",
+            provider_run=other_provider.run,
+            managed_runner=managed,
+            ready_timeout_ms=500,
+        )
+        try:
+            fresh = await other.start(resource_id="other", actor=self.actor,
+                                      attempt_id="managed-context")
+            self.assertEqual(len(inherited), 1)
+            self.assertTrue(callable(inherited[0]),
+                            "Managed child provider must inherit output admission")
+            self.assertIn(fresh["session_id"], other.sessions)
+        finally:
+            await other.stop_all()
+            await other.close()
 
     async def test_ticket_is_single_use_resource_actor_bound_and_not_stored_plain(self):
         self.assertEqual(self.started["transport_protocol"], SOCKET_PROTOCOL)
