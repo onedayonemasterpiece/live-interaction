@@ -4,6 +4,17 @@ import asyncio
 import json
 import logging
 import inspect
+from contextvars import ContextVar
+
+# Session-scoped flow control propagates through the resource guard's child
+# provider task without changing its synchronous accounting callback.
+_output_dispatch = ContextVar("live_output_dispatch", default=None)
+
+
+class ProviderDispatchStopped(Exception):
+    """A normally fenced output receiver, not an asyncio task cancellation."""
+
+
 import os
 import re
 import sys
@@ -340,21 +351,21 @@ def setup_config(model, context, history=None, *, configuration=None, search=Fal
     return {'setup': setup}
 
 
-def handle_server_message(obj, emit=emit):
+def _server_events(obj):
     if 'error' in obj:
         raise RuntimeError(json.dumps(obj['error'], ensure_ascii=False))
     content = obj.get('serverContent') or {}
     status = obj.get('interactionStatus') or content.get('interactionStatus') or (obj.get('toolCall') or {}).get('interactionStatus')
     if status:
-        emit({'type': 'interaction_status', 'status': status})
+        yield {'type': 'interaction_status', 'status': status}
     if obj.get('toolCallCancellation'):
-        emit({'type': 'tool_cancelled', 'ids': obj['toolCallCancellation'].get('ids', [])})
+        yield {'type': 'tool_cancelled', 'ids': obj['toolCallCancellation'].get('ids', [])}
     if obj.get('toolCall'):
-        emit({'type': 'tool_call', 'calls': obj['toolCall'].get('functionCalls', [])})
+        yield {'type': 'tool_call', 'calls': obj['toolCall'].get('functionCalls', [])}
     if content.get('groundingMetadata'):
-        emit({'type': 'grounding', 'metadata': content['groundingMetadata']})
+        yield {'type': 'grounding', 'metadata': content['groundingMetadata']}
     if obj.get('usageMetadata'):
-        emit({'type': 'usage', 'metadata': obj['usageMetadata']})
+        yield {'type': 'usage', 'metadata': obj['usageMetadata']}
     for field, kind in [
         ('interimInputTranscription', 'interim_input_transcript'),
         ('inputTranscription', 'input_transcript'),
@@ -364,17 +375,33 @@ def handle_server_message(obj, emit=emit):
             # Preserve provider transcription losslessly for trusted product observers.
             # Interim input text is speculative UI telemetry and must not be persisted
             # as the authoritative user transcript by product adapters.
-            emit({'type': kind, 'text': content[field]['text']})
+            yield {'type': kind, 'text': content[field]['text']}
     if content.get('interrupted'):
-        emit({'type': 'interrupted'})
+        yield {'type': 'interrupted'}
     for part in (content.get('modelTurn') or {}).get('parts', []):
         data = part.get('inlineData') or {}
         if str(data.get('mimeType', '')).startswith('audio/pcm') and data.get('data'):
-            emit({'type': 'audio', 'mime_type': data.get('mimeType'), 'data': data.get('data')})
+            yield {'type': 'audio', 'mime_type': data.get('mimeType'), 'data': data.get('data')}
     if content.get('generationComplete'):
-        emit({'type': 'generation_complete'})
+        yield {'type': 'generation_complete'}
     if content.get('turnComplete'):
-        emit({'type': 'turn_complete'})
+        yield {'type': 'turn_complete'}
+
+
+def handle_server_message(obj, emit=emit):
+    """Synchronous compatibility parser; never creates hidden event tasks."""
+    for event in _server_events(obj):
+        emit(event)
+
+
+async def handle_server_message_async(obj, emit=emit):
+    """Apply bounded host admission before observing each ordered event."""
+    dispatch = _output_dispatch.get()
+    for event in _server_events(obj):
+        if dispatch is None:
+            emit(event)
+        else:
+            await dispatch(event, emit)
 
 
 async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guard=None, reconnect_budget=None):
@@ -670,7 +697,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             if 'setupComplete' in obj:
                                 break
                             _guard_check(resource_guard)
-                            handle_server_message(obj, emit=emit_observed)
+                            await handle_server_message_async(obj, emit=emit_observed)
                     if state['stopped']:
                         return
                     if transition and loop.time() >= transition['deadline']:
@@ -748,7 +775,7 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                             state['go_away'] = True
                             emit({'type': 'go_away', 'time_left': obj['goAway'].get('timeLeft')})
                             break
-                        handle_server_message(obj, emit=emit_observed)
+                        await handle_server_message_async(obj, emit=emit_observed)
                 if state.get('resource_error') is not None:
                     raise state['resource_error']
                 if state['stopped']:
@@ -756,6 +783,9 @@ async def run(*, load_key=default_key, reader=None, on_event=emit, resource_guar
                 if state.get('transition'):
                     continue
                 raise ConnectionError('provider_connection_closed')
+            except ProviderDispatchStopped:
+                state['stopped'] = True
+                break
             except Exception as exc:
                 state['ws'] = None
                 if state.get('resource_error') is not None:

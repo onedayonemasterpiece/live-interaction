@@ -3,6 +3,7 @@ package org.onedayonemasterpiece.live.platform;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
 /** Product-owned, authenticated same-origin session/ticket API. No provider credentials. */
@@ -10,6 +11,21 @@ public interface SessionApi {
     CompletableFuture<Connection> connect(StartContext context, String previousSessionId,
             long eventCursor, int connectionGeneration, boolean recoveryOnly);
     CompletableFuture<Void> stop(String sessionId, String reason);
+
+    /** Typed product API failure. Only a safe machine code crosses this boundary. */
+    final class ConnectFailure extends IOException {
+        private final String code;
+        private final boolean recoverable;
+
+        public ConnectFailure(String code, boolean recoverable) {
+            super(code != null && code.matches("(?:RESOURCE|LIVE|NATIVE|HTTP)_[A-Z0-9_]+")
+                ? code : "LIVE_NATIVE_SESSION_UNAVAILABLE");
+            this.code = getMessage();
+            this.recoverable = recoverable;
+        }
+        public String code() { return code; }
+        public boolean recoverable() { return recoverable; }
+    }
 
     /** Opaque credentials intentionally have no generated record/toString representation. */
     final class Connection {

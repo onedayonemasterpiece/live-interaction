@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from live_interaction.audio_v2 import *
 from live_interaction.audio_codec import PyAVAudioCodecFactory, PyAVDecoder, adts_packets, opus_samples
+from live_interaction import provider as provider_module
 from live_interaction.audio_socket import AudioWorkPool, SocketAudioV2
 from live_interaction.socket_host import LiveSocketSessionHost
 from live_interaction.socket_transport import serve_socket, socket_protocol, socket_ticket
@@ -476,6 +477,58 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
 
     async def test_durable_v2_backlog_does_not_retain_provider_pcm_in_relay(self):
         await self._durable_v2_backlog()
+
+    async def test_provider_receive_burst_waits_for_real_archive_commits(self):
+        # Unlike synthetic direct on_event calls, this exercises the exact
+        # provider recv parser + session ContextVar + guarded host callback.
+        # Force the first *durable* store commit to pause, then send 9.6 s of
+        # 320-ms PCM packets. Previously the eighth packet overflowed 2 s.
+        archive = self.binding.state.output_archive
+        source_id = f"out_{self.session.id}_1"
+        self.store.output_gate = asyncio.Event()
+        pcm = b"\x01\x00" * 7680
+        item = {"serverContent": {"modelTurn": {"parts": [{"inlineData": {
+            "mimeType": "audio/pcm;rate=24000",
+            "data": base64.b64encode(pcm).decode("ascii"),
+        }}]}}}
+        token = provider_module._output_dispatch.set(
+            lambda event, sink: self.host._dispatch_provider_event(self.session, event, sink))
+        producer = None
+        try:
+            async def actual_recv():
+                for _ in range(30):
+                    await provider_module.handle_server_message_async(item, emit=self.provider.events)
+                await provider_module.handle_server_message_async(
+                    {"serverContent": {"turnComplete": True}}, emit=self.provider.events)
+            producer = asyncio.create_task(actual_recv())
+            await asyncio.wait_for(self.store.output_entered.wait(), 2)
+            await asyncio.sleep(.05)
+            self.assertFalse(producer.done(), "Producer must stop reading at bounded archive admission")
+            self.assertLessEqual(archive.queued_duration_us, 2_000_000)
+            self.assertIsNone(archive.error)
+            self.store.output_gate.set()
+            await asyncio.wait_for(producer, 8)
+            await settle(lambda: source_id in self.store.seals, timeout=3)
+            self.assertEqual(self.store.seals[source_id][1], 9_600_000)
+            self.assertFalse(self.task.done(), self.closes)
+        finally:
+            self.store.output_gate.set()
+            if producer is not None:
+                if not producer.done():
+                    producer.cancel()
+                await asyncio.gather(producer, return_exceptions=True)
+            provider_module._output_dispatch.reset(token)
+
+    async def test_provider_single_oversized_event_preserves_exact_pcm_by_splitting(self):
+        archive = self.binding.state.output_archive
+        raw = b"\x7f\x00" * 120000
+        event = {"type": "audio", "mime_type": "audio/pcm;rate=24000",
+                 "data": base64.b64encode(raw).decode("ascii")}
+        pieces = list(archive.provider_pieces(event))
+        self.assertGreater(len(pieces), 5)
+        self.assertEqual(b"".join(base64.b64decode(p["data"]) for p in pieces), raw)
+        self.assertTrue(all(len(p["data"]) <= 60_000 for p in pieces))
+        self.assertEqual(event["data"], base64.b64encode(raw).decode("ascii"))
 
     async def test_evicted_v2_backlog_recovers_originals_without_detaching(self):
         # Exercise the production eviction path under a deliberately tiny
