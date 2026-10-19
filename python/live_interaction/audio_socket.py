@@ -545,6 +545,9 @@ class SocketAudioV2:
         elif entry[1] != archived.epoch or entry[0].server_source_id != archived.source.server_source_id:
             raise invalid("OUTPUT_IDENTITY", "Original output binding changed")
         ref = entry[2]
+        # Historical recovery may reuse a numeric response id from a different
+        # session. Only this host's exact source shares its interruption fence.
+        owns_response = source_id == f"out_{self.binding.session.id}_{archived.response_id}"
         self.output_bindings[source_id] = (archived.source, archived.epoch, ref)
         for index, original in enumerate(archived.chunks):
             chunk = original.chunk
@@ -553,10 +556,10 @@ class SocketAudioV2:
                 continue
             if chunk.chunk_seq != expected:
                 raise invalid("OUTPUT_SEQUENCE", "Output codec dependencies are not contiguous")
-            if self.archive.is_cancelled(archived.response_id) and not recovery:
+            if owns_response and self.archive.is_cancelled(archived.response_id):
                 return
             await self._admit_output(source_id, chunk, recovery)
-            if self.archive.is_cancelled(archived.response_id) and not recovery:
+            if owns_response and self.archive.is_cancelled(archived.response_id):
                 pending = self.output_pending.pop((source_id, chunk.chunk_seq), None)
                 if pending:
                     size, duration, lane = pending
