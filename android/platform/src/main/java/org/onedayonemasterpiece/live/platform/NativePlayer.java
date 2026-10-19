@@ -6,6 +6,8 @@ import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaCodecList;
 import android.media.MediaFormat;
+import android.os.Build;
+import android.util.Log;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -43,7 +45,7 @@ final class NativePlayer implements AutoCloseable {
     private AudioTrack track;
     private String trackResponse;
     private long trackOriginUs, writtenSamples, lastHead, headWrap, lastReportMs;
-    private int trackRate;
+    private int trackRate, trackPrefillFrames;
     private boolean trackStarted; // guarded by hardware: queued PCM is not yet physically playing
     private long queuedDuration;
     private int queuedBytes, queuedItems;
@@ -107,18 +109,20 @@ final class NativePlayer implements AutoCloseable {
     void stopImmediately() { reportPosition(); closed = true; interrupt(); }
     void reportPosition() {
         String response; long position; boolean pending;
+        AudioTrack observed;
         synchronized (hardware) {
-            if (track == null || !trackStarted) return; // Never mark prefilling PCM as played.
+            observed = track;
+            if (observed == null || !trackStarted) return; // Never mark prefilling PCM as played.
             try {
-                long head = track.getPlaybackHeadPosition() & 0xffffffffL;
-                if (head < lastHead) headWrap += 1L << 32;
-                lastHead = head;
-                long samples = Math.min(writtenSamples, headWrap + head);
+                long samples = playedFramesLocked(observed);
                 response = trackResponse; position = trackOriginUs + samples * 1000000L / trackRate;
                 pending = samples < writtenSamples;
             } catch (RuntimeException ignored) { return; }
         }
-        setPlaying(pending);
+        // Ignore a position callback from a track already interrupted/released.
+        synchronized (hardware) {
+            if (track == observed && trackStarted) setPlaying(pending);
+        }
         playedPositions.merge(response, position, Math::max);
         synchronized (receiptsLock) {
             Long end = pendingEnds.get(response);
@@ -195,13 +199,21 @@ final class NativePlayer implements AutoCloseable {
         // Very short replies never reach the 200-ms startup threshold. Their
         // terminal decoder event still starts precisely the PCM already queued.
         AudioTrack pending;
-        synchronized (hardware) { pending = track; }
+        synchronized (hardware) {
+            pending = track;
+            // Empty decoded output must never get a successful played receipt.
+            if (pending != null && writtenSamples == 0)
+                throw CompressedAudio.invalid("OUTPUT_EMPTY");
+        }
         if (pending != null) startBufferedTrack(pending, expectedVersion, true);
         long deadline = System.nanoTime() + 35000000000L;
         while (!closed && expectedVersion == version.get()) {
             reportPosition();
             synchronized (hardware) {
                 if (track == null || (headWrap + lastHead) >= writtenSamples) return;
+                // A terminal tail may arrive after starvation or rerouting.
+                // Recheck the actual unplayed queue until the hardware drains.
+                adjustTerminalThresholdLocked(track);
             }
             if (System.nanoTime() > deadline) throw CompressedAudio.invalid("PLAYBACK_STALLED");
             Thread.sleep(10);
@@ -222,10 +234,29 @@ final class NativePlayer implements AutoCloseable {
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
                 .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(Math.max(minimum, rate * 4 / 5)).build(); // >=400 ms
+            int startup;
+            try {
+                startup = PlaybackStartupPolicy.boundedPrefillFrames(rate, created.getBufferSizeInFrames(), created.getBufferCapacityInFrames());
+                if (Build.VERSION.SDK_INT >= 31) {
+                    // Android S defaults its streaming start threshold to the *whole*
+                    // track capacity. Without this explicit bound a short voice
+                    // response can remain buffered forever despite play().
+                    int actual = created.setStartThresholdInFrames(startup);
+                    if (actual < 1 || actual >= created.getBufferSizeInFrames())
+                        throw CompressedAudio.invalid("OUTPUT_START_THRESHOLD");
+                    startup = Math.max(startup, actual);
+                }
+                Log.i("LiveNativeAudioTrack", "buffer_frames=" + created.getBufferSizeInFrames()
+                        + " capacity_frames=" + created.getBufferCapacityInFrames()
+                        + " start_threshold_frames=" + startup);
+            } catch (RuntimeException error) {
+                created.release();
+                throw CompressedAudio.invalid("OUTPUT_START_THRESHOLD");
+            }
             synchronized (hardware) {
                 if (closed || expectedVersion != version.get()) { created.release(); return; }
                 track = selected = created; trackResponse = response; trackOriginUs = startUs + skip * 1000000L / rate;
-                trackRate = rate; writtenSamples = lastHead = headWrap = 0; trackStarted = false;
+                trackRate = rate; trackPrefillFrames = startup; writtenSamples = lastHead = headWrap = 0; trackStarted = false;
             }
             // Do not call play() on an empty AudioTrack. Queue 200 ms first;
             // the output device can otherwise underrun before codec data arrives.
@@ -235,7 +266,7 @@ final class NativePlayer implements AutoCloseable {
             synchronized (hardware) {
                 if (track != selected) return;
                 writeBytes = trackStarted ? pcm.length - offset :
-                    PlaybackStartupPolicy.nextWriteBytes(rate, writtenSamples, pcm.length - offset);
+                    PlaybackStartupPolicy.nextWriteBytes(rate, writtenSamples, pcm.length - offset, trackPrefillFrames);
             }
             int count;
             try { count = selected.write(pcm, offset, writeBytes, AudioTrack.WRITE_BLOCKING); }
@@ -256,27 +287,55 @@ final class NativePlayer implements AutoCloseable {
     private void startBufferedTrack(AudioTrack selected, long expectedVersion, boolean finalAudio) {
         boolean started = false;
         synchronized (hardware) {
-            if (track == selected && !trackStarted && !closed && expectedVersion == version.get()
-                    && PlaybackStartupPolicy.canStart(trackRate, writtenSamples, finalAudio)) {
-                selected.play();
-                trackStarted = true;
-                started = true;
+            if (track == selected && !closed && expectedVersion == version.get()) {
+                // A route change can raise the actual platform threshold after
+                // creating the track. Check the *live* value at terminal even
+                // when play() was already requested for this response.
+                if (finalAudio) adjustTerminalThresholdLocked(selected);
+                if (!trackStarted && PlaybackStartupPolicy.canStart(
+                        trackRate, writtenSamples, finalAudio, trackPrefillFrames)) {
+                    selected.play();
+                    trackStarted = true;
+                    setPlaying(true); // same hardware lock as interrupt and release
+                    started = true;
+                }
             }
         }
-        if (started && !closed && expectedVersion == version.get()) {
-            setPlaying(true);
-            listener.timing("audio_scheduled");
+        if (started) synchronized (hardware) {
+            if (track == selected && trackStarted && !closed && expectedVersion == version.get())
+                listener.timing("audio_scheduled");
         }
+    }
+    /** Caller owns hardware; preserve one extended hardware clock across queries. */
+    private long playedFramesLocked(AudioTrack selected) {
+        long head = selected.getPlaybackHeadPosition() & 0xffffffffL;
+        if (head < lastHead) headWrap += 1L << 32;
+        lastHead = head;
+        return Math.min(writtenSamples, headWrap + head);
+    }
+    private void adjustTerminalThresholdLocked(AudioTrack selected) {
+        if (Build.VERSION.SDK_INT < 31 || writtenSamples == 0) return;
+        long played = playedFramesLocked(selected);
+        int currentThreshold = selected.getStartThresholdInFrames();
+        int requested = PlaybackStartupPolicy.terminalThresholdFrames(writtenSamples, played, currentThreshold);
+        if (requested == currentThreshold) return;
+        int actual = selected.setStartThresholdInFrames(requested);
+        if (actual < 1 || actual > requested) throw CompressedAudio.invalid("OUTPUT_SHORT_START_THRESHOLD");
+        Log.i("LiveNativeAudioTrack", "stage=terminal_drain written_frames=" + writtenSamples
+                + " played_frames=" + played + " remaining_frames=" + (writtenSamples - played)
+                + " threshold_frames=" + actual + " underruns=" + selected.getUnderrunCount());
     }
     private void releaseTrack() {
         AudioTrack selected;
-        synchronized (hardware) { selected = track; track = null; trackStarted = false; }
+        synchronized (hardware) {
+            selected = track; track = null; trackStarted = false; trackPrefillFrames = 0;
+            setPlaying(false);
+        }
         if (selected != null) {
             try { selected.pause(); } catch (RuntimeException ignored) { }
             try { selected.flush(); } catch (RuntimeException ignored) { }
             selected.release();
         }
-        setPlaying(false);
     }
     private void setPlaying(boolean next) { if (playing != next) { playing = next; listener.playing(next); } }
     private void closeDecoder() { if (decoder != null) { decoder.close(); decoder = null; } }
