@@ -17,7 +17,7 @@ public class PlaybackStartupPolicyTest {
     }
     @Test public void platformStartThresholdCannotSilentlyExceedPrebufferCapacity() {
         // 400 ms requested, 200 ms prefill; if a vendor supplies a smaller
-        // effective buffer, use strictly less than half its actual capacity.
+        // effective buffer, use at most half its actual capacity.
         assertEquals(9600, PlaybackStartupPolicy.boundedPrefillFrames(48000, 19200, 19200));
         assertEquals(3600, PlaybackStartupPolicy.boundedPrefillFrames(48000, 7200, 24000));
         assertEquals(300, PlaybackStartupPolicy.boundedPrefillFrames(16000, 600, 1024));
@@ -29,6 +29,25 @@ public class PlaybackStartupPolicyTest {
         assertFalse(PlaybackStartupPolicy.canStart(48000, 0, true, 9600));
         assertThrows(IllegalArgumentException.class,
                 () -> PlaybackStartupPolicy.boundedPrefillFrames(48000, 1, 9600));
+    }
+    @Test public void terminalUnderrunUsesRemainingFramesNotCumulativeWrittenSamples() {
+        // One second has played; only the last 120 ms remain after starvation.
+        assertEquals(5760, PlaybackStartupPolicy.terminalThresholdFrames(53760, 48000, 9600));
+        assertEquals(4800, PlaybackStartupPolicy.terminalThresholdFrames(53760, 48960, 5760));
+        assertEquals(5760, PlaybackStartupPolicy.terminalThresholdFrames(5760, 0, 9600));
+        assertEquals(9600, PlaybackStartupPolicy.terminalThresholdFrames(57600, 48000, 9600));
+        assertEquals(9600, PlaybackStartupPolicy.terminalThresholdFrames(72000, 48000, 9600));
+        assertEquals(1, PlaybackStartupPolicy.terminalThresholdFrames(48001, 48000, 9600));
+        assertEquals(9600, PlaybackStartupPolicy.terminalThresholdFrames(48000, 48000, 9600));
+        assertEquals(9600, PlaybackStartupPolicy.terminalThresholdFrames(0, 0, 9600));
+        long wrap = 1L << 32;
+        assertEquals(5760, PlaybackStartupPolicy.terminalThresholdFrames(wrap + 53760, wrap + 48000, 9600));
+        assertThrows(IllegalArgumentException.class,
+                () -> PlaybackStartupPolicy.terminalThresholdFrames(1, 2, 9600));
+        assertThrows(IllegalArgumentException.class,
+                () -> PlaybackStartupPolicy.terminalThresholdFrames(-1, 0, 9600));
+        assertThrows(IllegalArgumentException.class,
+                () -> PlaybackStartupPolicy.terminalThresholdFrames(1, 0, 0));
     }
     @Test public void shortResponseStartsOnlyAfterRealPcmAndNeverFabricatesPlayhead() {
         assertFalse(PlaybackStartupPolicy.canStart(48000, 0, true));

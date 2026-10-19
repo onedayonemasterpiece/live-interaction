@@ -14,6 +14,15 @@ final class PlaybackStartupPolicy {
         if (bufferFrames < 2 || capacityFrames < 2) throw new IllegalArgumentException("LIVE_CODEC_OUTPUT_CAPACITY");
         return Math.max(1, Math.min(prefillFrames(sampleRate), Math.min(bufferFrames, capacityFrames) / 2));
     }
+    /** Terminal refill is based on unplayed frames, not cumulative writes.
+     * No frames or played receipts are invented by changing a platform threshold.
+     */
+    static int terminalThresholdFrames(long writtenFrames, long playedFrames, int currentThreshold) {
+        if (writtenFrames < 0 || playedFrames < 0 || playedFrames > writtenFrames || currentThreshold < 1)
+            throw new IllegalArgumentException("LIVE_CODEC_OUTPUT_POSITION");
+        long remaining = writtenFrames - playedFrames;
+        return remaining == 0 ? currentThreshold : (int) Math.min(currentThreshold, remaining);
+    }
     static int nextWriteBytes(int sampleRate, long queuedFrames, int remainingBytes) {
         return nextWriteBytes(sampleRate, queuedFrames, remainingBytes, prefillFrames(sampleRate));
     }

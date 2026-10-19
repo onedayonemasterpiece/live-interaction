@@ -114,10 +114,7 @@ final class NativePlayer implements AutoCloseable {
             observed = track;
             if (observed == null || !trackStarted) return; // Never mark prefilling PCM as played.
             try {
-                long head = track.getPlaybackHeadPosition() & 0xffffffffL;
-                if (head < lastHead) headWrap += 1L << 32;
-                lastHead = head;
-                long samples = Math.min(writtenSamples, headWrap + head);
+                long samples = playedFramesLocked(observed);
                 response = trackResponse; position = trackOriginUs + samples * 1000000L / trackRate;
                 pending = samples < writtenSamples;
             } catch (RuntimeException ignored) { return; }
@@ -214,6 +211,9 @@ final class NativePlayer implements AutoCloseable {
             reportPosition();
             synchronized (hardware) {
                 if (track == null || (headWrap + lastHead) >= writtenSamples) return;
+                // A terminal tail may arrive after starvation or rerouting.
+                // Recheck the actual unplayed queue until the hardware drains.
+                adjustTerminalThresholdLocked(track);
             }
             if (System.nanoTime() > deadline) throw CompressedAudio.invalid("PLAYBACK_STALLED");
             Thread.sleep(10);
@@ -291,12 +291,7 @@ final class NativePlayer implements AutoCloseable {
                 // A route change can raise the actual platform threshold after
                 // creating the track. Check the *live* value at terminal even
                 // when play() was already requested for this response.
-                if (Build.VERSION.SDK_INT >= 31 && finalAudio && writtenSamples > 0
-                        && selected.getStartThresholdInFrames() > writtenSamples) {
-                    int actual = selected.setStartThresholdInFrames((int) writtenSamples);
-                    if (actual < 1 || actual > writtenSamples)
-                        throw CompressedAudio.invalid("OUTPUT_SHORT_START_THRESHOLD");
-                }
+                if (finalAudio) adjustTerminalThresholdLocked(selected);
                 if (!trackStarted && PlaybackStartupPolicy.canStart(
                         trackRate, writtenSamples, finalAudio, trackPrefillFrames)) {
                     selected.play();
@@ -310,6 +305,25 @@ final class NativePlayer implements AutoCloseable {
             if (track == selected && trackStarted && !closed && expectedVersion == version.get())
                 listener.timing("audio_scheduled");
         }
+    }
+    /** Caller owns hardware; preserve one extended hardware clock across queries. */
+    private long playedFramesLocked(AudioTrack selected) {
+        long head = selected.getPlaybackHeadPosition() & 0xffffffffL;
+        if (head < lastHead) headWrap += 1L << 32;
+        lastHead = head;
+        return Math.min(writtenSamples, headWrap + head);
+    }
+    private void adjustTerminalThresholdLocked(AudioTrack selected) {
+        if (Build.VERSION.SDK_INT < 31 || writtenSamples == 0) return;
+        long played = playedFramesLocked(selected);
+        int currentThreshold = selected.getStartThresholdInFrames();
+        int requested = PlaybackStartupPolicy.terminalThresholdFrames(writtenSamples, played, currentThreshold);
+        if (requested == currentThreshold) return;
+        int actual = selected.setStartThresholdInFrames(requested);
+        if (actual < 1 || actual > requested) throw CompressedAudio.invalid("OUTPUT_SHORT_START_THRESHOLD");
+        Log.i("LiveNativeAudioTrack", "stage=terminal_drain written_frames=" + writtenSamples
+                + " played_frames=" + played + " remaining_frames=" + (writtenSamples - played)
+                + " threshold_frames=" + actual + " underruns=" + selected.getUnderrunCount());
     }
     private void releaseTrack() {
         AudioTrack selected;
