@@ -154,7 +154,14 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 task.add_done_callback(urgent_tasks.discard)
             if audio_v2 is not None:
                 payload = None
-                size = len(event.get("data") or "") if event.get("type") == "audio" else len(json.dumps(event).encode("utf-8"))
+                if event.get("type") == "audio":
+                    # The independent archive already owns the provider PCM.
+                    # v2 output() needs only this sequence to await its durable
+                    # compressed original. Do not retain/count another raw PCM
+                    # backlog while waiting for real device-durable receipts.
+                    # Copy, never mutate the archive/ring's original event.
+                    event = {"type": "audio", "seq": event["seq"]}
+                size = len(json.dumps(event).encode("utf-8"))
             else:
                 payload = encode_output(event)
                 size = len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
