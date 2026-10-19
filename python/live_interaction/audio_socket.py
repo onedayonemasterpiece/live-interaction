@@ -6,6 +6,7 @@ import base64
 import json
 import re
 import time
+from contextlib import aclosing
 from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -105,6 +106,7 @@ class SocketAudioV2:
         self.output_recovery = asyncio.Queue(maxsize=8)
         self.output_recovering = set()
         self.output_source_locks = {}
+        self.output_source_users = {}  # Counts holders AND waiters; locked() alone is insufficient.
         self.playback_resume = None
 
     def negotiate(self, hello):
@@ -496,8 +498,9 @@ class SocketAudioV2:
                     # prefix independently; never remux a suffix into a new epoch.
                     self._request_output(source_id, 0)
                     continue
-                async for payload in self._frames(archived, recovery=False):
-                    yield payload
+                async with aclosing(self._frames(archived, recovery=False)) as frames:
+                    async for payload in frames:
+                        yield payload
         if kind != "audio":
             yield json.dumps({"type": "event", "event": event}, ensure_ascii=False, separators=(",", ":"))
 
@@ -509,6 +512,7 @@ class SocketAudioV2:
             raise invalid("OUTPUT_RECOVERY_LIMIT", "The bounded output recovery lane is full")
         self.output_recovering.add(source_id)
         self.output_recovery.put_nowait((source_id, played_ms))
+        self.output_changed.set()  # Wake a live writer blocked on the output ACK window.
 
     def _output_ack(self, message):
         self._current()
@@ -517,8 +521,13 @@ class SocketAudioV2:
         seq = integer(message.get("chunk_seq"), 0, MAX_SAFE_INTEGER, "chunk_seq")
         previous = self.output_acknowledged.get(source_id, 0)
         if (message.get("stage") != "device_durable" or entry is None or
-                seq < previous or seq > entry[0].server_durable_seq):
+                seq > entry[0].server_durable_seq):
             raise invalid("OUTPUT_ACK", "Invalid device-durable contiguous output receipt")
+        if seq <= previous:
+            # Reconnect may deliver an older ACK for the same immutable source.
+            # It cannot roll the contiguous prefix backward or release a new
+            # reservation; ignore instead of tearing down the logical session.
+            return
         self.output_acknowledged[source_id] = seq
         for key, (size, duration, lane) in tuple(self.output_pending.items()):
             if key[0] == source_id and key[1] <= seq:
@@ -527,22 +536,31 @@ class SocketAudioV2:
                 del self.output_pending[key]
         self.output_changed.set()
 
+    def _output_terminated(self):
+        return (self.closed or self.binding.stopped
+                or self.binding.session.stop_reason is not None)
+
     async def _admit_output(self, source_id, chunk, recovery):
         lane = int(recovery)
         byte_limit = self.limits.output_recovery_window_bytes if lane else self.limits.output_window_bytes
         duration_limit = self.limits.output_recovery_window_duration_us if lane else self.limits.output_window_duration_us
-        if chunk.chunk_seq <= self.output_acknowledged.get(source_id, 0):
+        if (chunk.chunk_seq <= self.output_acknowledged.get(source_id, 0)
+                or self._output_terminated() or (not recovery and source_id in self.output_recovering)):
             return
         while (self.output_bytes[lane] + len(chunk.payload) > byte_limit or
                self.output_duration[lane] + chunk.duration_us > duration_limit or
                sum(value[2] == lane for value in self.output_pending.values()) >= 32):
             self._current()
+            if not recovery and source_id in self.output_recovering:
+                return
             self.output_changed.clear()
             try:
                 await asyncio.wait_for(self.output_changed.wait(), 15.0 if recovery else 5.0)
             except asyncio.TimeoutError:
                 raise invalid("OUTPUT_ACK_TIMEOUT", "Original output exceeded its durable receipt window") from None
         self._current()
+        if not recovery and source_id in self.output_recovering:
+            return
         self.output_pending[(source_id, chunk.chunk_seq)] = (len(chunk.payload), chunk.duration_us, lane)
         self.output_bytes[lane] += len(chunk.payload)
         self.output_duration[lane] += chunk.duration_us
@@ -550,12 +568,24 @@ class SocketAudioV2:
     async def _frames(self, archived, *, recovery):
         source_id = archived.source.source.source_id
         lock = self.output_source_locks.setdefault(source_id, asyncio.Lock())
-        # Serialise actual wire delivery, not only sequence reservations.
-        async with lock:
-            if not recovery and source_id in self.output_recovering:
-                return
-            async for payload in self._frames_locked(archived, recovery=recovery):
-                yield payload
+        # Count waiter and holder BEFORE attempting acquire, so evicting a
+        # binding can never replace a lock while its release wakes a waiter.
+        self.output_source_users[source_id] = self.output_source_users.get(source_id, 0) + 1
+        try:
+            async with lock:
+                if self._output_terminated() or (not recovery and source_id in self.output_recovering):
+                    return
+                async with aclosing(self._frames_locked(archived, recovery=recovery)) as frames:
+                    async for payload in frames:
+                        yield payload
+        finally:
+            users = self.output_source_users[source_id] - 1
+            if users:
+                self.output_source_users[source_id] = users
+            else:
+                self.output_source_users.pop(source_id, None)
+                if source_id not in self.output_bindings and source_id not in self.output_recovering:
+                    self.output_source_locks.pop(source_id, None)
 
     async def _frames_locked(self, archived, *, recovery):
         source_id = archived.source.source.source_id
@@ -564,13 +594,12 @@ class SocketAudioV2:
             while len(self.output_bindings) >= 32:
                 removable = next((name for name in self.output_bindings if name not in self.output_recovering
                                   and not any(key[0] == name for key in self.output_pending)
-                                  and (name not in self.output_source_locks or not self.output_source_locks[name].locked())), None)
+                                  and not self.output_source_users.get(name, 0)), None)
                 if removable is None:
                     raise invalid("OUTPUT_LIMIT", "Output reference table is full")
                 del self.output_bindings[removable]
-                previous_lock = self.output_source_locks.get(removable)
-                if previous_lock is not None and not previous_lock.locked():
-                    self.output_source_locks.pop(removable, None)
+                # No holders OR waiters remain: safe to forget this source lock.
+                self.output_source_locks.pop(removable, None)
                 self.output_next.pop(removable, None)
                 self.output_acknowledged.pop(removable, None)
             self.output_epoch_ref += 1
@@ -592,7 +621,7 @@ class SocketAudioV2:
         owns_response = source_id == f"out_{self.binding.session.id}_{archived.response_id}"
         self.output_bindings[source_id] = (archived.source, archived.epoch, ref)
         for index, original in enumerate(archived.chunks):
-            if not recovery and source_id in self.output_recovering:
+            if self._output_terminated() or (not recovery and source_id in self.output_recovering):
                 return
             chunk = original.chunk
             expected = self.output_next.get(source_id, 1)
@@ -606,18 +635,33 @@ class SocketAudioV2:
             if owns_response and self.archive.is_cancelled(archived.response_id):
                 return
             await self._admit_output(source_id, chunk, recovery)
-            if (not recovery and source_id in self.output_recovering) or (owns_response and self.archive.is_cancelled(archived.response_id)):
+            if (self._output_terminated() or (not recovery and source_id in self.output_recovering)
+                    or (owns_response and self.archive.is_cancelled(archived.response_id))):
                 pending = self.output_pending.pop((source_id, chunk.chunk_seq), None)
                 if pending:
                     size, duration, lane = pending
                     self.output_bytes[lane] -= size
                     self.output_duration[lane] -= duration
+                    self.output_changed.set()
                 return
             frame = AudioFrame(DOWNLINK_MAGIC, chunk.flags | (EVENT_END if not recovery and index == len(archived.chunks) - 1 else 0),
                                ref, ref, chunk.chunk_seq, chunk.capture_start_us, chunk.duration_us,
                                self.binding.state.generation, original.original_event_seq, chunk.payload)
-            self.output_next[source_id] = chunk.chunk_seq + 1
-            yield frame.encode(self.limits)
+            sent = False
+            try:
+                yield frame.encode(self.limits)
+                # Advance only after the caller's awaited wire send returned.
+                # A failed send may be retried from immutable original bytes.
+                self.output_next[source_id] = chunk.chunk_seq + 1
+                sent = True
+            finally:
+                if not sent:
+                    pending = self.output_pending.pop((source_id, chunk.chunk_seq), None)
+                    if pending:
+                        size, duration, lane = pending
+                        self.output_bytes[lane] -= size
+                        self.output_duration[lane] -= duration
+                        self.output_changed.set()
 
     @staticmethod
     def _resume_dict(status):
@@ -697,9 +741,10 @@ class SocketAudioV2:
                 break
             response = integer(int(source_id.rsplit("_", 1)[-1]), 1, 0xFFFFFFFF, "provider_response_id")
             archived = ArchivedOutput(status.source, epoch, response, tuple(chunks))
-            async for payload in self._frames(archived, recovery=True):
-                self._current()
-                await self.send(payload)
+            async with aclosing(self._frames(archived, recovery=True)) as frames:
+                async for payload in frames:
+                    self._current()
+                    await self.send(payload)
             after = chunks[-1].chunk.chunk_seq
             ended = bool(chunks[-1].chunk.flags & EPOCH_END)
             next_at += sum(c.chunk.duration_us for c in chunks) / self.limits.output_recovery_us_per_second
@@ -727,3 +772,5 @@ class SocketAudioV2:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         if self.decoder:
             self.decoder.close()
+        self.output_source_locks.clear()
+        self.output_source_users.clear()

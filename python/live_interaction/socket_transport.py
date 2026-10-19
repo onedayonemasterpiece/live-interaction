@@ -12,6 +12,7 @@ import json
 import re
 import struct
 import time
+from contextlib import aclosing
 from urllib.parse import urlsplit
 
 from .session_host import LiveError
@@ -181,8 +182,11 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 seq = int(event.get("seq") or 0)
                 if seq > last_sent or (audio_v2 is not None and event.get("type") == "audio"):
                     if audio_v2 is not None:
-                        async for output in audio_v2.output(event):
-                            await send(output)
+                        # Ensure every nested async generator releases its
+                        # source lock even when the socket send is cancelled.
+                        async with aclosing(audio_v2.output(event)) as outputs:
+                            async for output in outputs:
+                                await send(output)
                     else:
                         await send(payload)
                     last_sent = max(last_sent, seq)

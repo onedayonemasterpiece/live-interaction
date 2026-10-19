@@ -4,6 +4,7 @@ import json
 import struct
 import threading
 import unittest
+from contextlib import aclosing
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -73,7 +74,9 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
         r = SocketAudioV2.__new__(SocketAudioV2)
         source = "out_session_1"
         r.output_source_locks = {}
+        r.output_source_users = {}
         r.output_recovering = set()
+        r.closed = False
         r.output_bindings = OrderedDict()
         r.output_next = {}
         r.output_acknowledged = {}
@@ -82,7 +85,7 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
         r.output_duration = [0, 0]
         r.output_epoch_ref = 0
         r.limits = AudioLimits()
-        r.binding = SimpleNamespace(session=SimpleNamespace(id="session"),
+        r.binding = SimpleNamespace(stopped=False, session=SimpleNamespace(id="session",stop_reason=None),
                                     state=SimpleNamespace(generation=2))
         r.archive = SimpleNamespace(is_cancelled=lambda _: False)
         entered, go = asyncio.Event(), asyncio.Event()
@@ -115,6 +118,136 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
             go.set()
             if not live.done():
                 live.cancel()
+
+
+    @staticmethod
+    def _output_for_cancellation():
+        from collections import OrderedDict
+        from types import SimpleNamespace
+        from live_interaction.audio_output import ArchivedOutput
+        r = SocketAudioV2.__new__(SocketAudioV2)
+        source = "out_session_1"
+        r.closed = False
+        r.output_source_locks = {}
+        r.output_source_users = {}
+        r.output_recovering = set()
+        r.output_bindings = OrderedDict()
+        r.output_next, r.output_acknowledged = {}, {}
+        r.output_pending = {}
+        r.output_bytes, r.output_duration = [0,0],[0,0]
+        r.output_changed = asyncio.Event()
+        r.output_epoch_ref = 0
+        r.limits = AudioLimits()
+        r.binding = SimpleNamespace(stopped=False,
+            session=SimpleNamespace(id="session", stop_reason=None),
+            state=SimpleNamespace(generation=2), heartbeat=lambda:None)
+        r.archive = SimpleNamespace(is_cancelled=lambda _: False)
+        epoch=CodecEpoch.from_dict(VECTORS["epoch"])
+        originals=[replace(c,source_id=source,flags=c.flags & EPOCH_END) for c in vector_chunks()]
+        record=ArchivedOutput(BoundSource(SourceDescriptor(source,0),"server_source",2),
+                              epoch,1,tuple(OutputChunk(c,1) for c in originals))
+        return r,record,source
+
+    async def test_aborted_socket_send_closes_source_generator_and_recovery_is_not_blocked(self):
+        r,record,source=self._output_for_cancellation()
+        send_error=OSError("closed socket")
+        try:
+            async with aclosing(r._frames(record,recovery=False)) as outputs:
+                header=await anext(outputs)
+                self.assertIsInstance(header,str)
+                first=AudioFrame.decode(await anext(outputs))
+                self.assertEqual(first.chunk_seq,1)
+                self.assertTrue(r.output_source_locks[source].locked())
+                self.assertEqual(r.output_next.get(source,1),1)
+                raise send_error
+        except OSError as exc:
+            self.assertIs(exc,send_error)
+        self.assertFalse(r.output_source_locks[source].locked())
+        self.assertFalse(r.output_pending,"A failed send cannot leak a delivery reservation")
+        self.assertEqual(r.output_next.get(source,1),1,
+                         "Only a completed wire send may advance the delivered sequence")
+        r.output_recovering.add(source)
+        observed=[]
+        async with aclosing(r._frames(record,recovery=True)) as recovery:
+            async for packet in recovery:
+                if isinstance(packet,bytes):
+                    observed.append(AudioFrame.decode(packet).chunk_seq)
+        self.assertEqual(observed,[1,2])
+        self.assertEqual(r.output_next[source],3)
+        self.assertFalse(r.output_source_users)
+
+    async def test_stop_after_first_completed_frame_does_not_send_late_tail(self):
+        r,record,source=self._output_for_cancellation()
+        frames=[]
+        async with aclosing(r._frames(record,recovery=False)) as sender:
+            self.assertIsInstance(await anext(sender),str)
+            frames.append(AudioFrame.decode(await anext(sender)).chunk_seq)
+            # The first bytes reached the device and its real receipt released
+            # this reservation. User Stop arrives before the second chunk.
+            r._output_ack({"source_id":source,"chunk_seq":1,"stage":"device_durable"})
+            r.binding.stopped=True
+            async for packet in sender:
+                if isinstance(packet,bytes):
+                    frames.append(AudioFrame.decode(packet).chunk_seq)
+        self.assertEqual(frames,[1])
+        self.assertFalse(r.output_pending)
+        self.assertFalse(r.output_source_users)
+        self.assertFalse(r.output_source_locks[source].locked())
+
+
+    async def test_old_device_ack_is_idempotent_after_newer_durable_receipt(self):
+        r,record,source=self._output_for_cancellation()
+        async with aclosing(r._frames(record,recovery=False)) as sender:
+            frames=[v async for v in sender]
+        self.assertEqual([AudioFrame.decode(v).chunk_seq for v in frames if isinstance(v,bytes)],[1,2])
+        self.assertTrue(r.output_pending)
+        r._output_ack({"source_id":source,"chunk_seq":2,"stage":"device_durable"})
+        r._output_ack({"source_id":source,"chunk_seq":1,"stage":"device_durable"})
+        r._output_ack({"source_id":source,"chunk_seq":2,"stage":"device_durable"})
+        self.assertEqual(r.output_acknowledged[source],2)
+        self.assertFalse(r.output_pending)
+        self.assertEqual(sum(r.output_bytes)+sum(r.output_duration),0)
+        with self.assertRaises(LiveError):
+            r._output_ack({"source_id":source,"chunk_seq":3,"stage":"device_durable"})
+
+
+    async def test_stop_wakes_waiting_input_without_false_ack_or_storage(self):
+        from time import monotonic
+        from types import SimpleNamespace
+        from live_interaction.audio_socket import _Source
+        r=SocketAudioV2.__new__(SocketAudioV2)
+        r.limits=AudioLimits()
+        r.queues=[asyncio.Queue(maxsize=32),asyncio.Queue(maxsize=32)]
+        r.queued_bytes=[16,0]
+        r.queued_duration=[r.limits.live_window_duration_us,0]
+        r.admission_changed=[asyncio.Event(),asyncio.Event()]
+        r.closed=False
+        source=_Source(BoundSource(SourceDescriptor("live",0),"server_live",0),False,0,monotonic())
+        source.submitted=4
+        r.sources={1:source}
+        r.epochs={1:(1,CodecEpoch.from_dict(VECTORS["epoch"]))}
+        r.live_ref=1
+        r.binding=SimpleNamespace(stopped=False,session=SimpleNamespace(stop_reason=None),
+                state=SimpleNamespace(generation=1),heartbeat=lambda:None,
+                host=SimpleNamespace(diagnostic=lambda *_a,**_kw:None))
+        r._age=lambda _src,_frame:None
+        blocked=AudioFrame(UPLINK_MAGIC,0,1,1,5,800000,200000,1,0,b"abcd")
+        task=asyncio.create_task(r.audio(blocked.encode(r.limits)))
+        try:
+            await asyncio.sleep(.03)
+            self.assertFalse(task.done())
+            r.binding.stopped=True
+            r.admission_changed[0].set()
+            with self.assertRaises(LiveError) as error:
+                await asyncio.wait_for(task,.2)
+            self.assertEqual(error.exception.code,"LIVE_AUDIO_STOPPED")
+            self.assertEqual(r.sources[1].submitted,4)
+            self.assertEqual(r.queued_duration[0],r.limits.live_window_duration_us)
+            self.assertTrue(r.queues[0].empty())
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task,return_exceptions=True)
 
     async def test_bounded_audio_waits_for_slow_store_without_dropping_originals(self):
         from time import monotonic
