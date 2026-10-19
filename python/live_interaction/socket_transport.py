@@ -199,7 +199,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 return
             if isinstance(frame, bytes):
                 if audio_v2 is not None:
-                    audio_v2.audio(frame)
+                    await audio_v2.audio(frame)
                     continue
                 seq, age, startup_catchup, pcm = decode_audio(frame)
                 await binding.input({"audio_base64": base64.b64encode(pcm).decode("ascii")},
