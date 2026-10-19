@@ -8,7 +8,7 @@ final class PlaybackStartupPolicy {
     private PlaybackStartupPolicy() { }
     static int prefillFrames(int sampleRate) {
         if (sampleRate < 8000 || sampleRate > 192000) throw new IllegalArgumentException("LIVE_CODEC_OUTPUT_RATE");
-        return sampleRate / 5; // 200 ms; the native track allocates >= 400 ms
+        return sampleRate * 3 / 10; // 300 ms; the native track allocates >= 600 ms
     }
     static int boundedPrefillFrames(int sampleRate, int bufferFrames, int capacityFrames) {
         if (bufferFrames < 2 || capacityFrames < 2) throw new IllegalArgumentException("LIVE_CODEC_OUTPUT_CAPACITY");
