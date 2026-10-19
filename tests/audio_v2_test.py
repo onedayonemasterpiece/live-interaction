@@ -63,6 +63,119 @@ class AudioWireConformance(unittest.TestCase):
         self.assertEqual(socket_ticket(["wl-live-v2", "wl-ticket." + "a" * 32]), "a" * 32)
 
 
+
+class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
+    """Pure wire sequencing and ingress admission, independent of PyAV."""
+    async def test_same_source_recovery_cannot_overtake_a_paused_live_writer(self):
+        from collections import OrderedDict
+        from types import SimpleNamespace
+        from live_interaction.audio_output import ArchivedOutput
+        r = SocketAudioV2.__new__(SocketAudioV2)
+        source = "out_session_1"
+        r.output_source_locks = {}
+        r.output_recovering = set()
+        r.output_bindings = OrderedDict()
+        r.output_next = {}
+        r.output_acknowledged = {}
+        r.output_pending = {}
+        r.output_bytes = [0, 0]
+        r.output_duration = [0, 0]
+        r.output_epoch_ref = 0
+        r.limits = AudioLimits()
+        r.binding = SimpleNamespace(session=SimpleNamespace(id="session"),
+                                    state=SimpleNamespace(generation=2))
+        r.archive = SimpleNamespace(is_cancelled=lambda _response: False)
+        started, release = asyncio.Event(), asyncio.Event()
+        async def admitted(_source, chunk, recovery):
+            if chunk.chunk_seq == 1 and not recovery:
+                started.set()
+                await release.wait()
+        r._admit_output = admitted
+        epoch = CodecEpoch.from_dict(VECTORS["epoch"])
+        chunks = [replace(c, source_id=source, flags=c.flags & EPOCH_END) for c in vector_chunks()]
+        original = ArchivedOutput(BoundSource(SourceDescriptor(source, 0), "server_source", 2),
+                                  epoch, 1, tuple(OutputChunk(c, 1) for c in chunks))
+        received = []
+        async def deliver(*, recovery):
+            async for packet in r._frames(original, recovery=recovery):
+                if isinstance(packet, bytes):
+                    received.append(AudioFrame.decode(packet).chunk_seq)
+                await asyncio.sleep(0)
+        live = asyncio.create_task(deliver(recovery=False))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            # A reconnect schedules canonical original recovery while the old
+            # live writer is paused just before admitting seq1.
+            r.output_recovering.add(source)
+            recovering = asyncio.create_task(deliver(recovery=True))
+            await asyncio.sleep(.01)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(live, recovering), 2)
+            self.assertEqual(received, [c.chunk_seq for c in chunks])
+            self.assertEqual(r.output_next[source], len(chunks) + 1)
+        finally:
+            release.set()
+            if not live.done():
+                live.cancel()
+
+    async def test_ingress_full_queue_waits_then_preserves_every_original(self):
+        from types import SimpleNamespace
+        from live_interaction.audio_socket import _Source
+        from time import monotonic
+        r = SocketAudioV2.__new__(SocketAudioV2)
+        r.limits = AudioLimits()
+        r.queues = [asyncio.Queue(maxsize=32), asyncio.Queue(maxsize=32)]
+        r.queued_bytes = [0, 0]
+        r.queued_duration = [0, 0]
+        r.admission_changed = [asyncio.Event(), asyncio.Event()]
+        r.closed = False
+        r.sources = {1: _Source(BoundSource(SourceDescriptor("live", 0), "server_live", 0),
+                                False, 0, monotonic())}
+        r.epochs = {1: (1, CodecEpoch.from_dict(VECTORS["epoch"]))}
+        r.live_ref = 1
+        waits = []
+        r.binding = SimpleNamespace(stopped=False, session=SimpleNamespace(stop_reason=None),
+                  state=SimpleNamespace(generation=1), heartbeat=lambda: None,
+                  host=SimpleNamespace(diagnostic=lambda _s, _stage, **kw: waits.append(kw)))
+        r._age = lambda _source, _frame: None
+        blocked, resume = asyncio.Event(), asyncio.Event()
+        committed = []
+        async def consumer():
+            for index in range(10):
+                item, size, duration = await r.queues[0].get()
+                if index == 0:
+                    blocked.set()
+                    await resume.wait()  # Emulate contended durable SQLite.
+                committed.append(item.chunk_seq)
+                r.queued_bytes[0] -= size
+                r.queued_duration[0] -= duration
+                r.queues[0].task_done()
+                r.admission_changed[0].set()
+        worker = asyncio.create_task(consumer())
+        async def producer():
+            for seq in range(1, 11):
+                frame = AudioFrame(UPLINK_MAGIC, 0, 1, 1, seq, (seq-1)*200000,
+                                   200000, 1, 0, b"abcd")
+                await r.audio(frame.encode(r.limits))
+        producer_task = asyncio.create_task(producer())
+        try:
+            await asyncio.wait_for(blocked.wait(), 2)
+            await asyncio.sleep(.05)
+            self.assertFalse(producer_task.done(), "Audio intake must wait rather than detach.")
+            self.assertLessEqual(r.queued_duration[0], 960000)
+            self.assertLessEqual(r.queued_bytes[0], 32768)
+            resume.set()
+            await asyncio.wait_for(asyncio.gather(producer_task, worker), 2)
+            self.assertEqual(committed, list(range(1, 11)))
+            self.assertEqual(r.sources[1].submitted, 10)
+            self.assertEqual(r.queued_duration[0], 0)
+            self.assertTrue(waits, "Wait diagnostics must report bounded stall.")
+        finally:
+            resume.set()
+            for task in (producer_task, worker):
+                if not task.done(): task.cancel()
+            await asyncio.gather(producer_task, worker, return_exceptions=True)
+
 @unittest.skipUnless(FACTORY.av, "Install the pinned [audio] extra for native codec tests")
 class NativeAudioCodecs(unittest.TestCase):
     def test_opus_original_vector_state_preskip_and_terminal_trim(self):

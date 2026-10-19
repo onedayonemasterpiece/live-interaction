@@ -86,6 +86,7 @@ class SocketAudioV2:
         self.queues = [asyncio.Queue(maxsize=32), asyncio.Queue(maxsize=32)]
         self.queued_bytes = [0, 0]
         self.queued_duration = [0, 0]
+        self.admission_changed = [asyncio.Event(), asyncio.Event()]
         self.next_work_at = [0.0, 0.0]
         self.tasks = []
         self.closed = False
@@ -103,6 +104,9 @@ class SocketAudioV2:
         self.output_changed = asyncio.Event()
         self.output_recovery = asyncio.Queue(maxsize=8)
         self.output_recovering = set()
+        # A live writer and a durable recovery worker share the same physical
+        # source after reconnect. Protect its epoch/next-sequence/send prefix.
+        self.output_source_locks = {}
         self.playback_resume = None
 
     def negotiate(self, hello):
@@ -166,7 +170,7 @@ class SocketAudioV2:
         self.queued_duration[lane] += duration
         self.queues[lane].put_nowait((value, size, duration))
 
-    def audio(self, data):
+    async def audio(self, data):
         frame = AudioFrame.decode(data, self.limits)
         if frame.magic != UPLINK_MAGIC or frame.stream_ref not in self.sources:
             raise invalid("SOURCE", "Unknown input source reference")
@@ -181,7 +185,33 @@ class SocketAudioV2:
             if frame.stream_ref != self.live_ref or frame.chunk_seq > source.submitted + 1:
                 raise invalid("SEQUENCE", "Fresh Live chunks must be contiguous")
             self._age(source, frame)
-        self._enqueue(int(recovery), frame, len(frame.payload), frame.duration_us)
+        lane = int(recovery)
+        byte_limit = self.limits.recovery_window_bytes if lane else self.limits.live_window_bytes
+        duration_limit = self.limits.recovery_window_duration_us if lane else self.limits.live_window_duration_us
+        deadline = time.monotonic() + 1.5
+        began = time.monotonic()
+        while (self.queues[lane].full() or self.queued_bytes[lane] + len(frame.payload) > byte_limit
+                or self.queued_duration[lane] + frame.duration_us > duration_limit):
+            self._current()
+            self.admission_changed[lane].clear()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise invalid("BACKPRESSURE", "Bounded audio ingress did not drain within 1.5 seconds")
+            try:
+                await asyncio.wait_for(self.admission_changed[lane].wait(), remaining)
+            except asyncio.TimeoutError:
+                raise invalid("BACKPRESSURE", "Bounded audio ingress did not drain within 1.5 seconds") from None
+        self._current()
+        # A long queue wait does not turn an old capture into fresh speech.
+        if not recovery:
+            self._age(source, frame)
+        waited_ms = round((time.monotonic() - began) * 1000)
+        if waited_ms >= 15:
+            self.binding.host.diagnostic(self.binding.session, "socket_audio_admission_wait",
+                connection_generation=self.binding.state.generation, admit_wait_ms=waited_ms,
+                queue_items=self.queues[lane].qsize(), queue_bytes=self.queued_bytes[lane],
+                queue_duration_us=self.queued_duration[lane])
+        self._enqueue(lane, frame, len(frame.payload), frame.duration_us)
         source.submitted = max(source.submitted, frame.chunk_seq)
 
     def control(self, message):
@@ -232,6 +262,7 @@ class SocketAudioV2:
                     self.queued_bytes[lane] -= size
                     self.queued_duration[lane] -= duration
                     self.queues[lane].task_done()
+                    self.admission_changed[lane].set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -521,14 +552,30 @@ class SocketAudioV2:
 
     async def _frames(self, archived, *, recovery):
         source_id = archived.source.source.source_id
+        lock = self.output_source_locks.setdefault(source_id, asyncio.Lock())
+        # Hold the per-source lock across actual socket.send(), not just the
+        # generator's next() call. Otherwise two producers each reserve the
+        # same next sequence before either frame reaches the receiver.
+        async with lock:
+            if not recovery and source_id in self.output_recovering:
+                return  # Recovery owns all currently committed originals.
+            async for payload in self._frames_locked(archived, recovery=recovery):
+                yield payload
+
+    async def _frames_locked(self, archived, *, recovery):
+        source_id = archived.source.source.source_id
         entry = self.output_bindings.get(source_id)
         if entry is None:
             while len(self.output_bindings) >= 32:
                 removable = next((name for name in self.output_bindings if name not in self.output_recovering
-                                  and not any(key[0] == name for key in self.output_pending)), None)
+                                  and not any(key[0] == name for key in self.output_pending)
+                                  and (name not in self.output_source_locks or not self.output_source_locks[name].locked())), None)
                 if removable is None:
                     raise invalid("OUTPUT_LIMIT", "Output reference table is full")
                 del self.output_bindings[removable]
+                previous_lock = self.output_source_locks.get(removable)
+                if previous_lock is not None and not previous_lock.locked():
+                    self.output_source_locks.pop(removable, None)
                 self.output_next.pop(removable, None)
                 self.output_acknowledged.pop(removable, None)
             self.output_epoch_ref += 1
@@ -550,16 +597,24 @@ class SocketAudioV2:
         owns_response = source_id == f"out_{self.binding.session.id}_{archived.response_id}"
         self.output_bindings[source_id] = (archived.source, archived.epoch, ref)
         for index, original in enumerate(archived.chunks):
+            if not recovery and source_id in self.output_recovering:
+                return  # Stop the live writer before recovery takes ownership.
             chunk = original.chunk
             expected = self.output_next.get(source_id, 1)
             if chunk.chunk_seq < expected:
-                continue
+                continue  # Identical immutable original prefix already sent on this socket.
             if chunk.chunk_seq != expected:
-                raise invalid("OUTPUT_SEQUENCE", "Output codec dependencies are not contiguous")
+                if not recovery and chunk.chunk_seq > expected:
+                    # A retained archive event arrived before its durable
+                    # prefix was replayed. Request that original; never invent
+                    # a missing frame or kill the logical provider session.
+                    self._request_output(source_id, 0)
+                    return
+                raise invalid("OUTPUT_SEQUENCE", "Durable recovery has a noncontiguous source")
             if owns_response and self.archive.is_cancelled(archived.response_id):
                 return
             await self._admit_output(source_id, chunk, recovery)
-            if owns_response and self.archive.is_cancelled(archived.response_id):
+            if (not recovery and source_id in self.output_recovering) or (owns_response and self.archive.is_cancelled(archived.response_id)):
                 pending = self.output_pending.pop((source_id, chunk.chunk_seq), None)
                 if pending:
                     size, duration, lane = pending
@@ -672,6 +727,8 @@ class SocketAudioV2:
     async def close(self):
         self.closed = True
         self.output_changed.set()
+        for changed in self.admission_changed:
+            changed.set()
         for task in self.tasks:
             task.cancel()
         if self.tasks:
