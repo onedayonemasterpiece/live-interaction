@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from live_interaction.audio_v2 import *
 from live_interaction.audio_codec import PyAVAudioCodecFactory, PyAVDecoder, adts_packets, opus_samples
-from live_interaction.audio_socket import AudioWorkPool
+from live_interaction.audio_socket import AudioWorkPool, SocketAudioV2
 from live_interaction.socket_host import LiveSocketSessionHost
 from live_interaction.socket_transport import serve_socket, socket_protocol, socket_ticket
 from live_interaction.session_host import LiveError
@@ -530,6 +530,53 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.played.get(source_id, 0), 0,
                          "Byte receipt must not fabricate a played cursor")
         self.assertFalse(self.closes)
+
+    async def test_interrupted_evicted_recovery_drops_admission_reservation(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        runtimes = []
+        original_admit = SocketAudioV2._admit_output
+
+        async def paused_admit(runtime, source_id, chunk, recovery):
+            if recovery and not runtimes:
+                runtimes.append(runtime)
+                entered.set()
+                await release.wait()
+            await original_admit(runtime, source_id, chunk, recovery)
+
+        source_id = f"out_{self.session.id}_1"
+        archive = self.binding.state.output_archive
+        try:
+            with patch.object(SocketAudioV2, "_admit_output", paused_admit), \
+                    patch("live_interaction.audio_output.OUTPUT_CACHE_EVENTS", 8), \
+                    patch("live_interaction.audio_output.OUTPUT_CACHE_BYTES", 1024):
+                for _ in range(30):
+                    seq = self.session.next_seq
+                    self.provider.events({"type": "audio", "data": base64.b64encode(bytes(4800)).decode(),
+                                          "mime_type": "audio/pcm;rate=24000"})
+                    await settle(lambda: archive.processed_seq >= seq)
+                self.provider.events({"type": "turn_complete"})
+                await settle(lambda: source_id in self.store.seals)
+                frames = [AudioFrame.decode(v) for v in self.sent if isinstance(v, bytes)]
+                self.assertTrue(frames)
+                await self.json({"type": "output_ack", "source_id": source_id,
+                                 "stage": "device_durable", "chunk_seq": frames[-1].chunk_seq})
+                await asyncio.wait_for(entered.wait(), 2)
+                self.provider.events({"type": "interrupted"})
+                await self.message("output_interrupt")
+                after_interrupt = len(self.sent)
+                release.set()
+                await settle(lambda: source_id in self.store.cancelled)
+                await asyncio.sleep(.15)
+                self.assertFalse(any(isinstance(v, bytes) for v in self.sent[after_interrupt:]),
+                                 "Interrupted recovery must not send a reserved frame after admission wakes")
+                self.assertFalse(runtimes[0].output_pending)
+                self.assertEqual(sum(runtimes[0].output_bytes), 0)
+                self.assertEqual(sum(runtimes[0].output_duration), 0)
+                self.assertFalse(self.task.done(), self.closes)
+        finally:
+            release.set()
+        await self.json({"type": "stop"})
+        await settle(lambda: self.binding.stopped, timeout=.2)
 
     async def test_finished_live_source_can_unbind_and_rotate_without_reconnecting(self):
         old = await self.source("first_live")
