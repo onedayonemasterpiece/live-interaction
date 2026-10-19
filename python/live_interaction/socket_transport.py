@@ -160,7 +160,8 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                     # compressed original. Do not retain/count another raw PCM
                     # backlog while waiting for real device-durable receipts.
                     # Copy, never mutate the archive/ring's original event.
-                    event = {"type": "audio", "seq": event["seq"]}
+                    event = {"type": "audio", "seq": event["seq"],
+                             "response_id": event["response_id"]}
                 size = len(json.dumps(event).encode("utf-8"))
             else:
                 payload = encode_output(event)

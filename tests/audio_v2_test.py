@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
+from unittest.mock import patch
 
 from live_interaction.audio_v2 import *
 from live_interaction.audio_codec import PyAVAudioCodecFactory, PyAVDecoder, adts_packets, opus_samples
@@ -474,6 +475,16 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         await settle(lambda: self.binding.stopped, timeout=.2)
 
     async def test_durable_v2_backlog_does_not_retain_provider_pcm_in_relay(self):
+        await self._durable_v2_backlog()
+
+    async def test_evicted_v2_backlog_recovers_originals_without_detaching(self):
+        # Exercise the production eviction path under a deliberately tiny
+        # cache, independently of codec compressibility and machine speed.
+        with patch("live_interaction.audio_output.OUTPUT_CACHE_EVENTS", 8), \
+                patch("live_interaction.audio_output.OUTPUT_CACHE_BYTES", 1024):
+            await self._durable_v2_backlog(evicted=True)
+
+    async def _durable_v2_backlog(self, *, evicted=False):
         # Hold the real device-durable ACK while the independent archive fsyncs
         # six seconds of provider output. Its compressed originals fit easily;
         # keeping the redundant base64 PCM in the relay exceeds 256 KiB.
@@ -492,10 +503,17 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         before = [AudioFrame.decode(v) for v in self.sent if isinstance(v, bytes)]
         self.assertLessEqual(sum(f.duration_us for f in before), 960000)
         self.assertFalse(self.task.done(), self.closes)
+        retained = [e for e in self.session.events if e.get("type") == "audio"]
+        self.assertTrue(retained)
+        self.assertEqual(retained[-1]["data"], base64.b64encode(pcm).decode(),
+                         "Relay projection must not mutate the archive/ring original")
+        if evicted:
+            self.assertLessEqual(len(archive.results), 8)
+            self.assertLessEqual(archive.result_bytes, 1024)
         # Drain only after actual ACK, and verify each wire payload equals its
         # durable original. No replay, invented progress or relaxed window.
         acknowledged = 0
-        for _ in range(100):
+        for _ in range(500 if evicted else 100):
             frames = [AudioFrame.decode(v) for v in self.sent if isinstance(v, bytes)]
             if frames and frames[-1].flags & EPOCH_END:
                 break

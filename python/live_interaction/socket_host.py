@@ -106,6 +106,10 @@ class LiveSocketSessionHost(LiveSessionHost):
             LOG.info("%s", json.dumps(record, ensure_ascii=False, separators=(",", ":")))
 
     def _emit(self, session, event):
+        if event.get("type") in ("turn_complete", "interrupted", "closed") and session.response_seq:
+            # Keep the terminal codec tail addressable after delivery-cache
+            # eviction; identity is assigned by the host, never the client.
+            event = {**event, "response_id": session.response_seq}
         super()._emit(session, event)
         state = self._socket_states.get(session.id)
         if state is None:
