@@ -196,6 +196,44 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 queued_bytes -= size
                 queue.task_done()
 
+    # A slow durable input worker must not hold the WebSocket control plane.
+    # Preserve source/epoch/chunk order with one bounded ingress worker rather
+    # than creating one task per audio frame. The underlying v2 delivery windows
+    # and actual server-durable ACK rules remain unchanged.
+    v2_ingress = None
+    v2_ingress_bytes = 0
+    v2_ingress_limit = 0
+    v2_frame_limit = 0
+
+    def stage_v2_input(value, size):
+        nonlocal v2_ingress_bytes
+        if isinstance(value, bytes) and size > v2_frame_limit:
+            # Malformed or oversized input must be terminal, not a recoverable
+            # backpressure error that would reconnect forever with the same bytes.
+            raise LiveError("LIVE_SOCKET_FRAME", "v2 encoded audio frame exceeds its bound")
+        if v2_ingress.full() or v2_ingress_bytes + size > v2_ingress_limit:
+            binding.host.diagnostic(binding.session, "socket_audio_read_ahead_full",
+                                    connection_generation=binding.state.generation,
+                                    queue_items=v2_ingress.qsize(), queue_bytes=v2_ingress_bytes)
+            # A bounded, recoverable detach is preferable to dropping un-ACKed
+            # originals or allowing unlimited frames to accumulate in RAM.
+            raise LiveError("LIVE_AUDIO_BACKPRESSURE", "Bounded v2 read-ahead is full")
+        v2_ingress.put_nowait((value, size))
+        v2_ingress_bytes += size
+
+    async def v2_ingress_loop():
+        nonlocal v2_ingress_bytes
+        while True:
+            value, size = await v2_ingress.get()
+            try:
+                if isinstance(value, bytes):
+                    await audio_v2.audio(value)
+                else:
+                    audio_v2.control(value)
+            finally:
+                v2_ingress_bytes -= size
+                v2_ingress.task_done()
+
     async def read_loop():
         while True:
             frame = await receive()
@@ -203,7 +241,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 return
             if isinstance(frame, bytes):
                 if audio_v2 is not None:
-                    await audio_v2.audio(frame)
+                    stage_v2_input(frame, len(frame))
                     continue
                 seq, age, startup_catchup, pcm = decode_audio(frame)
                 await binding.input({"audio_base64": base64.b64encode(pcm).decode("ascii")},
@@ -227,7 +265,12 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
                 await binding.stop()
                 return
             elif audio_v2 is not None:
-                audio_v2.control(message)
+                if message.get("type") in {"output_ack", "output_resume"}:
+                    # Device-durable output receipts release the delivery window
+                    # immediately, even during a stalled uplink commit.
+                    audio_v2.control(message)
+                else:
+                    stage_v2_input(message, len(frame.encode("utf-8")))
             elif message.get("type") == "input" and isinstance(message.get("message"), dict):
                 body = message["message"]
                 if "audio_base64" in body:
@@ -261,6 +304,15 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             from .audio_socket import SocketAudioV2
             audio_v2 = SocketAudioV2(binding, services, send, failed)
             v2_metadata = audio_v2.negotiate(hello)
+            # The read-ahead does not widen codec or durable delivery windows.
+            # It can hold the negotiated maximum un-ACKed live+recovery stream
+            # (including 10 ms small-packet headroom) and bounded FIFO control.
+            limits = audio_v2.limits
+            from .audio_v2 import HEADER
+            v2_ingress = asyncio.Queue(maxsize=min(256, max(32,
+                (limits.live_window_duration_us + limits.recovery_window_duration_us) // 10_000 + 8)))
+            v2_ingress_limit = limits.live_window_bytes + limits.recovery_window_bytes + MAX_CONTROL_BYTES
+            v2_frame_limit = HEADER.size + limits.max_encoded_bytes
         if hello.get("attempt_id") != binding.attempt_id:
             raise LiveError("LIVE_SOCKET_ATTEMPT", "Live attempt does not match")
         cursor = hello.get("cursor", 0)
@@ -319,6 +371,7 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
         tasks = [asyncio.create_task(read_loop()), asyncio.create_task(write_loop())]
         if audio_v2 is not None:
             tasks.extend(audio_v2.start())
+            tasks.append(asyncio.create_task(v2_ingress_loop()))
         done, _ = await asyncio.wait([*tasks, failed], return_when=asyncio.FIRST_COMPLETED)
         if failed in done:
             raise failed.result()
