@@ -41,6 +41,28 @@ public class OutputResumeQueueTest {
         assertNull(queue.next(Map.of()));
     }
 
+    @Test public void stopOrBargeInAfterDisconnectFencesBothActiveAndAlreadyBoundQueuedSource() {
+        for (boolean stop : new boolean[] {false, true}) {
+            OutputResumeQueue queue = new OutputResumeQueue();
+            queue.rememberBinding("out_A"); queue.rememberBinding("out_B");
+            queue.offer("out_prior", 0, 100000, true, false);
+            queue.reconnect("out_A", 20000); // socket epoch table can now be empty
+            var suppressed = new java.util.HashSet<String>();
+            queue.fenceBound(suppressed);
+            if (stop) suppressed.addAll(queue.pendingSources());
+            assertTrue(suppressed.containsAll(Set.of("out_A", "out_B")));
+            assertEquals(stop, suppressed.contains("out_prior"));
+            // Persisted snapshot restored into a fresh Run cannot re-offer either source.
+            var positions = java.util.List.of("out_A", "out_B").stream().map(id ->
+                new org.onedayonemasterpiece.live.DurableOutputStore.PlaybackPosition(
+                    new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor(id, 0),
+                    3, 8, id.equals("out_A") ? 20000 : 0, 100000, true, suppressed.contains(id))).toList();
+            OutputResumeQueue reopened = new OutputResumeQueue();
+            reopened.restore(positions, new java.util.HashMap<>(), new java.util.HashSet<>());
+            assertNull(reopened.next(Map.of()));
+        }
+    }
+
     @Test public void completedAudioDuringSocketOutageOwesAReplaySafePlayheadReceipt() {
         Map<String, Long> positions = OutputResumeQueue.completedPlayheads(
             Set.of("out_offline", "out_incomplete", "out_zero"),

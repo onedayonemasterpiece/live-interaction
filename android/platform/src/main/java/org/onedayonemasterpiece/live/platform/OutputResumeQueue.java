@@ -14,6 +14,9 @@ final class OutputResumeQueue {
     private final Map<String, Long> pending = new LinkedHashMap<>();
     private final Set<String> attempted = new LinkedHashSet<>();
     private String selected;
+    private final Set<String> bound = new LinkedHashSet<>();
+    synchronized void rememberBinding(String sourceId) { id(sourceId); bound.add(sourceId); }
+    synchronized void fenceBound(Set<String> suppressed) { suppressed.addAll(bound); }
 
     synchronized void offer(String sourceId, long playedUs, long durationUs, boolean complete, boolean cancelled) {
         id(sourceId);

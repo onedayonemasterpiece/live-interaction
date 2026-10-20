@@ -461,6 +461,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
             }
             public void onOutputBinding(OutputBinding binding, long generation) {
                 if (!active(run) || connectionGeneration != run.connectionGeneration) return;
+                run.outputResumes.rememberBinding(binding.sourceId());
                 run.outputBindings.put(binding.epochRef(), binding);
                 if (!binding.sourceId().equals(run.outputResumes.selected())) run.liveOutputs.add(binding.sourceId());
                 submitOutput(run, () -> {
@@ -544,6 +545,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
         });
     }
     private void fenceOutputPlayback(Run run) {
+        run.outputResumes.fenceBound(run.suppressedOutputs);
         // During an outage bindings are cleared but the synced native player may still run.
         NativePlayer player = run.player;
         String activeSource = player == null ? null : player.activeSource();
