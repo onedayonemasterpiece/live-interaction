@@ -544,6 +544,10 @@ public final class NativeLiveRuntime implements AutoCloseable {
         });
     }
     private void fenceOutputPlayback(Run run) {
+        // During an outage bindings are cleared but the synced native player may still run.
+        NativePlayer player = run.player;
+        String activeSource = player == null ? null : player.activeSource();
+        if (activeSource != null) run.suppressedOutputs.add(activeSource);
         for (OutputBinding binding : run.outputBindings.values()) run.suppressedOutputs.add(binding.sourceId());
         NativePlayer.PlaybackResume resume = run.playbackResume;
         if (resume != null) run.suppressedOutputs.add(resume.sourceId());
