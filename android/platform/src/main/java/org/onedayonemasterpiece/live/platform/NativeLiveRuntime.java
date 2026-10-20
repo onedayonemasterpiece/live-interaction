@@ -309,7 +309,13 @@ public final class NativeLiveRuntime implements AutoCloseable {
                 Pcm pcm = new Pcm(frame, count, firstSample, startUnix, run.rotation.get());
                 firstSample += count; run.capturedSamples = firstSample;
                 if (!run.pcm.offer(pcm)) {
-                    // One already captured frame is kept while hardware is stopped. Never discard a claimed original.
+                    // A brief fsync/GC scheduler pause is not terminal by itself.
+                    // Keep this exact captured frame in hand for at most 100 ms;
+                    // the bounded 2-second queue is unchanged. Only sustained
+                    // congestion may stop capture; never drop a claimed sample.
+                    if (run.pcm.offer(pcm, 100, TimeUnit.MILLISECONDS)) continue;
+                    Log.w("LiveNativeCapture", "stage=durable_queue_exhausted queued_frames=" + run.pcm.size()
+                            + " captured_samples=" + run.capturedSamples + " encoded_samples=" + run.encodedSamples);
                     fail(run, "LIVE_NATIVE_STORAGE_BACKPRESSURE", false);
                     if (!run.pcm.offer(pcm, 2, TimeUnit.SECONDS))
                         dispatch(() -> { if (visible(run)) listener.onError("LIVE_NATIVE_CAPTURE_TAIL_NOT_DURABLE", false); });
@@ -321,6 +327,10 @@ public final class NativeLiveRuntime implements AutoCloseable {
         finally { run.capturing = false; run.captureDone = true; publish(run); }
     }
     private void encode(Run run) {
+        // The durable encoder must not starve behind its higher-priority
+        // microphone producer on a busy handset or emulator. Both threads are
+        // real-time audio work; fsync and all original/ACK fences stay intact.
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO);
         NativeEncoder encoder = null; long rotation = -1;
         try {
             while (!run.captureDone || !run.pcm.isEmpty()) {

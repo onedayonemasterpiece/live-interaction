@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import OrderedDict
 import json
 import struct
 import threading
@@ -78,6 +79,7 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
             state=SimpleNamespace(generation=3),
             heartbeat=lambda: None,
             host=SimpleNamespace(diagnostic=lambda _session, event, **data: diagnostic.append((event, data))))
+        socket.archive = SimpleNamespace(failed_recoveries=OrderedDict())
         socket.output_recovering = set()
         socket.output_recovery = asyncio.Queue(maxsize=8)
         socket.output_changed = asyncio.Event()
@@ -97,6 +99,61 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("historical source accessed during new Live")
         socket.output_store = ForbiddenHistoricalStore()
         await socket._replay_output("out_live_yesterday_1", 400)
+
+    async def test_recovery_gap_is_response_scoped_and_does_not_stop_the_live_conversation(self):
+        from collections import OrderedDict
+        from types import SimpleNamespace
+        from live_interaction.audio_v2 import OutputResume
+        r = SocketAudioV2.__new__(SocketAudioV2)
+        current, healthy = "out_live_current_1", "out_live_current_2"
+        r.closed = False
+        diagnostics, sent, recovered = [], [], []
+        r.binding = SimpleNamespace(stopped=False,
+            session=SimpleNamespace(id="live_current", stop_reason=None),
+            state=SimpleNamespace(generation=5), heartbeat=lambda: None,
+            host=SimpleNamespace(diagnostic=lambda _session, event, **data: diagnostics.append((event, data))))
+        r.archive = SimpleNamespace(failed_recoveries=OrderedDict())
+        r.output_recovery = asyncio.Queue(maxsize=8)
+        r.output_recovering = {current, healthy}
+        r.output_acknowledged = {current: 3}
+        r.failed = asyncio.get_running_loop().create_future()
+        async def send(payload):
+            sent.append(payload)
+        r.send_json = send
+        async def replay(source, _played):
+            if source == current:
+                raise invalid("OUTPUT_SEQUENCE", "An original recovery prefix has a hole")
+            recovered.append(source)
+        r._replay_output = replay
+        def resume(source):
+            return OutputResume(BoundSource(SourceDescriptor(source, 0), "server_" + source, 5),
+                                0, False, 120000, True)
+        class Store:
+            async def pending_outputs(self, *, limit=8):
+                return [resume(current), resume(healthy)]
+        r.output_store = Store()
+        r.output_recovery.put_nowait((current, 0))
+        r.output_recovery.put_nowait((healthy, 0))
+        worker = asyncio.create_task(r._output_recovery_worker())
+        try:
+            await asyncio.wait_for(r.output_recovery.join(), 2)
+            self.assertFalse(r.failed.done(), "A damaged reply is not a fatal Live session failure")
+            self.assertEqual(recovered, [healthy])
+            self.assertNotIn(current, r.output_recovering)
+            self.assertEqual(list(r.archive.failed_recoveries), [current])
+            self.assertTrue(any(item.get("type") == "output_replayed" and item.get("source_id") == current
+                                and item.get("complete") is False and item.get("through_seq") == 3
+                                for item in sent))
+            self.assertTrue(any(item.get("code") == "LIVE_AUDIO_OUTPUT_GAP" for item in sent))
+            self.assertEqual(diagnostics[0][0], "socket_output_recovery_gap")
+            await r._output_manifest()
+            self.assertEqual(sent[-1]["type"], "output_available")
+            self.assertEqual([item["source_id"] for item in sent[-1]["sources"]], [healthy])
+            r._request_output(current, 0)
+            self.assertTrue(r.output_recovery.empty(), "A damaged source must not cause retry storms")
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
 
     async def test_same_source_recovery_serializes_a_paused_live_writer(self):
         from collections import OrderedDict
