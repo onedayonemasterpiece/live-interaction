@@ -58,6 +58,10 @@ class AudioOutputArchive:
         self.active_source_id = None
         self.response_id = self.rate = self.chunk_seq = self.end_us = self.last_audio_event = 0
         self.cancelled_responses = OrderedDict()
+        # A damaged playback source must not repeatedly tear down a healthy
+        # logical Live conversation. This bounded response fence survives WSS
+        # reconnects, but retains all original durable bytes for inspection.
+        self.failed_recoveries = OrderedDict()
         self.task = asyncio.create_task(self._run())
 
     def provider_pieces(self, event):

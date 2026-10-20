@@ -497,7 +497,7 @@ class SocketAudioV2:
                 if archived.cancelled or self.archive.is_cancelled(archived.response_id):
                     continue
                 source_id = archived.source.source.source_id
-                if source_id in self.output_recovering:
+                if source_id in self.output_recovering or source_id in self.archive.failed_recoveries:
                     continue
                 expected = self.output_next.get(source_id, 1)
                 if archived.chunks and archived.chunks[0].chunk.chunk_seq > expected:
@@ -526,7 +526,7 @@ class SocketAudioV2:
             self.binding.host.diagnostic(self.binding.session, "socket_historical_output_ignored",
                 connection_generation=self.binding.state.generation)
             return
-        if source_id in self.output_recovering:
+        if source_id in self.output_recovering or source_id in self.archive.failed_recoveries:
             return
         if self.output_recovery.full() or len(self.output_recovering) >= 8:
             raise invalid("OUTPUT_RECOVERY_LIMIT", "The bounded output recovery lane is full")
@@ -699,8 +699,33 @@ class SocketAudioV2:
                 try:
                     if source_id is None:
                         await self._output_manifest()
-                    else:
-                        await self._replay_output(source_id, played_ms)
+                    elif source_id not in self.archive.failed_recoveries:
+                        try:
+                            await self._replay_output(source_id, played_ms)
+                        except LiveError as error:
+                            # A single broken/noncontiguous OUTPUT source is
+                            # not authority to terminate microphone capture,
+                            # discard the logical conversation, or restart the
+                            # provider. The original remains stored unchanged.
+                            # Protocol/auth/codec/storage failures elsewhere
+                            # still propagate: this is specifically a recovery
+                            # sequence gap, not a blanket exception swallow.
+                            if error.code != "LIVE_AUDIO_OUTPUT_SEQUENCE":
+                                raise
+                            self.archive.failed_recoveries[source_id] = error.code
+                            while len(self.archive.failed_recoveries) > 32:
+                                self.archive.failed_recoveries.popitem(last=False)
+                            self.binding.host.diagnostic(self.binding.session,
+                                "socket_output_recovery_gap", code=error.code,
+                                connection_generation=self.binding.state.generation)
+                            # Neither terminal success nor a played cursor is
+                            # fabricated. Android can retire the incomplete
+                            # playback offer and continue receiving new turns.
+                            await self.send_json({"type": "output_replayed", "source_id": source_id,
+                                "through_seq": self.output_acknowledged.get(source_id, 0),
+                                "complete": False, "cancelled": False})
+                            await self.send_json({"type": "transport_notice",
+                                "code": "LIVE_AUDIO_OUTPUT_GAP", "source_id": source_id})
                 finally:
                     self.output_recovering.discard(source_id)
                     self.output_recovery.task_done()
@@ -718,7 +743,8 @@ class SocketAudioV2:
         # conversation-level pending outputs: the automatic WSS manifest is
         # ONLY for the currently attached logical Live session.
         current = [s for s in statuses if isinstance(s, OutputResume)
-                   and self._auto_replay_source(s.source.source.source_id)]
+                   and self._auto_replay_source(s.source.source.source_id)
+                   and s.source.source.source_id not in self.archive.failed_recoveries]
         self._current()
         await self.send_json({"type": "output_available", "sources": [self._resume_dict(s) for s in current]})
 
