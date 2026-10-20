@@ -317,6 +317,31 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(r.output_source_locks[source].locked())
 
 
+    async def test_late_output_ack_after_binding_eviction_does_not_detach_long_session(self):
+        from types import SimpleNamespace
+        r, _record, source = self._output_for_cancellation()
+        events = []
+        r.binding.host = SimpleNamespace(
+            diagnostic=lambda _session, kind, **attrs: events.append((kind, attrs)))
+        # A prior 90-minute conversation can have dozens of completed output
+        # sources. Once its old binding is evicted there is no outstanding
+        # durable reservation to advance or release.
+        r._output_ack({"source_id": source, "chunk_seq": 2, "stage": "device_durable"})
+        self.assertFalse(r.output_pending)
+        self.assertFalse(r.output_acknowledged)
+        self.assertEqual(events[0][0], "socket_output_ack_unbound_ignored")
+        self.assertEqual(events[0][1]["frame_seq"], 2)
+        # The unbound exception is narrow: malformed stage remains fatal.
+        with self.assertRaises(LiveError) as invalid_stage:
+            r._output_ack({"source_id": source, "chunk_seq": 2, "stage": "server_durable"})
+        self.assertEqual(invalid_stage.exception.code, "LIVE_AUDIO_OUTPUT_ACK")
+        # Known binding must still reject forging a future server-durable ACK.
+        async with aclosing(r._frames(_record, recovery=False)) as sender:
+            _ = [v async for v in sender]
+        with self.assertRaises(LiveError):
+            r._output_ack({"source_id": source, "chunk_seq": 3, "stage": "device_durable"})
+        self.assertEqual(r.output_acknowledged.get(source), None)
+
     async def test_old_device_ack_is_idempotent_after_newer_durable_receipt(self):
         r,record,source=self._output_for_cancellation()
         async with aclosing(r._frames(record,recovery=False)) as sender:

@@ -556,9 +556,18 @@ class SocketAudioV2:
         entry = self.output_bindings.get(source_id)
         seq = integer(message.get("chunk_seq"), 0, MAX_SAFE_INTEGER, "chunk_seq")
         previous = self.output_acknowledged.get(source_id, 0)
-        if (message.get("stage") != "device_durable" or entry is None or
-                seq > entry[0].server_durable_seq):
-            raise invalid("OUTPUT_ACK", "Invalid device-durable contiguous output receipt")
+        if message.get("stage") != "device_durable":
+            raise invalid("OUTPUT_ACK", "Invalid device-durable output receipt stage")
+        if entry is None:
+            # A late ACK from a retired socket generation, or for a completed
+            # source evicted after >32 responses, cannot release any active
+            # reservation. Ignore without admitting it as a receipt or
+            # disconnecting a healthy Live conversation.
+            self.binding.host.diagnostic(self.binding.session, "socket_output_ack_unbound_ignored",
+                connection_generation=self.binding.state.generation, frame_seq=seq)
+            return
+        if seq > entry[0].server_durable_seq:
+            raise invalid("OUTPUT_ACK", "Device ACK exceeds the server-durable original prefix")
         if seq <= previous:
             # Reconnect may deliver an older ACK for the same immutable source.
             # It cannot roll the contiguous prefix backward or release a new
