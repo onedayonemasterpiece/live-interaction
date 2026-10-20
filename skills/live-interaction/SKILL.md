@@ -33,6 +33,14 @@ checks cover both; backend language choice is not a performance guarantee.
 
 Consume the Android contracts and platform projects from the same immutable
 archive through the existing composite build; never edit a fork in the product.
+From rc12, Android `DurableOutputStore` implementations must durably implement
+`cancelPlayback(sourceId)` and return `PlaybackPosition.playbackCancelled` after
+reopening. Stop/barge-in cancellation is independent of original bytes and the
+actual played cursor; never delete originals or mark the unheard tail as played.
+The existing ordered output worker persists this marker and rechecks the local
+fence when delayed source-open/chunk tasks run. Older journals default to not
+cancelled; no historical cancellation is inferred from their age.
+
 For native v2, shared `NativeLiveRuntime` owns AudioRecord, VAD, MediaCodec,
 AudioTrack and WSS. Supply product authorization, SessionApi, durable stores,
 foreground service, permission flow and UI in the consumer. Keep browser products

@@ -45,6 +45,7 @@ public class DurablePlaybackPumpTest {
         public void registerOutputEpoch(String id, CodecEpoch value) { throw new AssertionError("playback may not change originals"); }
         public DurablePrefix appendOutput(OutputChunk value) { throw new AssertionError("playback may not invent EOS or receipts"); }
         public void markPlayed(String id, long value) { throw new AssertionError("submission is not actual playback"); }
+        public void cancelPlayback(String id) { throw new AssertionError("pump may not invent cancellation"); }
         public List<PlaybackPosition> playbackPositions() { throw new AssertionError("unused"); }
     }
     private static final class Player implements DurablePlaybackPump.Sink {

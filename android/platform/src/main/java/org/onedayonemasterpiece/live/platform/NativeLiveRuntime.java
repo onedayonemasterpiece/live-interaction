@@ -194,11 +194,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
                     : run.start.allowAacCompatibility() && caps.inputProfiles().contains(AAC_PROFILE) ? AAC_PROFILE : null;
             if (profile == null) throw new IllegalStateException("LIVE_NATIVE_COMPRESSED_UNSUPPORTED");
             run.codec = codecChoices.get(profile);
-            for (DurableOutputStore.PlaybackPosition position : outputStore.playbackPositions()) {
-                run.playedPositions.put(position.source().sourceId(), position.playedUs());
-                if (position.receivedThrough() > 0)
-                    run.outputResumes.offer(position.source().sourceId(), position.playedUs(), position.durationUs(), position.sealed(), false);
-            }
+            run.outputResumes.restore(outputStore.playbackPositions(), run.playedPositions, run.suppressedOutputs);
             if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
                 throw new IllegalStateException("LIVE_NATIVE_MICROPHONE_PERMISSION");
             run.player = player(run);
@@ -470,6 +466,11 @@ public final class NativeLiveRuntime implements AutoCloseable {
                 submitOutput(run, () -> {
                     outputStore.openOutput(new SourceDescriptor(binding.sourceId(), 0)); // unknown origin time is explicit and stable
                     outputStore.registerOutputEpoch(binding.sourceId(), binding.epoch());
+                    // An interrupt may fence this binding before its queued open runs.
+                    if (run.stopped.get() || run.suppressedOutputs.contains(binding.sourceId())) {
+                        run.suppressedOutputs.add(binding.sourceId());
+                        outputStore.cancelPlayback(binding.sourceId());
+                    }
                     run.playback.register(binding.sourceId(), binding.epoch());
                     drainPlayback(run);
                 });
@@ -483,6 +484,10 @@ public final class NativeLiveRuntime implements AutoCloseable {
                     EncodedChunk original = new EncodedChunk(binding.sourceId(), binding.epoch().epochId(), frame.chunkSeq(),
                         frame.startUs(), frame.durationUs(), frame.flags() & EPOCH_END, frame.payload());
                     DurablePrefix receipt = outputStore.appendOutput(new OutputChunk(original, frame.eventSeq()));
+                    if (run.stopped.get() || run.suppressedOutputs.contains(binding.sourceId())) {
+                        run.suppressedOutputs.add(binding.sourceId());
+                        outputStore.cancelPlayback(binding.sourceId());
+                    }
                     run.playback.received(binding.sourceId(), receipt.chunkSeq());
                     if (active(run) && connectionGeneration == run.connectionGeneration) {
                         LiveSocketTransportV2 transport = run.transport;
@@ -527,17 +532,27 @@ public final class NativeLiveRuntime implements AutoCloseable {
                 + " connection_generation=" + run.connectionGeneration
                 + " source_id=" + (current == null ? "none" : current.activeSource())
                 + " thread=" + Thread.currentThread().getName());
-        // Fence delayed encoded callbacks from the interrupted response before releasing hardware.
-        for (OutputBinding binding : run.outputBindings.values()) run.suppressedOutputs.add(binding.sourceId());
-        NativePlayer.PlaybackResume resume = run.playbackResume;
-        if (resume != null) run.suppressedOutputs.add(resume.sourceId());
+        // Fence delayed callbacks immediately; fsync is on the existing output worker.
+        fenceOutputPlayback(run);
         NativePlayer player = run.player; if (player != null) player.interrupt();
+        submitOutput(run, () -> persistOutputCancellations(run));
         executeNetwork(() -> {
             if (!active(run)) return;
             for (String sourceId : run.suppressedOutputs) run.outputResumes.finished(sourceId);
             run.playbackResume = null;
             // A new user portion has priority. Continue old pending output after the next actual output completes.
         });
+    }
+    private void fenceOutputPlayback(Run run) {
+        for (OutputBinding binding : run.outputBindings.values()) run.suppressedOutputs.add(binding.sourceId());
+        NativePlayer.PlaybackResume resume = run.playbackResume;
+        if (resume != null) run.suppressedOutputs.add(resume.sourceId());
+    }
+    private void persistOutputCancellations(Run run) throws IOException {
+        // Metadata only. Queued opens/chunks independently recheck the same fence.
+        for (var position : outputStore.playbackPositions())
+            if (!position.playbackCancelled() && run.suppressedOutputs.contains(position.source().sourceId()))
+                outputStore.cancelPlayback(position.source().sourceId());
     }
     private void outputEvent(Run run, JsonObject event, int connectionGeneration) {
         try {
@@ -549,6 +564,8 @@ public final class NativeLiveRuntime implements AutoCloseable {
                     if (run.liveOutputs.contains(sourceId)) continue; // original bytes are already arriving on the current live stream
                     long played = Math.max(item.get("played_us").getAsLong(), run.playedPositions.getOrDefault(sourceId, 0L));
                     boolean cancelled = item.get("cancelled").getAsBoolean() || run.suppressedOutputs.contains(sourceId);
+                    if (cancelled && run.suppressedOutputs.add(sourceId))
+                        submitOutput(run, () -> persistOutputCancellations(run));
                     run.outputResumes.offer(sourceId, played, item.get("duration_us").getAsLong(), item.get("complete").getAsBoolean(), cancelled);
                 }
                 requestNextOutput(run);
@@ -557,6 +574,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
                 boolean cancelled = event.has("cancelled") && event.get("cancelled").getAsBoolean();
                 if (cancelled || run.suppressedOutputs.contains(sourceId)) {
                     run.suppressedOutputs.add(sourceId); run.outputResumes.finished(sourceId);
+                    submitOutput(run, () -> persistOutputCancellations(run));
                     if (run.playbackResume != null && run.playbackResume.sourceId().equals(sourceId)) run.playbackResume = null;
                     requestNextOutput(run);
                 } else if (!event.get("complete").getAsBoolean()) {
@@ -732,11 +750,14 @@ public final class NativeLiveRuntime implements AutoCloseable {
             run.state = "stopping"; run.connected = false;
             finalizing = CompletableFuture.allOf(run.localDone, run.outputDone);
         }
+        fenceOutputPlayback(run);
+        run.suppressedOutputs.addAll(run.outputResumes.pendingSources());
         releaseCapture();
         if (run.player != null) run.player.stopImmediately();
         LiveSocketTransportV2 transport = run.transport; if (transport != null) transport.close(true);
         if (run.sessionId != null) executeNetwork(() -> stopRemote(run.sessionId, run.stopReason));
         submitOutput(run, () -> {
+            persistOutputCancellations(run);
             for (var position : run.playedPositions.entrySet()) outputStore.markPlayed(position.getKey(), position.getValue());
         });
         synchronized (run.outputSubmission) {
