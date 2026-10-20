@@ -50,15 +50,19 @@ final class OutputResumeQueue {
     synchronized String selected() { return selected; }
     synchronized Set<String> pendingSources() { return Set.copyOf(pending.keySet()); }
 
-    /** Reopening the app restores cancellation independently of actual playback. */
+    /**
+     * Reopening a logical Live run restores played/cancelled metadata, NOT an
+     * automatic playback queue. Yesterday's durable originals belong to the
+     * conversation archive, not today's response stream. Only the server's
+     * current-session output_available manifest may offer a source; the same
+     * native Run retains its pending queue across socket reconnects.
+     */
     void restore(List<DurableOutputStore.PlaybackPosition> positions,
                  Map<String, Long> playedPositions, Set<String> suppressed) {
         for (var position : positions) {
             String id = position.source().sourceId();
             playedPositions.merge(id, position.playedUs(), Math::max);
             if (position.playbackCancelled()) suppressed.add(id);
-            if (position.receivedThrough() > 0)
-                offer(id, position.playedUs(), position.durationUs(), position.sealed(), suppressed.contains(id));
         }
     }
 

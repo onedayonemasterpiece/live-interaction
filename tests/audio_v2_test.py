@@ -67,6 +67,37 @@ class AudioWireConformance(unittest.TestCase):
 
 class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
     """Transport ordering and ingress without any optional local audio codecs."""
+
+    async def test_new_live_session_does_not_autoplay_a_prior_sessions_durable_response(self):
+        from types import SimpleNamespace
+        diagnostic = []
+        socket = SocketAudioV2.__new__(SocketAudioV2)
+        socket.closed = False
+        socket.binding = SimpleNamespace(stopped=False,
+            session=SimpleNamespace(id="live_today", stop_reason=None),
+            state=SimpleNamespace(generation=3),
+            heartbeat=lambda: None,
+            host=SimpleNamespace(diagnostic=lambda _session, event, **data: diagnostic.append((event, data))))
+        socket.output_recovering = set()
+        socket.output_recovery = asyncio.Queue(maxsize=8)
+        socket.output_changed = asyncio.Event()
+        socket._request_output("out_live_yesterday_1", 123)
+        self.assertTrue(socket.output_recovery.empty())
+        self.assertEqual(socket.output_recovering, set())
+        self.assertEqual(diagnostic[0][0], "socket_historical_output_ignored")
+        # Reconnecting WSS generation within today's SAME Live session still
+        # recovers the actual original, at the client's true played cursor.
+        socket._request_output("out_live_today_2", 314)
+        self.assertEqual(socket.output_recovery.get_nowait(), ("out_live_today_2", 314))
+        self.assertEqual(socket.output_recovering, {"out_live_today_2"})
+        # A direct replay call on historical input does not read, mark played,
+        # cancel, or change any durable source bytes.
+        class ForbiddenHistoricalStore:
+            async def resume_source(self, _source_id):
+                raise AssertionError("historical source accessed during new Live")
+        socket.output_store = ForbiddenHistoricalStore()
+        await socket._replay_output("out_live_yesterday_1", 400)
+
     async def test_same_source_recovery_serializes_a_paused_live_writer(self):
         from collections import OrderedDict
         from types import SimpleNamespace
@@ -692,7 +723,7 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         await self.json(hello)
         await self.message("hello_ack")
 
-    async def test_detached_output_is_archived_and_new_host_replays_exact_originals(self):
+    async def test_detached_output_is_archived_but_new_live_does_not_autoplay_originals(self):
         await self.incoming.put(None)
         await asyncio.wait_for(self.task, 2)
         source_id = f"out_{self.session.id}_1"
@@ -702,13 +733,14 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         originals = [self.store.outputs[(source_id, seq)] for seq in range(1, self.store.prefix(source_id) + 1)]
         await self.reconnect(playback={"source_id": source_id, "played_ms": 50}, new_host=True)
         notice = await self.message("output_available")
-        self.assertEqual(notice["sources"][0]["source_id"], source_id)
-        await self.message("output_replayed", source_id=source_id)
-        replay = [AudioFrame.decode(value) for value in self.sent if isinstance(value, bytes)]
-        self.assertEqual([f.payload for f in replay], [o.chunk.payload for o in originals])
-        self.assertTrue(all(not f.flags & EVENT_END for f in replay))
-        self.assertEqual([f.event_seq for f in replay], [o.original_event_seq for o in originals])
-        self.assertEqual(self.store.played[source_id], 50000)
+        self.assertEqual(notice["sources"], [], "New Start cannot advertise previous Live session")
+        self.assertFalse(self.messages("output_replayed"))
+        self.assertFalse(any(isinstance(v, bytes) for v in self.sent))
+        self.assertEqual(self.store.played.get(source_id, 0), 0, "Ignored autoplay never fabricates playhead")
+        archived = await self.store.resume_source(source_id)
+        explicit = await self.store.read_output(archived, after_seq=0, max_encoded_bytes=65536, max_duration_us=2_000_000)
+        self.assertEqual([o.chunk.payload for o in explicit], [o.chunk.payload for o in originals])
+        self.assertEqual([o.original_event_seq for o in explicit], [o.original_event_seq for o in originals])
         self.assertFalse(any(b'"type":"audio"' in line for line in self.provider.inputs))
 
     async def test_output_commit_wait_does_not_block_interruption_and_cancelled_original_never_autoplays(self):
@@ -724,8 +756,9 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         self.assertIn(source_id, self.store.seals)
         self.assertFalse(any(isinstance(v, bytes) for v in self.sent))
         await self.reconnect(playback={"source_id": source_id, "played_ms": 0}, new_host=True)
-        replayed = await self.message("output_replayed", source_id=source_id)
-        self.assertTrue(replayed["cancelled"])
+        self.assertEqual((await self.message("output_available"))["sources"], [])
+        self.assertFalse(self.messages("output_replayed"))
+        self.assertIn(source_id, self.store.cancelled)
         self.assertFalse(any(isinstance(v, bytes) for v in self.sent))
 
     async def test_output_window_waits_for_device_durable_prefix_while_stop_remains_available(self):
@@ -939,7 +972,9 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
         self.provider.events({"type": "interrupted"})
         await settle(lambda: second in self.store.cancelled)
         await self.reconnect(playback={"source_id": second, "played_ms": 0}, new_host=True)
-        self.assertTrue((await self.message("output_replayed", source_id=second))["cancelled"])
+        self.assertEqual((await self.message("output_available"))["sources"], [])
+        self.assertFalse(self.messages("output_replayed"))
+        self.assertIn(second, self.store.cancelled)
         self.assertFalse(any(isinstance(v, bytes) for v in self.sent))
 
     async def test_open_output_recovery_waits_for_real_tail_without_blocking_fresh_live(self):

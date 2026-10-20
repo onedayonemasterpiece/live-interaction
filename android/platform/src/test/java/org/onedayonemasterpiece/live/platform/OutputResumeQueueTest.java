@@ -6,7 +6,7 @@ import java.util.Set;
 import static org.junit.Assert.*;
 
 public class OutputResumeQueueTest {
-    @Test public void freshRunRestoresCancellationWithoutTurningReceivedBytesIntoPlayedAudio() {
+    @Test public void freshRunRestoresMetadataButOnlyCurrentSessionManifestCanResumePlayback() {
         var source = new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor("out_cancelled", 0);
         var pending = new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor("out_pending", 0);
         var positions = java.util.List.of(
@@ -18,7 +18,9 @@ public class OutputResumeQueueTest {
         queue.restore(positions, played, suppressed);
         assertEquals(Set.of("out_cancelled"), suppressed);
         assertEquals(Long.valueOf(20000), played.get("out_cancelled"));
-        assertEquals(Set.of("out_pending"), queue.pendingSources());
+        assertTrue(queue.pendingSources().isEmpty());
+        assertNull(queue.next(played)); // saved historical source is NOT queued to autoplay
+        queue.offer("out_pending", 40000, 100000, true, false); // current-session manifest only
         assertEquals(new OutputResumeQueue.Resume("out_pending", 40), queue.next(played));
         // An older server manifest cannot undo the on-device cancellation.
         queue.offer("out_cancelled", 0, 100000, true, suppressed.contains("out_cancelled"));
@@ -26,7 +28,7 @@ public class OutputResumeQueueTest {
         assertNull(queue.next(played));
         queue.reconnect(null, 0);
         queue.restore(positions, played, suppressed);
-        assertEquals(Set.of("out_pending"), queue.pendingSources());
+        assertTrue(queue.pendingSources().isEmpty());
     }
 
     @Test public void cancellationOfEmptySourceStillFencesItsLaterDelivery() {
