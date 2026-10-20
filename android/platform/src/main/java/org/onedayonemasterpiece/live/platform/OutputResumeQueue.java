@@ -3,6 +3,8 @@ package org.onedayonemasterpiece.live.platform;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.List;
+import org.onedayonemasterpiece.live.DurableOutputStore;
 import java.util.Set;
 import static org.onedayonemasterpiece.live.VoiceAudioV2.id;
 
@@ -12,6 +14,9 @@ final class OutputResumeQueue {
     private final Map<String, Long> pending = new LinkedHashMap<>();
     private final Set<String> attempted = new LinkedHashSet<>();
     private String selected;
+    private final Set<String> bound = new LinkedHashSet<>();
+    synchronized void rememberBinding(String sourceId) { id(sourceId); bound.add(sourceId); }
+    synchronized void fenceBound(Set<String> suppressed) { suppressed.addAll(bound); }
 
     synchronized void offer(String sourceId, long playedUs, long durationUs, boolean complete, boolean cancelled) {
         id(sourceId);
@@ -43,6 +48,19 @@ final class OutputResumeQueue {
         }
     }
     synchronized String selected() { return selected; }
+    synchronized Set<String> pendingSources() { return Set.copyOf(pending.keySet()); }
+
+    /** Reopening the app restores cancellation independently of actual playback. */
+    void restore(List<DurableOutputStore.PlaybackPosition> positions,
+                 Map<String, Long> playedPositions, Set<String> suppressed) {
+        for (var position : positions) {
+            String id = position.source().sourceId();
+            playedPositions.merge(id, position.playedUs(), Math::max);
+            if (position.playbackCancelled()) suppressed.add(id);
+            if (position.receivedThrough() > 0)
+                offer(id, position.playedUs(), position.durationUs(), position.sealed(), suppressed.contains(id));
+        }
+    }
 
     /** An output finished during a network outage still owes its played cursor.
      * Emit positions on every new transport, never re-enqueue already heard audio.

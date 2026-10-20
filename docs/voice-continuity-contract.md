@@ -242,6 +242,17 @@ after the real codec tail. Detached sockets do not cancel archiving. Interrupted
 can finish persistence while playback cancellation remains immediate; saved cancelled output
 is marked as such and cannot automatically resume as speech.
 
+Android rc12 persists the same local playback decision through
+`DurableOutputStore.cancelPlayback` and `PlaybackPosition.playbackCancelled`.
+The normal output worker commits it after immediate hardware interruption and
+before the Stop completion barrier. A queued source open or late original chunk
+rechecks the fence, so a delayed write cannot resurrect cancelled speech. A new
+Run restores these markers separately from actual played positions. Received
+bytes, canonical audio and already-played counters remain unchanged; existing
+unmarked journals remain valid and are not guessed to be cancelled. This prevents
+one identified local restart/replay path; it does not by itself establish the
+origin of any historical handset incident or replace provider/device testing.
+
 `output_epoch` binds `source_id`, `server_source_id`, `stream_ref`, `provider_response_id`,
 `epoch_ref`, `server_durable_seq`, `connection_generation` and the original descriptor.
 `WLO2` carries unchanged compressed chunks. Android syncs each original output chunk before

@@ -6,6 +6,63 @@ import java.util.Set;
 import static org.junit.Assert.*;
 
 public class OutputResumeQueueTest {
+    @Test public void freshRunRestoresCancellationWithoutTurningReceivedBytesIntoPlayedAudio() {
+        var source = new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor("out_cancelled", 0);
+        var pending = new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor("out_pending", 0);
+        var positions = java.util.List.of(
+            new org.onedayonemasterpiece.live.DurableOutputStore.PlaybackPosition(source, 5, 11, 20000, 100000, true, true),
+            new org.onedayonemasterpiece.live.DurableOutputStore.PlaybackPosition(pending, 5, 12, 40000, 100000, true, false));
+        var played = new java.util.HashMap<String, Long>();
+        var suppressed = new java.util.HashSet<String>();
+        OutputResumeQueue queue = new OutputResumeQueue();
+        queue.restore(positions, played, suppressed);
+        assertEquals(Set.of("out_cancelled"), suppressed);
+        assertEquals(Long.valueOf(20000), played.get("out_cancelled"));
+        assertEquals(Set.of("out_pending"), queue.pendingSources());
+        assertEquals(new OutputResumeQueue.Resume("out_pending", 40), queue.next(played));
+        // An older server manifest cannot undo the on-device cancellation.
+        queue.offer("out_cancelled", 0, 100000, true, suppressed.contains("out_cancelled"));
+        queue.finished("out_pending");
+        assertNull(queue.next(played));
+        queue.reconnect(null, 0);
+        queue.restore(positions, played, suppressed);
+        assertEquals(Set.of("out_pending"), queue.pendingSources());
+    }
+
+    @Test public void cancellationOfEmptySourceStillFencesItsLaterDelivery() {
+        var source = new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor("out_empty", 0);
+        var positions = java.util.List.of(new org.onedayonemasterpiece.live.DurableOutputStore.PlaybackPosition(
+            source, 0, 0, 0, 0, false, true));
+        var suppressed = new java.util.HashSet<String>();
+        OutputResumeQueue queue = new OutputResumeQueue();
+        queue.restore(positions, new java.util.HashMap<>(), suppressed);
+        assertEquals(Set.of("out_empty"), suppressed);
+        assertTrue(queue.pendingSources().isEmpty());
+        assertNull(queue.next(Map.of()));
+    }
+
+    @Test public void stopOrBargeInAfterDisconnectFencesBothActiveAndAlreadyBoundQueuedSource() {
+        for (boolean stop : new boolean[] {false, true}) {
+            OutputResumeQueue queue = new OutputResumeQueue();
+            queue.rememberBinding("out_A"); queue.rememberBinding("out_B");
+            queue.offer("out_prior", 0, 100000, true, false);
+            queue.reconnect("out_A", 20000); // socket epoch table can now be empty
+            var suppressed = new java.util.HashSet<String>();
+            queue.fenceBound(suppressed);
+            if (stop) suppressed.addAll(queue.pendingSources());
+            assertTrue(suppressed.containsAll(Set.of("out_A", "out_B")));
+            assertEquals(stop, suppressed.contains("out_prior"));
+            // Persisted snapshot restored into a fresh Run cannot re-offer either source.
+            var positions = java.util.List.of("out_A", "out_B").stream().map(id ->
+                new org.onedayonemasterpiece.live.DurableOutputStore.PlaybackPosition(
+                    new org.onedayonemasterpiece.live.VoiceAudioV2.SourceDescriptor(id, 0),
+                    3, 8, id.equals("out_A") ? 20000 : 0, 100000, true, suppressed.contains(id))).toList();
+            OutputResumeQueue reopened = new OutputResumeQueue();
+            reopened.restore(positions, new java.util.HashMap<>(), new java.util.HashSet<>());
+            assertNull(reopened.next(Map.of()));
+        }
+    }
+
     @Test public void completedAudioDuringSocketOutageOwesAReplaySafePlayheadReceipt() {
         Map<String, Long> positions = OutputResumeQueue.completedPlayheads(
             Set.of("out_offline", "out_incomplete", "out_zero"),
