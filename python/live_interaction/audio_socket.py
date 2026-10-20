@@ -714,8 +714,13 @@ class SocketAudioV2:
         statuses = await self.output_store.pending_outputs(limit=8)
         if not isinstance(statuses, list) or len(statuses) > 8:
             raise invalid("OUTPUT_STORE", "Output manifest exceeds its bound")
+        # Defensive SDK boundary even for consumers that still return all
+        # conversation-level pending outputs: the automatic WSS manifest is
+        # ONLY for the currently attached logical Live session.
+        current = [s for s in statuses if isinstance(s, OutputResume)
+                   and self._auto_replay_source(s.source.source.source_id)]
         self._current()
-        await self.send_json({"type": "output_available", "sources": [self._resume_dict(s) for s in statuses]})
+        await self.send_json({"type": "output_available", "sources": [self._resume_dict(s) for s in current]})
 
     async def _replay_output(self, source_id, played_ms):
         from .audio_output import ArchivedOutput
