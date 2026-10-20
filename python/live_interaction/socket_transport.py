@@ -200,12 +200,18 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
     # Preserve source/epoch/chunk order with one bounded ingress worker rather
     # than creating one task per audio frame. The underlying v2 delivery windows
     # and actual server-durable ACK rules remain unchanged.
-    v2_ingress = asyncio.Queue(maxsize=8)
+    v2_ingress = None
     v2_ingress_bytes = 0
+    v2_ingress_limit = 0
+    v2_frame_limit = 0
 
     def stage_v2_input(value, size):
         nonlocal v2_ingress_bytes
-        if v2_ingress.full() or v2_ingress_bytes + size > MAX_CONTROL_BYTES:
+        if isinstance(value, bytes) and size > v2_frame_limit:
+            # Malformed or oversized input must be terminal, not a recoverable
+            # backpressure error that would reconnect forever with the same bytes.
+            raise LiveError("LIVE_SOCKET_FRAME", "v2 encoded audio frame exceeds its bound")
+        if v2_ingress.full() or v2_ingress_bytes + size > v2_ingress_limit:
             binding.host.diagnostic(binding.session, "socket_audio_read_ahead_full",
                                     connection_generation=binding.state.generation,
                                     queue_items=v2_ingress.qsize(), queue_bytes=v2_ingress_bytes)
@@ -298,6 +304,15 @@ async def serve_socket(binding, *, receive, send, close, hello_timeout=2.0,
             from .audio_socket import SocketAudioV2
             audio_v2 = SocketAudioV2(binding, services, send, failed)
             v2_metadata = audio_v2.negotiate(hello)
+            # The read-ahead does not widen codec or durable delivery windows.
+            # It can hold the negotiated maximum un-ACKed live+recovery stream
+            # (including 10 ms small-packet headroom) and bounded FIFO control.
+            limits = audio_v2.limits
+            from .audio_v2 import HEADER
+            v2_ingress = asyncio.Queue(maxsize=min(256, max(32,
+                (limits.live_window_duration_us + limits.recovery_window_duration_us) // 10_000 + 8)))
+            v2_ingress_limit = limits.live_window_bytes + limits.recovery_window_bytes + MAX_CONTROL_BYTES
+            v2_frame_limit = HEADER.size + limits.max_encoded_bytes
         if hello.get("attempt_id") != binding.attempt_id:
             raise LiveError("LIVE_SOCKET_ATTEMPT", "Live attempt does not match")
         cursor = hello.get("cursor", 0)
