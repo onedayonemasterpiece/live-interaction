@@ -69,6 +69,40 @@ class AudioWireConformance(unittest.TestCase):
 class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
     """Transport ordering and ingress without any optional local audio codecs."""
 
+    async def test_tiny_opus_packets_fit_negotiated_duration_without_false_item_overflow(self):
+        from types import SimpleNamespace
+        from live_interaction.audio_socket import _audio_item_capacity
+        limits = AudioLimits()
+        self.assertEqual(_audio_item_capacity(limits.live_window_duration_us), 104)
+        self.assertEqual(_audio_item_capacity(limits.recovery_window_duration_us), 56)
+        r = SocketAudioV2.__new__(SocketAudioV2)
+        r.limits = limits
+        r.closed = False
+        r.binding = SimpleNamespace(stopped=False,
+            session=SimpleNamespace(stop_reason=None), heartbeat=lambda: None)
+        r.queues = [asyncio.Queue(maxsize=_audio_item_capacity(limits.live_window_duration_us)),
+                    asyncio.Queue(maxsize=_audio_item_capacity(limits.recovery_window_duration_us))]
+        r.queued_bytes, r.queued_duration = [0, 0], [0, 0]
+        # Real Samsung logs had 31 pending tiny Opus packets while only
+        # ~2 KiB had been admitted. The old maxsize=32 rejected well before
+        # the 960-ms duration or 32-KiB byte budget could be reached.
+        for seq in range(96):
+            r._enqueue(0, seq, 40, 10_000)
+        self.assertEqual(r.queues[0].qsize(), 96)
+        self.assertEqual(r.queued_bytes[0], 3840)
+        self.assertEqual(r.queued_duration[0], limits.live_window_duration_us)
+        self.assertLessEqual(r.queues[0].maxsize, 128)
+        with self.assertRaises(LiveError) as duration_full:
+            r._enqueue(0, 97, 40, 10_000)
+        self.assertEqual(duration_full.exception.code, "LIVE_AUDIO_BACKPRESSURE")
+        self.assertEqual(r.queues[0].qsize(), 96)  # No unbounded admission.
+        for seq in range(48):
+            r._enqueue(1, seq, 40, 10_000)
+        self.assertEqual(r.queued_duration[1], limits.recovery_window_duration_us)
+        with self.assertRaises(LiveError):
+            r._enqueue(1, 49, 40, 10_000)
+        self.assertEqual(r.queues[1].qsize(), 48)
+
     async def test_new_live_session_does_not_autoplay_a_prior_sessions_durable_response(self):
         from types import SimpleNamespace
         diagnostic = []
@@ -282,6 +316,31 @@ class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(r.output_source_users)
         self.assertFalse(r.output_source_locks[source].locked())
 
+
+    async def test_late_output_ack_after_binding_eviction_does_not_detach_long_session(self):
+        from types import SimpleNamespace
+        r, _record, source = self._output_for_cancellation()
+        events = []
+        r.binding.host = SimpleNamespace(
+            diagnostic=lambda _session, kind, **attrs: events.append((kind, attrs)))
+        # A prior 90-minute conversation can have dozens of completed output
+        # sources. Once its old binding is evicted there is no outstanding
+        # durable reservation to advance or release.
+        r._output_ack({"source_id": source, "chunk_seq": 2, "stage": "device_durable"})
+        self.assertFalse(r.output_pending)
+        self.assertFalse(r.output_acknowledged)
+        self.assertEqual(events[0][0], "socket_output_ack_unbound_ignored")
+        self.assertEqual(events[0][1]["frame_seq"], 2)
+        # The unbound exception is narrow: malformed stage remains fatal.
+        with self.assertRaises(LiveError) as invalid_stage:
+            r._output_ack({"source_id": source, "chunk_seq": 2, "stage": "server_durable"})
+        self.assertEqual(invalid_stage.exception.code, "LIVE_AUDIO_OUTPUT_ACK")
+        # Known binding must still reject forging a future server-durable ACK.
+        async with aclosing(r._frames(_record, recovery=False)) as sender:
+            _ = [v async for v in sender]
+        with self.assertRaises(LiveError):
+            r._output_ack({"source_id": source, "chunk_seq": 3, "stage": "device_durable"})
+        self.assertEqual(r.output_acknowledged.get(source), None)
 
     async def test_old_device_ack_is_idempotent_after_newer_durable_receipt(self):
         r,record,source=self._output_for_cancellation()
