@@ -18,6 +18,16 @@ from .audio_v2 import (AudioFrame, BoundSource, CodecEpoch, DurablePCMProjection
                        OutputResume, identifier, integer, invalid)
 
 
+def _audio_item_capacity(duration_us: int) -> int:
+    """Bound short Opus frame count to the existing duration window.
+
+    A 960-ms negotiated live window contains 96 ten-ms packets, not 32.
+    Bytes/duration/age limits still enforce the original hard bounds, and
+    neither extra PCM nor additional durable work is admitted.
+    """
+    return min(128, max(32, (duration_us + 9_999) // 10_000 + 8))
+
+
 class AudioWorkPool:
     """One small native pool per existing host, never one thread per stream."""
     def __init__(self):
@@ -84,7 +94,13 @@ class SocketAudioV2:
         self.decoder_key = None
         self.decoder_ended = True
         self.portions = deque()
-        self.queues = [asyncio.Queue(maxsize=32), asyncio.Queue(maxsize=32)]
+        # Item slots must cover small (10 ms) Opus packets within the already
+        # negotiated live/recovery duration budgets. Otherwise 32 tiny frames
+        # falsely exhaust admission at ~320 ms with >600 ms still available.
+        self.queues = [
+            asyncio.Queue(maxsize=_audio_item_capacity(self.limits.live_window_duration_us)),
+            asyncio.Queue(maxsize=_audio_item_capacity(self.limits.recovery_window_duration_us)),
+        ]
         self.queued_bytes = [0, 0]
         self.queued_duration = [0, 0]
         self.admission_changed = [asyncio.Event(), asyncio.Event()]
