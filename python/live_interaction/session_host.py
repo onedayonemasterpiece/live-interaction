@@ -222,7 +222,9 @@ class LiveSessionHost:
             if isinstance(encoded, str) and 8000 <= rate <= 96000:
                 size = len(encoded.rstrip("=")) * 3 // 4
                 session.response_audio_us += round((size // 2) * 1_000_000 / rate)
-        elif kind in ("turn_complete", "interrupted"):
+        elif kind in ("turn_complete", "interrupted", "generation_complete"):
+            # A provider generation boundary terminates its audio epoch even
+            # when the later semantic turnComplete is delayed across reconnect.
             session.response_open = False
         item = {"seq": session.next_seq, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **event}
         session.next_seq += 1

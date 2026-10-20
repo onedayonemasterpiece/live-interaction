@@ -782,6 +782,62 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
                 samples += len(result.pcm16) // 2
         self.assertEqual(samples, 4800)
 
+    async def test_generation_complete_seals_output_before_next_reply_in_one_socket(self):
+        # Google may emit generationComplete before its later turnComplete.
+        # That is the audio epoch's true EOS, not a new provider session.
+        pcm = {"type": "audio", "data": base64.b64encode(bytes(4800)).decode(),
+               "mime_type": "audio/pcm;rate=24000"}
+        first = f"out_{self.session.id}_1"
+        second = f"out_{self.session.id}_2"
+        self.provider.events(pcm)
+        self.provider.events({"type": "generation_complete"})
+        await settle(lambda: first in self.store.seals)
+        self.assertFalse(self.session.response_open)
+        self.provider.events({"type": "turn_complete"})
+        self.provider.events(pcm)
+        self.provider.events({"type": "generation_complete"})
+        await settle(lambda: second in self.store.seals)
+        self.assertEqual(self.session.response_seq, 2)
+        self.assertTrue(self.store.prefix(first))
+        self.assertTrue(self.store.prefix(second))
+        self.assertFalse(self.binding.stopped)
+        self.assertFalse(self.task.done(), self.closes)
+        self.assertNotIn(first, self.store.cancelled)
+        self.assertNotIn(second, self.store.cancelled)
+
+    async def test_missing_terminal_boundary_cancels_only_old_reply_and_keeps_new_speech(self):
+        pcm = {"type": "audio", "data": base64.b64encode(bytes(4800)).decode(),
+               "mime_type": "audio/pcm;rate=24000"}
+        first = f"out_{self.session.id}_1"
+        second = f"out_{self.session.id}_2"
+        self.provider.events(pcm)
+        await settle(lambda: (first, 1) in self.store.outputs)
+        # Fault injection: the semantic host advances response identity but
+        # provider terminal A is absent from the durable archive queue.
+        # Never remux A's suffix as the new B source or Stop the Live session.
+        self.session.response_open = False
+        self.provider.events(pcm)
+        self.provider.events({"type": "generation_complete"})
+        await settle(lambda: second in self.store.seals)
+        self.assertIn(first, self.store.seals)
+        self.assertIn(first, self.store.cancelled)
+        self.assertNotIn(second, self.store.cancelled)
+        self.assertEqual(self.session.response_seq, 2)
+        self.assertFalse(self.task.done(), self.closes)
+        # A late explicitly attributed terminal for A must not end B's epoch.
+        self.session.response_open = False
+        self.provider.events(pcm)
+        third = f"out_{self.session.id}_3"
+        await settle(lambda: (third, 1) in self.store.outputs)
+        archive = self.binding.state.output_archive
+        self.assertEqual(await archive._process({"type": "turn_complete", "response_id": 1}), ())
+        self.assertEqual(archive.response_id, 3)
+        self.assertIsNotNone(archive.encoder)
+        self.provider.events({"type": "generation_complete"})
+        await settle(lambda: third in self.store.seals)
+        self.assertNotIn(third, self.store.cancelled)
+        self.assertFalse(self.task.done(), self.closes)
+
     async def test_stalled_durable_commit_preserves_source_order_and_control_ping(self):
         refs = await self.source("live")
         self.store.block["live"] = asyncio.Event()
