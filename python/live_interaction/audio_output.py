@@ -321,20 +321,52 @@ class AudioOutputArchive:
 
     async def _commit(self, encoded, *, cancelled=False):
         chunks = []
-        for payload, duration, ended in encoded:
-            chunk = EncodedChunk(self.source.source.source_id, self.epoch.epoch_id, self.chunk_seq + 1,
-                                 self.end_us, duration, EPOCH_END if ended else 0, payload)
-            original = OutputChunk(chunk, self.last_audio_event)
+        batcher = getattr(self.store, "commit_outputs", None)
+
+        async def persist(group):
             t0 = time.monotonic()
-            receipt = await self.store.commit_output(self.source, self.epoch, original)
-            self._last_commit_ms += round((time.monotonic() - t0) * 1000)
+            if callable(batcher):
+                receipts = await batcher(self.source, self.epoch, group)
+                if not isinstance(receipts, (tuple, list)) or len(receipts) != len(group):
+                    raise invalid("DURABILITY", "Batch commit omitted original receipts")
+                self._last_commit_ms += round((time.monotonic() - t0) * 1000)
+                for original, receipt in zip(group, receipts):
+                    applied(original, receipt)
+            else:
+                # Backwards compatible with other products' EncodedOutputStore.
+                # Each individually committed prefix remains represented even
+                # if a *later* frame fails, exactly as before this optimization.
+                for original in group:
+                    t0 = time.monotonic()
+                    receipt = await self.store.commit_output(self.source, self.epoch, original)
+                    self._last_commit_ms += round((time.monotonic() - t0) * 1000)
+                    applied(original, receipt)
+
+        def applied(original, receipt):
+            chunk = original.chunk
             receipt.validate_for(self.source, chunk)
             if receipt.server_durable_seq != chunk.chunk_seq:
                 raise invalid("DURABILITY", "Output commit did not extend its contiguous durable prefix")
             self.chunk_seq = chunk.chunk_seq
-            self.end_us += duration
+            self.end_us += chunk.duration_us
             self.source = BoundSource(self.source.source, self.source.server_source_id, receipt.server_durable_seq)
             chunks.append(original)
+
+        group = []
+        next_seq, next_us = self.chunk_seq, self.end_us
+        for payload, duration, ended in encoded:
+            chunk = EncodedChunk(self.source.source.source_id, self.epoch.epoch_id,
+                                 next_seq + 1, next_us, duration, EPOCH_END if ended else 0, payload)
+            group.append(OutputChunk(chunk, self.last_audio_event))
+            next_seq += 1
+            next_us += duration
+            # Bound the global SQLite-lock hold and avoid an unbounded source
+            # transaction when a provider emits unusually large PCM blocks.
+            if len(group) == 6:
+                await persist(tuple(group))
+                group.clear()
+        if group:
+            await persist(tuple(group))
         return ArchivedOutput(self.source, self.epoch, self.response_id, tuple(chunks), cancelled)
 
     async def _finish(self, *, cancelled=False):

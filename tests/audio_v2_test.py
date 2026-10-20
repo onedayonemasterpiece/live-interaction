@@ -30,6 +30,112 @@ def vector_chunks(source_id="local_vector"):
                          c["flags"], base64.b64decode(c["payload_base64"])) for c in VECTORS["chunks"]]
 
 
+class OutputCommitBatchContracts(unittest.IsolatedAsyncioTestCase):
+    """Bounded archive transactions are optional and never invent a receipt."""
+
+    @staticmethod
+    def archive(store):
+        from live_interaction.audio_output import AudioOutputArchive
+        runtime = AudioOutputArchive.__new__(AudioOutputArchive)
+        runtime.store = store
+        runtime.source = BoundSource(SourceDescriptor("out_test_1", 0), "server_output_1", 0)
+        runtime.epoch = CodecEpoch("epoch_1", "opus", "ogg", 1, 1, 16000, 48000, 312, b"headers")
+        runtime.chunk_seq = runtime.end_us = runtime._last_commit_ms = 0
+        runtime.response_id = runtime.last_audio_event = 7
+        return runtime
+
+    async def test_bounded_batch_uses_two_durable_transactions_for_seven_pages(self):
+        class BatchedStore:
+            def __init__(self):
+                self.groups = []
+            async def commit_outputs(self, source, epoch, originals):
+                self.groups.append(tuple(originals))
+                return tuple(DurableCommit(c.chunk.source_id, source.server_source_id,
+                    epoch.epoch_id, c.chunk.chunk_seq, c.chunk.payload_sha256,
+                    c.chunk.chunk_seq, True) for c in originals)
+            async def commit_output(self, *_):
+                raise AssertionError("Individual writes must not run with batch support")
+
+        store = BatchedStore()
+        archive = self.archive(store)
+        data = [(bytes([i]), 20_000, i == 7) for i in range(1, 8)]
+        result = await archive._commit(data)
+        self.assertEqual([len(g) for g in store.groups], [6, 1])
+        self.assertEqual([c.chunk.chunk_seq for c in result.chunks], list(range(1, 8)))
+        self.assertEqual([c.chunk.capture_start_us for c in result.chunks],
+                         [i * 20_000 for i in range(7)])
+        self.assertEqual(archive.chunk_seq, 7)
+        self.assertEqual(archive.end_us, 140_000)
+        self.assertEqual(archive.source.server_durable_seq, 7)
+
+    async def test_legacy_single_writes_retain_exact_committed_prefix_after_failure(self):
+        class SingleStore:
+            def __init__(self):
+                self.committed = []
+            async def commit_output(self, source, epoch, original):
+                if original.chunk.chunk_seq == 2:
+                    raise IOError("injected individual durable-store failure")
+                self.committed.append(original)
+                c = original.chunk
+                return DurableCommit(c.source_id, source.server_source_id, epoch.epoch_id,
+                                     c.chunk_seq, c.payload_sha256, c.chunk_seq, True)
+
+        store = SingleStore()
+        archive = self.archive(store)
+        with self.assertRaisesRegex(IOError, "injected"):
+            await archive._commit([(b"first", 20_000, False), (b"second", 20_000, True)])
+        self.assertEqual(len(store.committed), 1)
+        self.assertEqual(archive.chunk_seq, 1)
+        self.assertEqual(archive.end_us, 20_000)
+        self.assertEqual(archive.source.server_durable_seq, 1)
+
+    async def test_invalid_batched_receipts_cannot_advance_archive_prefix(self):
+        class InvalidStore:
+            async def commit_outputs(self, _source, _epoch, _originals):
+                return ()
+
+        archive = self.archive(InvalidStore())
+        with self.assertRaises(LiveError):
+            await archive._commit([(b"first", 20_000, False), (b"second", 20_000, True)])
+        self.assertEqual(archive.chunk_seq, 0)
+        self.assertEqual(archive.source.server_durable_seq, 0)
+
+
+class StaleInputDiagnosticsContracts(unittest.TestCase):
+    def test_stale_frame_reports_age_and_bounded_queue_before_recoverable_detach(self):
+        from types import SimpleNamespace
+        import time
+        observed = []
+        binding = SimpleNamespace(
+            session=SimpleNamespace(id="live_test"),
+            state=SimpleNamespace(generation=2),
+            host=SimpleNamespace(diagnostic=lambda _session, event, **data:
+                observed.append((event, data))),
+        )
+        runtime = SocketAudioV2.__new__(SocketAudioV2)
+        runtime.binding = binding
+        runtime.limits = AudioLimits()
+        runtime.queues = [asyncio.Queue(maxsize=104), asyncio.Queue(maxsize=56)]
+        runtime.queued_bytes = [120, 0]
+        runtime.queued_duration = [40_000, 0]
+        source = SimpleNamespace(source_time_now_us=0,
+                                 registered_at=time.monotonic() - 4.0)
+        frame = SimpleNamespace(start_us=20_000, duration_us=20_000, chunk_seq=37)
+        with self.assertRaises(LiveError) as error:
+            runtime._age(source, frame)
+        self.assertEqual(error.exception.code, "LIVE_AUDIO_STALE")
+        self.assertEqual(observed[0][0], "socket_audio_stale_frame")
+        data = observed[0][1]
+        self.assertEqual(data["connection_generation"], 2)
+        self.assertEqual(data["frame_seq"], 37)
+        self.assertGreaterEqual(data["capture_age_ms"], 3900)
+        self.assertEqual(data["queue_items"], 0)
+        self.assertEqual(data["queue_bytes"], 120)
+        self.assertEqual(data["queue_duration_us"], 40_000)
+        self.assertNotIn("text", data)
+        self.assertNotIn("audio", data)
+
+
 class AudioWireConformance(unittest.TestCase):
     def test_shared_cross_language_vectors_and_transport_independent_identity(self):
         self.assertEqual(HEADER.size, 56)
