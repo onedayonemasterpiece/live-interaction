@@ -635,6 +635,31 @@ class CompressedSocketContract(unittest.IsolatedAsyncioTestCase):
                 samples += len(result.pcm16) // 2
         self.assertEqual(samples, 4800)
 
+    async def test_stalled_durable_commit_preserves_source_order_and_control_ping(self):
+        refs = await self.source("live")
+        self.store.block["live"] = asyncio.Event()
+        chunks = vector_chunks("live")
+        try:
+            await self.chunk(refs, chunks[0])
+            await asyncio.wait_for(self.store.entered.wait(), 1)
+            await self.chunk(refs, chunks[1])
+            # This control MUST stay behind both accepted original chunks.
+            await self.json({"type": "source_seal", "source_ref": refs[0],
+                             "last_chunk_seq": 2, "capture_end_us": 100000})
+            await self.json({"type": "ping"})
+            async with asyncio.timeout(.25):
+                await self.message("pong")
+            self.assertEqual(self.store.prefix("live"), 0)
+            self.assertNotIn("live", self.store.seals)
+            self.store.block["live"].set()
+            await self.message("audio_ack", source_id="live", chunk_seq=2)
+            sealed = await self.message("source_sealed", source_id="live")
+            self.assertTrue(sealed["complete"])
+            self.assertEqual([self.store.chunks[("live", n)].payload for n in (1, 2)],
+                             [c.payload for c in chunks])
+        finally:
+            self.store.block["live"].set()
+
     async def reconnect(self, *, playback=None, new_host=False):
         if not self.task.done():
             await self.incoming.put(None)

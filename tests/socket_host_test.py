@@ -227,6 +227,141 @@ class SocketHostContract(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response", encoded)
         self.assertNotIn("fixture-not-a-provider-key", encoded)
 
+    async def test_v2_control_plane_survives_blocked_durable_ingress(self):
+        # Exercise the actual relay read loop with a deliberately blocked v2
+        # admission worker. No provider, codec or user audio is involved.
+        from unittest.mock import patch
+        from live_interaction import audio_socket
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        admitted, controls = [], []
+
+        class BlockedAudio:
+            def __init__(self, binding, services, send, failed):
+                self.binding = binding
+
+            def negotiate(self, hello):
+                return {"uplink_profile": "test-opus", "downlink_profile": "test-opus"}
+
+            def start(self):
+                return []
+
+            async def audio(self, frame):
+                admitted.append(frame)
+                entered.set()
+                await release.wait()
+
+            def control(self, message):
+                controls.append(message["type"])
+
+            async def output(self, event):
+                yield json.dumps({"type": "event", "event": event})
+
+            async def close(self):
+                release.set()
+
+        self.host.audio_v2 = object()
+        binding = self.open()
+        incoming, sent, closes = asyncio.Queue(), [], []
+
+        async def send(value):
+            sent.append(value)
+
+        async def close(code, reason):
+            closes.append((code, reason))
+
+        with patch.object(audio_socket, "SocketAudioV2", BlockedAudio):
+            task = asyncio.create_task(serve_socket(
+                binding, receive=incoming.get, send=send, close=close, protocol="wl-live-v2"))
+            try:
+                await incoming.put(json.dumps({"type": "hello", "protocol": "wl-live-v2",
+                    "attempt_id": "attempt_test", "connection_generation": 1, "cursor": 0}))
+                await settle(lambda: any('"hello_ack"' in x for x in sent if isinstance(x, str)))
+                await incoming.put(b"first exact original")
+                await asyncio.wait_for(entered.wait(), 1)
+                await incoming.put(b"second exact original")
+                await incoming.put('{"type":"source_seal","source_ref":1}')
+                # Output ACK is unrelated to the blocked uplink lane. Other
+                # source controls must retain FIFO order behind the audio.
+                await incoming.put('{"type":"output_ack","source_id":"s","chunk_seq":1}')
+                await incoming.put('{"type":"ping"}')
+                await settle(lambda: any(x == '{"type":"pong"}' for x in sent), timeout=.25)
+                self.assertEqual(controls, ["output_ack"])
+                self.assertEqual(admitted, [b"first exact original"])
+                await incoming.put('{"type":"stop"}')
+                await asyncio.wait_for(task, .5)
+                self.assertTrue(binding.stopped)
+                self.assertEqual(closes[-1][0], 1000)
+                self.assertNotIn("source_seal", controls)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_v2_read_ahead_overflow_detaches_without_unbounded_audio(self):
+        from unittest.mock import patch
+        from live_interaction import audio_socket
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        admitted = []
+
+        class BlockedAudio:
+            def __init__(self, binding, services, send, failed):
+                pass
+
+            def negotiate(self, hello):
+                return {}
+
+            def start(self):
+                return []
+
+            async def audio(self, frame):
+                admitted.append(frame)
+                entered.set()
+                await release.wait()
+
+            def control(self, message):
+                pass
+
+            async def output(self, event):
+                yield json.dumps({"type": "event", "event": event})
+
+            async def close(self):
+                release.set()
+
+        self.host.audio_v2 = object()
+        binding = self.open()
+        incoming, sent, closes = asyncio.Queue(), [], []
+
+        async def send(value):
+            sent.append(value)
+
+        async def close(code, reason):
+            closes.append((code, reason))
+
+        with patch.object(audio_socket, "SocketAudioV2", BlockedAudio):
+            task = asyncio.create_task(serve_socket(
+                binding, receive=incoming.get, send=send, close=close, protocol="wl-live-v2"))
+            try:
+                await incoming.put(json.dumps({"type": "hello", "protocol": "wl-live-v2",
+                    "attempt_id": "attempt_test", "connection_generation": 1, "cursor": 0}))
+                await settle(lambda: any('"hello_ack"' in x for x in sent if isinstance(x, str)))
+                await incoming.put(b"first")
+                await asyncio.wait_for(entered.wait(), 1)
+                for n in range(16):
+                    await incoming.put(b"x" * 4096)
+                await asyncio.wait_for(task, 1)
+                self.assertEqual(closes[-1], (1011, "LIVE_AUDIO_BACKPRESSURE"))
+                self.assertFalse(binding.stopped, "Overflow detaches but does not stop the logical session")
+                self.assertEqual(admitted, [b"first"], "Unadmitted original frames cannot be ACKed")
+                self.assertFalse(any('"audio_ack"' in x for x in sent if isinstance(x, str)))
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_neutral_relay_hello_binary_push_and_ack(self):
         binding = self.open()
         inbound = asyncio.Queue()
