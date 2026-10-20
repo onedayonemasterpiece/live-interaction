@@ -124,7 +124,7 @@ class LiveSocketSessionHost(LiveSessionHost):
             emit(piece)
 
     def _emit(self, session, event):
-        if event.get("type") in ("turn_complete", "interrupted", "closed") and session.response_seq:
+        if event.get("type") in ("turn_complete", "interrupted", "generation_complete", "closed") and session.response_seq:
             # Keep the terminal codec tail addressable after delivery-cache
             # eviction; identity is assigned by the host, never the client.
             event = {**event, "response_id": session.response_seq}

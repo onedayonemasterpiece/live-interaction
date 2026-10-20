@@ -144,7 +144,11 @@ class AudioOutputArchive:
         if self.closing or self.error:
             return
         if event.get("type") == "interrupted":
-            self.cancelled_responses[self.session.response_seq] = True
+            # Use the event-bound response identity: the session counter may
+            # have advanced to the next response by the time this item drains.
+            response = event.get("response_id", self.session.response_seq)
+            if type(response) is int and response > 0:
+                self.cancelled_responses[response] = True
             while len(self.cancelled_responses) > 32:
                 self.cancelled_responses.popitem(last=False)
         size = len(event.get("data") or "") if event.get("type") == "audio" else 0
@@ -232,7 +236,7 @@ class AudioOutputArchive:
                 await self.changed.wait()
         if self.error:
             raise self.error
-        if event.get("type") in ("audio", "turn_complete", "closed", "interrupted") and seq not in self.results:
+        if event.get("type") in ("audio", "turn_complete", "generation_complete", "closed", "interrupted") and seq not in self.results:
             raise invalid("OUTPUT_HISTORY", "The event is outside the bounded archive delivery cache; resume its durable source")
         return self.results.get(seq, ())
 
@@ -257,6 +261,26 @@ class AudioOutputArchive:
             if not raw or len(raw) % 2 or len(raw) > 262144 or rate not in (16000, 24000, 48000):
                 raise invalid("OUTPUT", "Provider PCM exceeds its bound")
             media_start = integer(event.get("audio_start_us", 0), 0, MAX_SAFE_INTEGER, "audio_start_us")
+            if self.encoder is not None and response != self.response_id:
+                if response < self.response_id:
+                    # A late old response cannot be grafted onto the new codec
+                    # epoch. Its earlier original remains untouched; never
+                    # rewind or fabricate a source prefix.
+                    self.host.diagnostic(self.session, "output_stale_response_skipped",
+                        response_id=response, event_seq=seq)
+                    return ()
+                if media_start:
+                    raise invalid("OUTPUT_HISTORY", "New response is missing its original prefix")
+                # The provider advanced without a terminal A event. Seal only
+                # the *already received* A samples and cancel its playback;
+                # B starts a distinct immutable source, no session-wide Stop.
+                old_response = self.response_id
+                await self._finish(cancelled=True)
+                self.cancelled_responses[old_response] = True
+                while len(self.cancelled_responses) > 32:
+                    self.cancelled_responses.popitem(last=False)
+                self.host.diagnostic(self.session, "output_response_boundary_recovered",
+                    response_id=response, previous_response_id=old_response)
             if self.encoder is None:
                 if media_start:
                     raise invalid("OUTPUT_HISTORY", "Cannot invent a codec state for a missing response prefix")
@@ -270,18 +294,26 @@ class AudioOutputArchive:
                 await self.store.register_epoch(self.source, self.epoch)
                 self.response_id, self.rate = response, rate
                 self.chunk_seq = self.end_us = 0
-            elif response != self.response_id or rate != self.rate:
-                raise invalid("OUTPUT_SEQUENCE", "A response must end its single output codec epoch before a new response or PCM rate")
+            elif rate != self.rate:
+                raise invalid("OUTPUT_SEQUENCE", "PCM rate changed within one response codec epoch")
             self.last_audio_event = seq
             t0 = time.monotonic()
             encoded = await self.work.run(self.encoder.encode, raw, sample_rate=rate)
             self._last_encode_ms += round((time.monotonic() - t0) * 1000)
             output = await self._commit(encoded)
             return (output,) if output.chunks else ()
-        if kind in ("turn_complete", "closed", "interrupted"):
-            if kind == "interrupted" and self.encoder is None and self.source is not None:
-                # Playback can still be in progress after provider EOS. Preserve
-                # that cancellation across restart instead of reviving the tail.
+        if kind in ("turn_complete", "closed", "interrupted", "generation_complete"):
+            response = event.get("response_id")
+            if (kind != "closed" and type(response) is int and self.encoder is not None
+                    and response != self.response_id):
+                # Terminal A must not close the new B codec epoch.
+                self.host.diagnostic(self.session, "output_foreign_terminal_ignored",
+                    response_id=response, current_response_id=self.response_id)
+                return ()
+            if (kind == "interrupted" and self.encoder is None and self.source is not None
+                    and (response is None or response == self.response_id)):
+                # Playback can continue after provider EOS; cancellation is a
+                # durable disposition rather than fabricated played audio.
                 await self.store.cancel_output(self.source)
             output = await self._finish(cancelled=kind == "interrupted")
             return (output,) if output else ()

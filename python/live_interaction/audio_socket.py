@@ -495,7 +495,7 @@ class SocketAudioV2:
             except LiveError as error:
                 response = event.get("response_id")
                 if (error.code != "LIVE_AUDIO_OUTPUT_HISTORY"
-                        or kind not in ("audio", "turn_complete", "closed")
+                        or kind not in ("audio", "turn_complete", "generation_complete", "closed")
                         or not isinstance(response, int) or isinstance(response, bool) or response < 1):
                     raise
                 # Eviction is not loss of the durable original. Reuse the
