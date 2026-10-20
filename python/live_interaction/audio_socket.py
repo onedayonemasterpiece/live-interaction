@@ -262,6 +262,14 @@ class SocketAudioV2:
         now_source_us = source.source_time_now_us + round((time.monotonic() - source.registered_at) * 1_000_000)
         age_us = now_source_us - frame.start_us - frame.duration_us
         if age_us < -250_000 or age_us > self.limits.live_max_age_ms * 1000:
+            # Distinguish a delayed durable source from a client sample clock
+            # unexpectedly ahead of the server. These are numeric, bounded
+            # diagnostics only: no codec content, transcript or credentials.
+            self.binding.host.diagnostic(self.binding.session, "socket_audio_stale_frame",
+                connection_generation=self.binding.state.generation,
+                frame_seq=frame.chunk_seq, capture_age_ms=max(0, age_us // 1000),
+                queue_items=self.queues[0].qsize(), queue_bytes=self.queued_bytes[0],
+                queue_duration_us=self.queued_duration[0])
             raise invalid("STALE", "Fresh audio is outside the admitted capture clock window")
 
     async def _worker(self, lane):
