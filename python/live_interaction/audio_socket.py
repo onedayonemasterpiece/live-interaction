@@ -135,9 +135,16 @@ class SocketAudioV2:
             else:
                 response = integer(playback.get("response_id"), 1, self.binding.session.response_seq, "response_id")
                 source_id = f"out_{self.binding.session.id}_{response}"
-            self.playback_resume = (source_id, played)
-            self.output_recovering.add(source_id)
-            self.output_recovery.put_nowait(self.playback_resume)
+            # A new Live session is not an explicit request to listen to the
+            # conversation's archived responses. Older Android clients may
+            # still offer a locally persisted playback_resume from yesterday.
+            # Ignore it without failing this healthy new connection. The same
+            # logical session ID survives socket generations and remains
+            # recoverable using its exact committed output source.
+            if self._auto_replay_source(source_id):
+                self.playback_resume = (source_id, played)
+                self.output_recovering.add(source_id)
+                self.output_recovery.put_nowait(self.playback_resume)
         resume = hello.get("resume", [])
         if not isinstance(resume, list) or len(resume) > self.limits.max_sources:
             raise invalid("SOURCE_LIMIT", "Too many pending sources")
@@ -504,8 +511,21 @@ class SocketAudioV2:
         if kind != "audio":
             yield json.dumps({"type": "event", "event": event}, ensure_ascii=False, separators=(",", ":"))
 
+    def _auto_replay_source(self, source_id):
+        # The WSS output recovery lane is automatic same-Live-session replay,
+        # not an archival playback API. Manual historical retrieval continues
+        # through the actor-authorized durable source store without deleting it.
+        prefix = f"out_{self.binding.session.id}_"
+        return (isinstance(source_id, str) and source_id.startswith(prefix)
+                and source_id[len(prefix):].isdigit()
+                and int(source_id[len(prefix):]) > 0)
+
     def _request_output(self, source_id, played_ms):
         self._current()
+        if not self._auto_replay_source(source_id):
+            self.binding.host.diagnostic(self.binding.session, "socket_historical_output_ignored",
+                connection_generation=self.binding.state.generation)
+            return
         if source_id in self.output_recovering:
             return
         if self.output_recovery.full() or len(self.output_recovering) >= 8:
@@ -699,6 +719,11 @@ class SocketAudioV2:
 
     async def _replay_output(self, source_id, played_ms):
         from .audio_output import ArchivedOutput
+        # Guard the recovery worker as well as the hello/control admission
+        # paths. A legacy client's archived pending position cannot become
+        # autoplay after a new logical Live session starts.
+        if not self._auto_replay_source(source_id):
+            return
         source = await self.output_store.resume_source(source_id)
         await self.output_store.mark_played(source, played_ms * 1000)
         status = await self.output_store.output_status(source)

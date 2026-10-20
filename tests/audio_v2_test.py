@@ -67,6 +67,37 @@ class AudioWireConformance(unittest.TestCase):
 
 class BoundedVoiceRaceContracts(unittest.IsolatedAsyncioTestCase):
     """Transport ordering and ingress without any optional local audio codecs."""
+
+    async def test_new_live_session_does_not_autoplay_a_prior_sessions_durable_response(self):
+        from types import SimpleNamespace
+        diagnostic = []
+        socket = SocketAudioV2.__new__(SocketAudioV2)
+        socket.closed = False
+        socket.binding = SimpleNamespace(stopped=False,
+            session=SimpleNamespace(id="live_today", stop_reason=None),
+            state=SimpleNamespace(generation=3),
+            heartbeat=lambda: None,
+            host=SimpleNamespace(diagnostic=lambda _session, event, **data: diagnostic.append((event, data))))
+        socket.output_recovering = set()
+        socket.output_recovery = asyncio.Queue(maxsize=8)
+        socket.output_changed = asyncio.Event()
+        socket._request_output("out_live_yesterday_1", 123)
+        self.assertTrue(socket.output_recovery.empty())
+        self.assertEqual(socket.output_recovering, set())
+        self.assertEqual(diagnostic[0][0], "socket_historical_output_ignored")
+        # Reconnecting WSS generation within today's SAME Live session still
+        # recovers the actual original, at the client's true played cursor.
+        socket._request_output("out_live_today_2", 314)
+        self.assertEqual(socket.output_recovery.get_nowait(), ("out_live_today_2", 314))
+        self.assertEqual(socket.output_recovering, {"out_live_today_2"})
+        # A direct replay call on historical input does not read, mark played,
+        # cancel, or change any durable source bytes.
+        class ForbiddenHistoricalStore:
+            async def resume_source(self, _source_id):
+                raise AssertionError("historical source accessed during new Live")
+        socket.output_store = ForbiddenHistoricalStore()
+        await socket._replay_output("out_live_yesterday_1", 400)
+
     async def test_same_source_recovery_serializes_a_paused_live_writer(self):
         from collections import OrderedDict
         from types import SimpleNamespace
