@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.UUID;
 import static org.onedayonemasterpiece.live.VoiceAudioV2.*;
 
@@ -18,6 +20,9 @@ final class NativeEncoder implements AutoCloseable {
     interface Sink {
         void epoch(CodecEpoch epoch) throws IOException;
         void chunk(EncodedChunk chunk) throws IOException;
+        default void chunks(List<EncodedChunk> group) throws IOException {
+            for (EncodedChunk chunk : group) chunk(chunk);
+        }
         default void speechStarted() { }
     }
     private record Packet(byte[] bytes, int samples, long pts) { }
@@ -27,6 +32,10 @@ final class NativeEncoder implements AutoCloseable {
     private final MediaCodec codec;
     private final Sink sink;
     private final ArrayDeque<VoiceMark> voice = new ArrayDeque<>();
+    // Encoded pages are held for at most a short audio window. No source
+    // receipt exists until the sink's durable appendBatch completes.
+    private final ArrayList<EncodedChunk> pendingDurability = new ArrayList<>(6);
+    private long firstPendingNs, pendingDurationUs;
     private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
     private CodecEpoch epoch;
     private CompressedAudio.OggMux ogg;
@@ -100,6 +109,19 @@ final class NativeEncoder implements AutoCloseable {
             submittedSamples += n;
             codec.queueInputBuffer(index, 0, n * 2, pts, 0); offset += n; drain(false);
         }
+        flushIfDue();
+    }
+    void flushIfDue() throws IOException {
+        if (!pendingDurability.isEmpty()
+                && System.nanoTime() - firstPendingNs >= 80_000_000L) flushPending();
+    }
+    void flushPending() throws IOException {
+        if (pendingDurability.isEmpty()) return;
+        // Retain the entire pending burst on sink failure; caller fails this
+        // source and recovers on restart instead of inventing device receipts.
+        sink.chunks(List.copyOf(pendingDurability));
+        pendingDurability.clear();
+        firstPendingNs = pendingDurationUs = 0;
     }
     void finish() throws IOException {
         if (closed || eos) return;
@@ -141,6 +163,7 @@ final class NativeEncoder implements AutoCloseable {
         if (capturedSamples > 0 && (epoch == null || validSamples < capturedSamples))
             throw CompressedAudio.invalid("ENCODER_TAIL_SHORT");
         if (validSamples > capturedSamples) throw CompressedAudio.invalid("ENCODER_TAIL_OVERRUN");
+        flushPending(); // all terminal pages device-durable before source seal
     }
     private void drain(boolean waiting) throws IOException {
         while (!eos) {
@@ -239,7 +262,18 @@ final class NativeEncoder implements AutoCloseable {
         long startUs = samplesUs(validSamples), endUs = samplesUs(end);
         int flags = portionFlags(end, terminal) | (terminal ? EPOCH_END : 0);
         if (endUs - startUs > MAX_DURATION_US) throw CompressedAudio.invalid("FRAME_DURATION");
-        sink.chunk(new EncodedChunk(sourceId, epochId, ++chunkSeq, startUs, (int) (endUs - startUs), flags, payload));
+        EncodedChunk original = new EncodedChunk(sourceId, epochId, ++chunkSeq,
+                startUs, (int) (endUs - startUs), flags, payload);
+        // Codec profiles can emit different packet durations. Never allow a
+        // group to exceed 100 ms of original audio even when it holds <6 pages.
+        if (pendingDurationUs + original.durationUs() > 100_000L) flushPending();
+        if (pendingDurability.isEmpty()) firstPendingNs = System.nanoTime();
+        pendingDurability.add(original);
+        pendingDurationUs += original.durationUs();
+        // Speech start/end and real codec EOS must reach durable media before
+        // their controls/timing callbacks can be observed or a seal issued.
+        if (pendingDurability.size() >= 6 || pendingDurationUs >= 100_000L
+                || (flags & (PORTION_START | PORTION_END | EPOCH_END)) != 0) flushPending();
         validSamples = end;
         if (terminal) trim = span.endTrimSamples();
     }

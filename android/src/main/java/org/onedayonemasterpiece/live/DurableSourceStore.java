@@ -2,6 +2,7 @@ package org.onedayonemasterpiece.live;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -40,6 +41,21 @@ public interface DurableSourceStore extends Closeable {
      * lane/RECOVERY flags are not part of EncodedChunk or its stored identity.
      */
     VoiceAudioV2.DurablePrefix append(VoiceAudioV2.EncodedChunk chunk) throws IOException;
+
+    /**
+     * Optional group-commit optimization for a small contiguous original
+     * source prefix. Product stores can write all records with ONE fsync and
+     * return receipts only after that fsync. Other products keep exact legacy
+     * semantics through this default method (no premature ACK).
+     */
+    default List<VoiceAudioV2.DurablePrefix> appendBatch(List<VoiceAudioV2.EncodedChunk> chunks)
+            throws IOException {
+        if (chunks == null || chunks.isEmpty() || chunks.size() > 6)
+            throw new IllegalArgumentException("Durable input burst must contain one to six chunks");
+        List<VoiceAudioV2.DurablePrefix> receipts = new ArrayList<>(chunks.size());
+        for (VoiceAudioV2.EncodedChunk chunk : chunks) receipts.add(append(chunk));
+        return receipts;
+    }
 
     /**
      * Read, without consuming, an ordered prefix after both the supplied cursor
