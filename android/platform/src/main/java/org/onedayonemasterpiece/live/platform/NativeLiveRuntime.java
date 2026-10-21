@@ -334,8 +334,13 @@ public final class NativeLiveRuntime implements AutoCloseable {
         NativeEncoder encoder = null; long rotation = -1;
         try {
             while (!run.captureDone || !run.pcm.isEmpty()) {
-                Pcm frame = run.pcm.poll(50, TimeUnit.MILLISECONDS);
-                if (frame == null) continue;
+                Pcm frame = run.pcm.poll(20, TimeUnit.MILLISECONDS);
+                if (frame == null) {
+                    // A stalled/quiet capture must not strand an unacknowledged
+                    // partial encoded batch indefinitely in memory.
+                    if (encoder != null) encoder.flushIfDue();
+                    continue;
+                }
                 if (encoder == null || rotation != frame.rotation()) {
                     if (encoder != null) { finishSource(run, encoder); encoder.close(); }
                     rotation = frame.rotation();
@@ -353,7 +358,21 @@ public final class NativeLiveRuntime implements AutoCloseable {
                                 interruptOutput(run, "local_speech_started");
                         }
                         public void chunk(EncodedChunk chunk) throws IOException {
-                            DurablePrefix receipt = store.append(chunk); // fsync before any local/device acknowledgement or wire submission
+                            committed(chunk, store.append(chunk));
+                        }
+                        public void chunks(List<EncodedChunk> originals) throws IOException {
+                            List<DurablePrefix> receipts = store.appendBatch(originals);
+                            if (receipts == null || receipts.size() != originals.size())
+                                throw new IOException("LIVE_NATIVE_DURABILITY_BATCH_RECEIPT");
+                            // Commit all pages before any callback can advertise
+                            // them as device-durable or submit them over WSS.
+                            for (int i = 0; i < originals.size(); i++)
+                                committed(originals.get(i), receipts.get(i));
+                        }
+                        private void committed(EncodedChunk chunk, DurablePrefix receipt) throws IOException {
+                            if (receipt == null || !receipt.sourceId().equals(chunk.sourceId())
+                                    || receipt.chunkSeq() != chunk.chunkSeq())
+                                throw new IOException("LIVE_NATIVE_DURABILITY_RECEIPT");
                             if (run.source == source) run.deviceDurable = receipt.chunkSeq();
                             dispatch(() -> { if (visible(run)) listener.onDeviceDurable(receipt); });
                             if ((chunk.flags() & PORTION_START) != 0) nativeTiming(run, "speech_start");
@@ -678,6 +697,7 @@ public final class NativeLiveRuntime implements AutoCloseable {
                         run.opening.remove(id);
                         if (error != null) { disconnected(run, "LIVE_NATIVE_SOURCE_OPEN_FAILED"); return; }
                         if (bound.serverDurableSeq() < status.serverCommittedThrough()) { fail(run, "LIVE_NATIVE_SERVER_DURABLE_REGRESSION", false); return; }
+                        if (bound.serverDurableSeq() > status.deviceDurableThrough()) { fail(run, "LIVE_NATIVE_SERVER_DURABLE_OVERRUN", false); return; }
                         try {
                             // The authenticated bind also repairs a receipt lost after server fsync but before device fsync.
                             DurablePrefix receipt = store.markServerCommitted(new DurablePrefix(id, bound.serverDurableSeq()));
